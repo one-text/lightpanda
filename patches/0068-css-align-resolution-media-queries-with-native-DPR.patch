@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 4 Nov 2026 11:56:54 -0300
+Subject: [PATCH] css: align resolution media queries with native DPR
+
+Expose the Neo persona's synthetic display density through the shared
+native CSS media-query evaluator. Read Viewport.scale, the same source
+as Window.devicePixelRatio, instead of hardcoding another density or
+replacing matchMedia in JavaScript. Both native MediaQueryList objects
+and stylesheet @media conditions use this evaluator; existing viewport
+notifications also update listeners and invalidate stylesheet state.
+
+Support resolution, min-resolution, max-resolution and the boolean form.
+Parse adjacent CSS number/unit dimensions, including signs, fractions and
+exponents, for dppx, x, dpi and dpcm. Require a unit even for zero and reject
+negative, malformed and non-finite values. Normalize equivalent units to
+the viewport's f32 precision so fractional JS DPR values remain coherent.
+General Media Queries Level 4 comparison/range syntax remains out of scope.
+
+Validation: release build and all 1658 existing upstream tests pass.
+An ignored temporary CDP fixture verifies 47 query cases, equivalent units,
+fractional density overrides, stylesheet updates and native change events.
+The unchanged benchmark improves from 113/130 to 114/130, with only
+dpr-resolution-consistency changing from fail to pass and no regressions.
+No permanent tests are added and no existing patch is changed.
+
+References:
+https://www.w3.org/TR/css-values-4/#resolution
+https://www.w3.org/TR/mediaqueries-4/#resolution
+https://www.apple.com/macbook-neo/specs/
+---
+ src/browser/css/MediaQuery.zig | 48 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/src/browser/css/MediaQuery.zig b/src/browser/css/MediaQuery.zig
+index 4c2adec..0c3fa0a 100644
+--- a/src/browser/css/MediaQuery.zig
++++ b/src/browser/css/MediaQuery.zig
+@@ -30,7 +30,9 @@
+ //!               `device-height` / `min-device-height` / `max-device-height`,
+ //!               `orientation` (portrait | landscape),
+ //!               `pointer` / `any-pointer` (fine),
+-//!               `hover` / `any-hover` (hover).
++//!               `hover` / `any-hover` (hover),
++//!               `resolution` / `min-resolution` / `max-resolution`.
++//!   - Resolution values: `<number>dppx`, `<number>x`, `<number>dpi`, `<number>dpcm`.
+ //!   - Length values: `<number>px`, `<number>em` (1em = 16px), `<number>rem`,
+ //!     and bare `0`.
+ //!   - Operators: `,` (OR), `and`, `not`, `only`.
+@@ -325,6 +327,12 @@ fn evalNameValue(name: []const u8, value: []const u8, viewport: Viewport) bool {
+         const px = parseLengthPx(value) orelse return false;
+         return height == px;
+     }
++    if (std.mem.eql(u8, lname, "resolution") or std.mem.eql(u8, lname, "min-resolution") or std.mem.eql(u8, lname, "max-resolution")) {
++        const dppx = parseResolutionDppx(value) orelse return false;
++        if (std.mem.eql(u8, lname, "min-resolution")) return viewport.scale >= dppx;
++        if (std.mem.eql(u8, lname, "max-resolution")) return viewport.scale <= dppx;
++        return viewport.scale == dppx;
++    }
+     if (std.mem.eql(u8, lname, "pointer") or std.mem.eql(u8, lname, "any-pointer")) {
+         return std.ascii.eqlIgnoreCase(value, "fine");
+     }
+@@ -352,12 +360,50 @@ fn evalBoolean(name: []const u8, viewport: Viewport) bool {
+ 
+     if (std.mem.eql(u8, lname, "width")) return width > 0;
+     if (std.mem.eql(u8, lname, "height")) return height > 0;
++    if (std.mem.eql(u8, lname, "resolution")) return viewport.scale > 0;
+     if (std.mem.eql(u8, lname, "orientation")) return true;
+     if (std.mem.eql(u8, lname, "pointer") or std.mem.eql(u8, lname, "any-pointer")) return true;
+     if (std.mem.eql(u8, lname, "hover") or std.mem.eql(u8, lname, "any-hover")) return true;
+     return false;
+ }
+ 
++/// Resolution dimensions require a unit even for zero. Normalize to the same
++/// precision as Viewport.scale so equivalent units and JS DPR agree.
++fn parseResolutionDppx(value: []const u8) ?f32 {
++    var i: usize = 0;
++    if (i < value.len and (value[i] == '+' or value[i] == '-')) i += 1;
++    const num_start = i;
++    while (i < value.len and std.ascii.isDigit(value[i])) i += 1;
++    var has_digits = i > num_start;
++    if (i + 1 < value.len and value[i] == '.' and std.ascii.isDigit(value[i + 1])) {
++        i += 1;
++        while (i < value.len and std.ascii.isDigit(value[i])) i += 1;
++        has_digits = true;
++    }
++    if (!has_digits) return null;
++
++    if (i < value.len and (value[i] == 'e' or value[i] == 'E')) {
++        var end = i + 1;
++        if (end < value.len and (value[end] == '+' or value[end] == '-')) end += 1;
++        const exponent_start = end;
++        while (end < value.len and std.ascii.isDigit(value[end])) end += 1;
++        if (end > exponent_start) i = end;
++    }
++
++    const num = std.fmt.parseFloat(f64, value[0..i]) catch return null;
++    if (!std.math.isFinite(num) or num < 0) return null;
++    const unit = value[i..];
++    const dppx: f32 = @floatCast(if (std.ascii.eqlIgnoreCase(unit, "dppx") or std.ascii.eqlIgnoreCase(unit, "x"))
++        num
++    else if (std.ascii.eqlIgnoreCase(unit, "dpi"))
++        num / 96
++    else if (std.ascii.eqlIgnoreCase(unit, "dpcm"))
++        num * (2.54 / 96.0)
++    else
++        return null);
++    return if (std.math.isFinite(dppx)) dppx else null;
++}
++
+ /// Parse CSS numbers with px, em, or rem units (1em=16px), or unitless zero.
+ /// Negative lengths and values beyond the existing u32 pixel limit are rejected.
+ fn parseLengthPx(value: []const u8) ?f64 {

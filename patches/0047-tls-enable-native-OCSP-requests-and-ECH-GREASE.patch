@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 29 Oct 2026 22:22:00 -0300
+Subject: [PATCH] tls: enable native OCSP requests and ECH GREASE
+
+Enable BoringSSL OCSP requests and curl ECH grease mode, including required HTTPSRR build support. Native serialization and randomness are preserved; certificate verification, SCT, ciphers and session caching stay unchanged. Grease mode skips HTTPS-record lookups. Real ECH, revocation enforcement and remaining TLS extensions stay out of scope.
+---
+ build.zig             | 3 +++
+ src/network/http.zig  | 2 ++
+ src/sys/libcrypto.zig | 1 +
+ src/sys/libcurl.zig   | 2 ++
+ 4 files changed, 8 insertions(+)
+
+diff --git a/build.zig b/build.zig
+index 72b0926..236cd7c 100644
+--- a/build.zig
++++ b/build.zig
+@@ -751,6 +751,9 @@ fn buildCurl(
+ 
+         .USE_OPENSSL = true,
+         .OPENSSL_IS_BORINGSSL = true,
++        .USE_ECH = true,
++        .USE_HTTPSRR = true,
++        .HAVE_SSL_SET1_ECH_CONFIG_LIST = true,
+         .CURL_BORINGSSL_VERSION = null,
+         .CURL_CA_PATH = null,
+         .CURL_CA_BUNDLE = null,
+diff --git a/src/network/http.zig b/src/network/http.zig
+index 066bcc5..d51da1e 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -469,6 +469,7 @@ pub const Connection = struct {
+         }
+ 
+         // TLS.
++        try libcurl.curl_easy_setopt(self._easy, .ech, "grease");
+         try libcurl.curl_easy_setopt(self._easy, .ssl_ctx_function, &(struct {
+             fn wrap(
+                 _: *libcurl.Curl,
+@@ -483,6 +484,7 @@ pub const Connection = struct {
+                 crypto.SSL_CTX_set_grease_sigalgs_enabled(ssl_ctx, 1);
+                 crypto.SSL_CTX_set_permute_extensions(ssl_ctx, 1);
+                 crypto.SSL_CTX_enable_signed_cert_timestamps(ssl_ctx);
++                crypto.SSL_CTX_enable_ocsp_stapling(ssl_ctx);
+ 
+                 // Chromium's cipher policy retains the backend's AES-aware ordering.
+                 if (crypto.SSL_CTX_set_strict_cipher_list(ssl_ctx, "ALL:!aPSK:!ECDSA+SHA1:!3DES") != 1) {
+diff --git a/src/sys/libcrypto.zig b/src/sys/libcrypto.zig
+index 3395c00..125a287 100644
+--- a/src/sys/libcrypto.zig
++++ b/src/sys/libcrypto.zig
+@@ -185,6 +185,7 @@ pub extern fn SSL_CTX_set_grease_enabled(ctx: *SSL_CTX, enabled: c_int) void;
+ pub extern fn SSL_CTX_set_grease_sigalgs_enabled(ctx: *SSL_CTX, enabled: c_int) void;
+ pub extern fn SSL_CTX_set_permute_extensions(ctx: *SSL_CTX, enabled: c_int) void;
+ pub extern fn SSL_CTX_enable_signed_cert_timestamps(ctx: *SSL_CTX) void;
++pub extern fn SSL_CTX_enable_ocsp_stapling(ctx: *SSL_CTX) void;
+ pub extern fn SSL_CTX_set_strict_cipher_list(ctx: *SSL_CTX, str: [*:0]const u8) c_int;
+ pub extern fn SSL_CTX_set_verify_algorithm_prefs(ctx: *SSL_CTX, prefs: [*]const u16, num_prefs: usize) c_int;
+ 
+diff --git a/src/sys/libcurl.zig b/src/sys/libcurl.zig
+index 6cd8743..928ac33 100644
+--- a/src/sys/libcurl.zig
++++ b/src/sys/libcurl.zig
+@@ -207,6 +207,7 @@ const CurlOption = enum(c.CURLoption) {
+     proxy_ssl_verify_host = c.CURLOPT_PROXY_SSL_VERIFYHOST,
+     proxy_ssl_verify_peer = c.CURLOPT_PROXY_SSL_VERIFYPEER,
+     accept_encoding = c.CURLOPT_ACCEPT_ENCODING,
++    ech = c.CURLOPT_ECH,
+     verbose = c.CURLOPT_VERBOSE,
+     debug_function = c.CURLOPT_DEBUGFUNCTION,
+     custom_request = c.CURLOPT_CUSTOMREQUEST,
+@@ -640,6 +641,7 @@ pub fn curl_easy_setopt(easy: *Curl, comptime option: CurlOption, value: anytype
+         .url,
+         .proxy,
+         .accept_encoding,
++        .ech,
+         .custom_request,
+         .cookie,
+         .user_pwd,

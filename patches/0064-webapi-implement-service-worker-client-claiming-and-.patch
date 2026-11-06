@@ -1,0 +1,609 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 3 Nov 2026 23:53:39 -0300
+Subject: [PATCH] webapi: implement service-worker client claiming and
+ controllers
+
+Add a native, service-worker-only Clients object with stable identity and
+claim(). Reject inactive workers with InvalidStateError without a nested
+microtask checkpoint, allow claiming during activation, update controllers
+without entering page JavaScript, queue trusted controllerchange events on
+client schedulers, and queue claim-promise resolution on the worker scheduler.
+Repeated claims leave unchanged controllers alone.
+
+Discover document clients session-wide, including documents that never called
+register() or accessed navigator.serviceWorker. Canonicalize creation URLs,
+validate registration-scope origins, discard scope fragments, and use the
+specification's serialized-URL longest-prefix matching after origin checks.
+More-specific registrations win even while installing. Reuse page-realm
+registration/ServiceWorker wrappers for controller identity.
+
+Assign monotonically increasing session-local document IDs rather than using
+reusable Frame addresses. Resolve IDs again at queued event delivery and
+invalidate them before navigation/context reclamation, disconnected iframe
+subtrees, and closed popup subtrees. Clear controllers when existing worker
+registration detachment tears down their native scope. Scheduler finalizers
+release pending claim resolvers and event task arenas on cancellation.
+
+Validation:
+- scripts/build.sh: passed.
+- scripts/build.sh test: all 1658 existing tests passed unchanged.
+- Ignored localhost HTTP/CDP fixtures with serviceworker explicitly enabled:
+  activation waitUntil(clients.claim()), install InvalidStateError and
+  synchronous-statement/microtask ordering, stable Clients identity and realm
+  exposure, undefined promise result, controller wrapper identity, trusted
+  event and event-handler delivery, duplicate-claim suppression, non-registering
+  and lazy-container clients, canonical scope URLs, more-specific installing
+  registrations, out-of-scope/origin/session exclusions, and immutable creation
+  URL after history changes all passed.
+- Loaded removed iframes and descendants of closed popups stay unclaimed and
+  receive no stale events. Queued-claim/removal checks and 15 close/navigation/
+  iframe-reuse stress iterations passed; unregister clears controllers.
+- One reviewer pass: fixed subtree invalidation and inactive-claim promise
+  checkpoint findings, then rebuilt and reran full tests and diagnostics.
+- No new upstream tests or benchmark changes; diagnostics remain uncommitted.
+
+Boundary: in-memory document claiming only. Session plus origin is the current
+storage boundary; partitioned storage keys are not introduced. Workers retain
+existing creating-Page ownership and disappear with it. Existing simplified
+unregister/script replacement still detaches registrations immediately; this is
+not a full service-worker update/unregister pipeline. Automatic navigation
+control, fetch interception, Client wrappers, client enumeration, extendable
+message delivery and worker-to-page replies remain unsupported. Experimental
+feature defaults, ready semantics and persona values are not expanded. This
+intermediate patch does not claim benchmark completeness or success.
+
+Specification references:
+https://w3c.github.io/ServiceWorker/#clients-claim
+https://w3c.github.io/ServiceWorker/#notify-controller-change-algorithm
+https://w3c.github.io/ServiceWorker/#scope-match-algorithm
+---
+ src/browser/Frame.zig                         |  33 ++++-
+ src/browser/Session.zig                       |   5 +
+ src/browser/js/bridge.zig                     |   2 +
+ src/browser/webapi/Clients.zig                | 125 ++++++++++++++++++
+ src/browser/webapi/ServiceWorkerContainer.zig |  99 +++++++++++++-
+ .../webapi/ServiceWorkerGlobalScope.zig       |  21 ++-
+ .../webapi/ServiceWorkerRegistration.zig      |   2 +
+ src/browser/webapi/Window.zig                 |   1 +
+ 8 files changed, 273 insertions(+), 15 deletions(-)
+ create mode 100644 src/browser/webapi/Clients.zig
+
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index d4517c6..d77fd9f 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -98,6 +98,11 @@ _frame_id: u32,
+ // navigate.
+ _loader_id: u32,
+ 
++_service_worker_client_id: u64 = 0,
++// Set at response commit, before scripts run; history changes must not change
++// the creation URL used by the claim algorithm.
++_service_worker_creation_url: ?[:0]const u8 = null,
++
+ page: *Page,
+ 
+ _session: *Session,
+@@ -453,9 +458,17 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
+             }.runIdleTasks, 200, .{ .name = "frame.runIdleTasks", .blocks_done = false });
+         }
+     }
++
++    if (session.experimental_features.serviceworker) {
++        session.service_worker_client_id_gen += 1;
++        const id = session.service_worker_client_id_gen;
++        try session.service_worker_clients.put(session.arena.allocator(), id, self);
++        self._service_worker_client_id = id;
++    }
+ }
+ 
+ pub fn deinit(self: *Frame) void {
++    self.detachServiceWorkerClient();
+     for (self.child_frames.items) |frame| {
+         frame.deinit();
+     }
+@@ -550,6 +563,14 @@ pub fn deinit(self: *Frame) void {
+     self._local_arena.release();
+ }
+ 
++pub fn detachServiceWorkerClient(self: *Frame) void {
++    if (self._service_worker_client_id != 0) {
++        _ = self._session.service_worker_clients.remove(self._service_worker_client_id);
++        self._service_worker_client_id = 0;
++    }
++    for (self.child_frames.items) |child| child.detachServiceWorkerClient();
++}
++
+ pub fn detachPdf(self: *Frame) void {
+     while (self.js.rtc_peers.first) |node| {
+         const peer: *@import("webapi/WebRTC.zig").Peer = @fieldParentPtr("_context_node", node);
+@@ -564,14 +585,15 @@ pub fn detachPdf(self: *Frame) void {
+     for (self.child_frames.items) |child| child.detachPdf();
+ }
+ 
+-fn detachDisconnectedPdf(self: *Frame) void {
++fn detachDisconnectedContexts(self: *Frame) void {
+     if (self.iframe) |iframe| {
+         if (!iframe.asNode().isConnected()) {
++            self.detachServiceWorkerClient();
+             self.detachPdf();
+             return;
+         }
+     }
+-    for (self.child_frames.items) |child| child.detachDisconnectedPdf();
++    for (self.child_frames.items) |child| child.detachDisconnectedContexts();
+ }
+ 
+ pub fn viewportChanged(self: *Frame) void {
+@@ -1555,6 +1577,9 @@ fn frameHeaderDoneCallback(transfer: *HttpClient.Transfer) !HttpClient.Transfer.
+         return error.XFrameOptionsDenied;
+     }
+     try self.js.setOrigin(self.origin);
++    if (self._session.experimental_features.serviceworker) {
++        self._service_worker_creation_url = try URL.resolve(self.arena, "", self.url, .{});
++    }
+ 
+     // After any redirect, drop the original method/body/header so a later
+     // Page.reload doesn't re-POST form data to the redirect target. Conservative
+@@ -2900,8 +2925,8 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
+         return;
+     }
+ 
+-    self.page.frame.detachDisconnectedPdf();
+-    for (self.page.popups.items) |popup| popup.detachDisconnectedPdf();
++    self.page.frame.detachDisconnectedContexts();
++    for (self.page.popups.items) |popup| popup.detachDisconnectedContexts();
+ 
+     // Focus goes with the removed subtree. The focused element can be inside a
+     // shadow tree hanging off it, which the walk below doesn't descend into,
+diff --git a/src/browser/Session.zig b/src/browser/Session.zig
+index eb36595..705f4e2 100644
+--- a/src/browser/Session.zig
++++ b/src/browser/Session.zig
+@@ -84,6 +84,11 @@ shared_workers: std.StringHashMapUnmanaged(*SharedWorkerGlobalScope) = .empty,
+ // pages by url.
+ service_workers: std.StringHashMapUnmanaged(*ServiceWorkerGlobalScope) = .empty,
+ 
++// Document-lifetime identities, never reusable frame addresses. Removed before
++// context teardown; queued client tasks resolve the ID again before delivery.
++service_worker_clients: std.AutoHashMapUnmanaged(u64, *Frame) = .empty,
++service_worker_client_id_gen: u64 = 0,
++
+ _page_destruction_queue: std.ArrayList(*Page) = .empty,
+ 
+ // Round-robin cursor for fair page iteration (processQueuedNavigation)
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 9c2b196..a88f5bd 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1450,6 +1450,7 @@ pub const SharedWorkerJsApis = flattenTypes(&([_]type{@import("../webapi/SharedW
+ 
+ pub const ServiceWorkerJsApis = flattenTypes(&([_]type{
+     @import("../webapi/ServiceWorkerGlobalScope.zig"),
++    @import("../webapi/Clients.zig"),
+     @import("../webapi/ServiceWorker.zig"),
+     @import("../webapi/ServiceWorkerRegistration.zig"),
+     @import("../webapi/event/ExtendableEvent.zig"),
+@@ -1468,6 +1469,7 @@ pub const JsApis = blk: {
+         @import("../webapi/SharedWorkerGlobalScope.zig").JsApi,
+         @import("../webapi/ServiceWorkerGlobalScope.zig").JsApi,
+         //ServiceWorker-only, so it isn't in PageJsApis either.
++        @import("../webapi/Clients.zig").JsApi,
+         @import("../webapi/event/ExtendableEvent.zig").JsApi,
+         @import("../webapi/WorkerGlobalScope.zig").JsApi,
+         @import("../webapi/WorkerLocation.zig").JsApi,
+diff --git a/src/browser/webapi/Clients.zig b/src/browser/webapi/Clients.zig
+new file mode 100644
+index 0000000..5dfd638
+--- /dev/null
++++ b/src/browser/webapi/Clients.zig
+@@ -0,0 +1,125 @@
++// Copyright (C) 2026  Lightpanda (Selecy SAS)
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const URL = @import("../URL.zig");
++const Session = @import("../Session.zig");
++const DOMException = @import("DOMException.zig");
++const ServiceWorkerContainer = @import("ServiceWorkerContainer.zig");
++const ServiceWorkerGlobalScope = @import("ServiceWorkerGlobalScope.zig");
++
++const Clients = @This();
++
++_scope: *ServiceWorkerGlobalScope,
++
++// The spec compares serialized URL prefixes, not path segments. Callers supply
++// canonical URLs and scope registration enforces the same-origin boundary.
++pub fn scopeMatches(scope: *ServiceWorkerGlobalScope, client_url: [:0]const u8) bool {
++    const origin = scope._proto.origin orelse return false;
++    return URL.isSameOrigin(client_url, origin) and
++        URL.isSameOrigin(scope._scope_url, origin) and
++        std.mem.startsWith(u8, client_url, scope._scope_url);
++}
++
++fn matchingRegistration(session: *Session, client_url: [:0]const u8) ?*ServiceWorkerGlobalScope {
++    var best: ?*ServiceWorkerGlobalScope = null;
++    var it = session.service_workers.valueIterator();
++    while (it.next()) |entry| {
++        const scope = entry.*;
++        if (scopeMatches(scope, client_url) == false) continue;
++        // Even an installing, more-specific registration prevents an outer
++        // registration from claiming this client.
++        if (best == null or scope._scope_url.len > best.?._scope_url.len) {
++            best = scope;
++        }
++    }
++    return best;
++}
++
++pub fn claim(self: *Clients, exec: *js.Execution) !js.Promise {
++    const resolver = exec.js.local.?.createPromiseResolver();
++    const scope = self._scope;
++    if (scope.hasActiveWorker() == false) {
++        const exception = DOMException.init("The service worker is not active.", "InvalidStateError");
++        try resolver.rejectValue(try exec.js.local.?.zigValueToJs(exception, .{}));
++        return resolver.promise();
++    }
++
++    const session = scope._proto._session;
++    var it = session.service_worker_clients.valueIterator();
++    while (it.next()) |entry| {
++        const frame = entry.*;
++        const client_url = frame._service_worker_creation_url orelse continue;
++        if (frame.page.destroying or frame.window._closed or frame.isSecureContext() == false or frame.isSameOrigin(scope._proto.url) == false) continue;
++        if (matchingRegistration(session, client_url) != scope) continue;
++
++        const navigator = frame.window._navigator;
++        const container = navigator._service_worker orelse blk: {
++            const container = try ServiceWorkerContainer.init(frame);
++            navigator._service_worker = container;
++            break :blk container;
++        };
++        try container.claim(scope);
++    }
++
++    // Queue resolution after updating controllers and queuing their change
++    // events. Never run page JS inside the discovery walk.
++    const arena = try session.getArena(.tiny, "Clients.claim");
++    errdefer arena.release();
++    const callback = try arena.create(ClaimCallback);
++    callback.* = .{ .arena = arena, .js_context = exec.js, .resolver = try resolver.persist() };
++    errdefer callback.resolver.release();
++    try exec.js.scheduler.add(callback, ClaimCallback.run, 0, .{
++        .name = "Clients.claim",
++        .finalizer = ClaimCallback.cancelled,
++    });
++    return resolver.promise();
++}
++
++const ClaimCallback = struct {
++    arena: *lp.Arena,
++    js_context: *js.Context,
++    resolver: js.PromiseResolver.Global,
++
++    fn cancelled(ctx: *anyopaque) void {
++        const self: *ClaimCallback = @ptrCast(@alignCast(ctx));
++        self.resolver.release();
++        self.arena.release();
++    }
++
++    fn run(ctx: *anyopaque) !?u32 {
++        const self: *ClaimCallback = @ptrCast(@alignCast(ctx));
++        defer cancelled(ctx);
++        var ls: js.Local.Scope = undefined;
++        self.js_context.localScope(&ls);
++        defer ls.deinit();
++        ls.toLocal(self.resolver).resolve("Clients.claim", {});
++        return null;
++    }
++};
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Clients);
++    pub const Meta = struct {
++        pub const name = "Clients";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const claim = bridge.function(Clients.claim, .{});
++};
+diff --git a/src/browser/webapi/ServiceWorkerContainer.zig b/src/browser/webapi/ServiceWorkerContainer.zig
+index d60a427..fa576d3 100644
+--- a/src/browser/webapi/ServiceWorkerContainer.zig
++++ b/src/browser/webapi/ServiceWorkerContainer.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -25,6 +26,9 @@ const URL = @import("../URL.zig");
+ const Frame = @import("../Frame.zig");
+ 
+ const Worker = @import("Worker.zig");
++const WorkerGlobalScope = @import("WorkerGlobalScope.zig");
++const Event = @import("Event.zig");
++const Clients = @import("Clients.zig");
+ const EventTarget = @import("EventTarget.zig");
+ const ServiceWorker = @import("ServiceWorker.zig");
+ const ServiceWorkerGlobalScope = @import("ServiceWorkerGlobalScope.zig");
+@@ -38,8 +42,10 @@ pub const Proto = EventTarget;
+ 
+ _proto: *EventTarget,
+ _frame: *Frame,
++_controller: ?*ServiceWorkerRegistration = null,
++_on_controller_change: ?js.Function.Global = null,
+ 
+-// One per scope this container has registered
++// One per scope this document has registered or been claimed by
+ _registrations: std.ArrayList(*ServiceWorkerRegistration) = .empty,
+ 
+ _ready: ?js.Promise.Global = null,
+@@ -61,6 +67,7 @@ pub fn init(frame: *Frame) !*ServiceWorkerContainer {
+ 
+ // Called from Frame.deinit
+ pub fn detach(self: *ServiceWorkerContainer) void {
++    self._controller = null;
+     for (self._registrations.items) |registration| {
+         registration.detach();
+     }
+@@ -132,12 +139,21 @@ pub fn register(self: *ServiceWorkerContainer, url: []const u8, options: ?Regist
+             break :blk2 script_url[0 .. end + 1];
+         };
+ 
+-        break :blk URL.resolve(frame.local_arena, frame.base(), raw, .{ .encoding = frame.charset }) catch {
++        const without_fragment = raw[0 .. std.mem.indexOfScalar(u8, raw, '#') orelse raw.len];
++        break :blk URL.resolve(frame.local_arena, frame.base(), without_fragment, .{ .encoding = frame.charset }) catch {
+             resolver.rejectError("ServiceWorkerContainer.register", .{ .type_error = "Failed to resolve scope URL" });
+             return resolver.promise();
+         };
+     };
+ 
++    if (frame.isSameOrigin(scope_url) == false) {
++        resolver.reject("ServiceWorkerContainer.register", @import("DOMException.zig").init(
++            "The origin of the provided scope does not match the current origin.",
++            "SecurityError",
++        ));
++        return resolver.promise();
++    }
++
+     const scope = ServiceWorkerGlobalScope.getOrCreate(frame, script_url, scope_url, opts.type) catch |err| {
+         log.debug(.browser, "SWC register", .{ .url = script_url, .err = err });
+         resolver.rejectError("ServiceWorkerContainer.register", .{ .type_error = "Failed to register a ServiceWorker" });
+@@ -168,9 +184,51 @@ fn track(self: *ServiceWorkerContainer, scope: *ServiceWorkerGlobalScope) !*Serv
+     return registration;
+ }
+ 
+-// For now, always null: we never dispatch fetch events.
+-pub fn getController(_: *ServiceWorkerContainer) ?*ServiceWorker {
+-    return null;
++pub fn getController(self: *ServiceWorkerContainer) !?*ServiceWorker {
++    const registration = self._controller orelse return null;
++    const scope = registration._scope orelse return null;
++    return try registration.worker(scope);
++}
++
++pub fn claim(self: *ServiceWorkerContainer, scope: *ServiceWorkerGlobalScope) !void {
++    if (self._controller) |registration| {
++        if (registration._scope == scope) return;
++    }
++    const registration = try self.track(scope);
++    try self.scheduleControllerChange();
++    self._controller = registration;
++}
++
++// Called before a worker's native memory is released. Container teardown clears
++// its controller first and invalidates its document ID, so it queues no event.
++pub fn workerDetached(self: *ServiceWorkerContainer, registration: *ServiceWorkerRegistration) void {
++    if (self._controller != registration) return;
++    self._controller = null;
++    self.scheduleControllerChange() catch |err| {
++        log.debug(.browser, "SWC controllerchange", .{ .err = err });
++    };
++}
++
++fn scheduleControllerChange(self: *ServiceWorkerContainer) !void {
++    const frame = self._frame;
++    const id = frame._service_worker_client_id;
++    if (id == 0) return;
++    const arena = try frame._session.getArena(.tiny, "ServiceWorkerContainer.controllerchange");
++    errdefer arena.release();
++    const callback = try arena.create(ControllerChangeCallback);
++    callback.* = .{ .arena = arena, .session = frame._session, .client_id = id };
++    try frame.js.scheduler.add(callback, ControllerChangeCallback.run, 0, .{
++        .name = "ServiceWorkerContainer.controllerchange",
++        .finalizer = ControllerChangeCallback.cancelled,
++    });
++}
++
++pub fn getOnControllerChange(self: *const ServiceWorkerContainer) ?js.Function.Global {
++    return self._on_controller_change;
++}
++
++pub fn setOnControllerChange(self: *ServiceWorkerContainer, setter: ?WorkerGlobalScope.FunctionSetter) void {
++    self._on_controller_change = WorkerGlobalScope.getFunctionFromSetter(setter);
+ }
+ 
+ pub fn getReady(self: *ServiceWorkerContainer, exec: *const js.Execution) !js.Promise {
+@@ -234,6 +292,7 @@ fn activeRegistration(self: *ServiceWorkerContainer) ?*ServiceWorkerRegistration
+ 
+ // The registration whose scope covers `client_url`, longest scope winning.
+ fn matchScope(self: *ServiceWorkerContainer, only_active: bool, client_url: []const u8) ?*ServiceWorkerRegistration {
++    const canonical_url = URL.resolve(self._frame.local_arena, "", client_url, .{}) catch return null;
+     var best_len: usize = 0;
+     var best: ?*ServiceWorkerRegistration = null;
+ 
+@@ -243,7 +302,7 @@ fn matchScope(self: *ServiceWorkerContainer, only_active: bool, client_url: []co
+             continue;
+         }
+         const scope_url = scope._scope_url;
+-        if (std.mem.startsWith(u8, client_url, scope_url) == false) {
++        if (Clients.scopeMatches(scope, canonical_url) == false) {
+             continue;
+         }
+         if (best == null or scope_url.len > best_len) {
+@@ -257,6 +316,33 @@ fn matchScope(self: *ServiceWorkerContainer, only_active: bool, client_url: []co
+ // Messages from a worker are delivered as soon as they're posted
+ pub fn startMessages(_: *ServiceWorkerContainer) void {}
+ 
++const ControllerChangeCallback = struct {
++    arena: *lp.Arena,
++    session: *@import("../Session.zig"),
++    client_id: u64,
++
++    fn cancelled(ctx: *anyopaque) void {
++        const self: *ControllerChangeCallback = @ptrCast(@alignCast(ctx));
++        self.arena.release();
++    }
++
++    fn run(ctx: *anyopaque) !?u32 {
++        const self: *ControllerChangeCallback = @ptrCast(@alignCast(ctx));
++        defer self.arena.release();
++        const frame = self.session.service_worker_clients.get(self.client_id) orelse return null;
++        if (frame.page.destroying) return null;
++        const container = frame.window._navigator._service_worker orelse return null;
++        const event = try Event.initTrusted(.wrap("controllerchange"), .{
++            .bubbles = false,
++            .cancelable = false,
++        }, frame.page);
++        try frame.js.execution.dispatch(container._proto, event, container._on_controller_change, .{
++            .context = "SWC controllerchange",
++        });
++        return null;
++    }
++};
++
+ const ReadyCallback = struct {
+     arena: *lp.Arena,
+     container: *ServiceWorkerContainer,
+@@ -297,6 +383,7 @@ pub const JsApi = struct {
+     };
+ 
+     pub const controller = bridge.accessor(ServiceWorkerContainer.getController, null, .{});
++    pub const oncontrollerchange = bridge.accessor(ServiceWorkerContainer.getOnControllerChange, ServiceWorkerContainer.setOnControllerChange, .{});
+     pub const ready = bridge.accessor(ServiceWorkerContainer.getReady, null, .{});
+     pub const register = bridge.function(ServiceWorkerContainer.register, .{});
+     pub const getRegistration = bridge.function(ServiceWorkerContainer.getRegistration, .{});
+diff --git a/src/browser/webapi/ServiceWorkerGlobalScope.zig b/src/browser/webapi/ServiceWorkerGlobalScope.zig
+index a880914..64251e4 100644
+--- a/src/browser/webapi/ServiceWorkerGlobalScope.zig
++++ b/src/browser/webapi/ServiceWorkerGlobalScope.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -37,6 +38,8 @@ const ExtendableEvent = @import("event/ExtendableEvent.zig");
+ const log = lp.log;
+ const String = lp.String;
+ 
++const Clients = @import("Clients.zig");
++
+ const ServiceWorkerGlobalScope = @This();
+ 
+ pub const Proto = WorkerGlobalScope;
+@@ -50,7 +53,8 @@ const ScriptLoad = struct {
+ _proto: *WorkerGlobalScope,
+ _arena: *lp.Arena,
+ 
+-_scope_url: []const u8,
++_scope_url: [:0]const u8,
++_clients: ?*Clients = null,
+ _state: ServiceWorker.State = .parsed,
+ 
+ // The in-flight fetch of the initial script.
+@@ -104,7 +108,7 @@ fn init(
+         ServiceWorkerGlobalScope{
+             ._proto = undefined,
+             ._arena = arena,
+-            ._scope_url = try arena.dupe(u8, scope_url),
++            ._scope_url = try arena.dupeZ(u8, scope_url),
+         },
+         worker_type == .module,
+         frame_id,
+@@ -540,6 +544,14 @@ const ReceiveMessageCallback = struct {
+     }
+ };
+ 
++pub fn getClients(self: *ServiceWorkerGlobalScope) !*Clients {
++    if (self._clients) |clients| return clients;
++    const clients = try self._proto.arena.create(Clients);
++    clients.* = .{ ._scope = self };
++    self._clients = clients;
++    return clients;
++}
++
+ pub fn getRegistration(self: *ServiceWorkerGlobalScope, exec: *js.Execution) !*ServiceWorkerRegistration {
+     if (self._self_registration) |r| {
+         return r;
+@@ -608,6 +620,7 @@ pub const JsApi = struct {
+         pub var class_id: bridge.ClassId = undefined;
+     };
+ 
++    pub const clients = bridge.accessor(ServiceWorkerGlobalScope.getClients, null, .{});
+     pub const registration = bridge.accessor(ServiceWorkerGlobalScope.getRegistration, null, .{});
+     pub const serviceWorker = bridge.accessor(ServiceWorkerGlobalScope.getServiceWorker, null, .{});
+     pub const skipWaiting = bridge.function(ServiceWorkerGlobalScope.skipWaiting, .{});
+@@ -617,7 +630,5 @@ pub const JsApi = struct {
+     pub const onactivate = bridge.accessor(ServiceWorkerGlobalScope.getOnActivate, ServiceWorkerGlobalScope.setOnActivate, .{});
+     pub const onmessage = bridge.accessor(ServiceWorkerGlobalScope.getOnMessage, ServiceWorkerGlobalScope.setOnMessage, .{});
+ 
+-    // Deliberately absent: `onfetch` and `clients`. Nothing dispatches fetch
+-    // events yet, and an accessor that silently never fires is worse than a
+-    // missing one — a site can at least feature-detect the latter.
++    // Fetch interception remains unsupported; deliberately no onfetch.
+ };
+diff --git a/src/browser/webapi/ServiceWorkerRegistration.zig b/src/browser/webapi/ServiceWorkerRegistration.zig
+index 56b5fae..89f236d 100644
+--- a/src/browser/webapi/ServiceWorkerRegistration.zig
++++ b/src/browser/webapi/ServiceWorkerRegistration.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -68,6 +69,7 @@ pub fn init(scope: *ServiceWorkerGlobalScope, container: ?*ServiceWorkerContaine
+ pub fn detach(self: *ServiceWorkerRegistration) void {
+     const scope = self._scope orelse return;
+     self._scope = null;
++    if (self._container) |container| container.workerDetached(self);
+     scope._registrations.remove(&self._node);
+     if (self._worker) |w| {
+         w.detach();
+diff --git a/src/browser/webapi/Window.zig b/src/browser/webapi/Window.zig
+index ccbce11..2cda74c 100644
+--- a/src/browser/webapi/Window.zig
++++ b/src/browser/webapi/Window.zig
+@@ -822,6 +822,7 @@ pub fn close(self: *Window) void {
+     } else return;
+ 
+     self._closed = true;
++    frame.detachServiceWorkerClient();
+     frame.detachPdf();
+ 
+     // Any live Window holding us as its opener must drop the reference —

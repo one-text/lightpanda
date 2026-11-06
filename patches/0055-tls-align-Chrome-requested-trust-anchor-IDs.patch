@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Sun, 1 Nov 2026 00:17:16 -0300
+Subject: [PATCH] tls: align Chrome requested trust-anchor IDs
+
+Advertise Chrome's 28 requested Trust Anchor IDs using BoringSSL's
+SSL_CTX_set1_requested_trust_anchors API in the existing TLS context
+callback. The sorted, length-prefixed ID list is 184 bytes; BoringSSL
+owns its copy and serializes extension 51764 with a 186-byte payload.
+Abort TLS setup if the native setter fails.
+
+Pin the IDs from Chrome 155.0.8059.40 Chrome Root Store v39; these match
+the installed Linux Chrome 154.0.8037.97 baseline captures exactly.
+This is a fixed fingerprint policy, not a replacement Chrome trust
+store: retain system/custom roots, hostname verification and existing
+certificate acceptance. ALPS remains a separate fingerprint gap.
+
+References:
+https://chromium.googlesource.com/chromium/src/+/155.0.8059.40/net/data/ssl/chrome_root_store/root_store.textproto
+https://chromium.googlesource.com/chromium/src/+/155.0.8059.40/net/socket/ssl_client_socket_impl.cc
+fingerprint/README.md
+---
+ src/network/http.zig  | 35 +++++++++++++++++++++++++++++++++++
+ src/sys/libcrypto.zig |  1 +
+ 2 files changed, 36 insertions(+)
+
+diff --git a/src/network/http.zig b/src/network/http.zig
+index 3de0316..3581e4f 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -510,6 +510,41 @@ pub const Connection = struct {
+                     return libcurl.CURLE.ABORTED_BY_CALLBACK;
+                 }
+ 
++                // Chrome 155 / Chrome Root Store v39 IDs in sorted TLS wire format.
++                // Advertising these IDs does not change certificate verification.
++                const trust_anchor_ids: []const u8 =
++                    "\x05\x82\xdf\x13\x02\x01" ++
++                    "\x05\x82\xdf\x13\x02\x06" ++
++                    "\x05\x82\xdf\x13\x02\x0d" ++
++                    "\x05\x82\xdf\x13\x02\x0e" ++
++                    "\x05\x82\xdf\x13\x02\x0f" ++
++                    "\x05\x82\xdf\x13\x02\x12" ++
++                    "\x05\x82\xdf\x13\x02\x13" ++
++                    "\x05\x82\xdf\x13\x02\x14" ++
++                    "\x08\x83\x9a\x64\x8c\x9b\x2d\x01\x07" ++
++                    "\x08\x83\x9a\x64\x8c\x9b\x2d\x01\x08" ++
++                    "\x08\x83\x9a\x64\x8c\x9b\x2d\x01\x09" ++
++                    "\x08\x83\x9a\x64\x8c\x9b\x2d\x01\x0a" ++
++                    "\x08\x83\x9a\x64\x8c\x9b\x2d\x01\x0b" ++
++                    "\x08\x83\x9a\x64\x8c\x9b\x2d\x01\x0c" ++
++                    "\x08\x83\x9a\x64\x8c\x9b\x2d\x01\x0d" ++
++                    "\x08\x83\x9a\x64\x8c\x9b\x2d\x01\x12" ++
++                    "\x08\x83\x9a\x64\x8c\x9b\x2d\x01\x13" ++
++                    "\x04\xd6\x79\x09\x01" ++
++                    "\x04\xd6\x79\x09\x04" ++
++                    "\x04\xd6\x79\x09\x05" ++
++                    "\x04\xd6\x79\x09\x06" ++
++                    "\x04\xd6\x79\x09\x07" ++
++                    "\x04\xd6\x79\x09\x08" ++
++                    "\x04\xd6\x79\x09\x0a" ++
++                    "\x04\xd6\x79\x09\x0b" ++
++                    "\x04\xd6\x79\x09\x0c" ++
++                    "\x04\xd6\x79\x09\x0d" ++
++                    "\x04\xd6\x79\x09\x0f";
++                if (crypto.SSL_CTX_set1_requested_trust_anchors(ssl_ctx, trust_anchor_ids.ptr, trust_anchor_ids.len) != 1) {
++                    return libcurl.CURLE.ABORTED_BY_CALLBACK;
++                }
++
+                 // Chromium's cipher policy retains the backend's AES-aware ordering.
+                 if (crypto.SSL_CTX_set_strict_cipher_list(ssl_ctx, "ALL:!aPSK:!ECDSA+SHA1:!3DES") != 1) {
+                     return libcurl.CURLE.ABORTED_BY_CALLBACK;
+diff --git a/src/sys/libcrypto.zig b/src/sys/libcrypto.zig
+index 19e84d9..9bd3af2 100644
+--- a/src/sys/libcrypto.zig
++++ b/src/sys/libcrypto.zig
+@@ -181,6 +181,7 @@ pub extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *?[*]const u8, len:
+ pub const SSL_OP_NO_TICKET: u32 = 0x00004000;
+ pub extern fn SSL_CTX_clear_options(ctx: *SSL_CTX, options: u32) u32;
+ pub extern fn SSL_CTX_set1_verify_cert_store(ctx: ?*SSL_CTX, store: ?*X509_STORE) c_int;
++pub extern fn SSL_CTX_set1_requested_trust_anchors(ctx: *SSL_CTX, ids: [*]const u8, ids_len: usize) c_int;
+ pub extern fn SSL_CTX_set_grease_enabled(ctx: *SSL_CTX, enabled: c_int) void;
+ pub extern fn SSL_CTX_set_grease_sigalgs_enabled(ctx: *SSL_CTX, enabled: c_int) void;
+ pub extern fn SSL_CTX_set_permute_extensions(ctx: *SSL_CTX, enabled: c_int) void;

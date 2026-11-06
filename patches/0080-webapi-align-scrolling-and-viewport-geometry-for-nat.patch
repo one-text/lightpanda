@@ -1,0 +1,257 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Fri, 6 Nov 2026 10:16:40 -0300
+Subject: [PATCH] webapi: align scrolling and viewport geometry for native
+ clicks
+
+Make CDP scrollIntoViewIfNeeded move the existing window scroller on both
+axes, honor an optional element-relative rectangle, and leave visible axes
+unchanged. Share ordinary-flow client coordinates with hit testing and
+report actual window offsets in CDP viewport metrics. Preserve positioned
+coordinates without double subtraction, including synthetic auto-inset
+viewport-fixed anchors.
+
+Keep the existing synthetic layout, screenshot dimensions, scroll extents
+and input routing. Automatic nested scrolling and general CSS/painting
+correctness remain outside scope. Adjust the existing wheel-chain test's
+pointer coordinates after viewport scrolling; add no upstream tests.
+
+Validation: ReleaseFast and Debug builds; all 1658 upstream tests; seven
+temporary native Playwright probe groups. Native Flux sidebar navigation,
+GitHub navigation expansion and Steam agreement checking succeed; Flux
+search receives the click. Renovate Clear receives the native click but
+still lacks reset activation, outside this viewport fix. Passive benchmark:
+123/130, with both explicit rectangle consistency checks passing. One
+reviewer finding on auto-inset fixed controls was addressed and validated.
+---
+ src/browser/webapi/Document.zig  |  2 +-
+ src/browser/webapi/Element.zig   | 66 ++++++++++++++++++++++++--------
+ src/server/cdp/domains/dom.zig   |  6 ++-
+ src/server/cdp/domains/input.zig |  5 ++-
+ src/server/cdp/domains/page.zig  | 24 ++++++------
+ 5 files changed, 71 insertions(+), 32 deletions(-)
+
+diff --git a/src/browser/webapi/Document.zig b/src/browser/webapi/Document.zig
+index 95ec0e5..914b9a5 100644
+--- a/src/browser/webapi/Document.zig
++++ b/src/browser/webapi/Document.zig
+@@ -1038,7 +1038,7 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame:
+             try flow_positions.put(frame.local_arena, element, pos);
+             hidden = hidden or style_manager.hasDisplayNone(element);
+             if (!hidden) {
+-                const top = element.positionedCoordinate(frame, .height, &flow_positions) orelse pos;
++                const top = element.clientCoordinate(frame, .height, &flow_positions);
+                 if (y >= top and y <= top + element.boxAxis(frame, .height)) {
+                     if (ignore_x) {
+                         topmost = element;
+diff --git a/src/browser/webapi/Element.zig b/src/browser/webapi/Element.zig
+index c0b24b5..1f0858c 100644
+--- a/src/browser/webapi/Element.zig
++++ b/src/browser/webapi/Element.zig
+@@ -1635,7 +1635,7 @@ pub fn boundingClientRectValues(self: *Element, frame: *Frame) DOMRect.Data {
+ pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect.Data {
+     return .{
+         .x = self.horizontalPosition(frame),
+-        .y = self.positionedClientCoordinate(frame, .height) orelse calculateDocumentPosition(self.asNode()),
++        .y = self.clientCoordinate(frame, .height, null),
+         .width = self.boxAxis(frame, .width),
+         .height = self.boxAxis(frame, .height),
+     };
+@@ -1980,7 +1980,18 @@ fn countSubtreeNodes(node: *Node) f64 {
+ // translateX is commonly used to shift elements around, e.g. in a carousel to
+ // shift things around. So we honor any transform: translateX inline styles.
+ pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
+-    return self.positionedClientCoordinate(frame, .width) orelse self.flowHorizontalPosition(frame);
++    return self.clientCoordinate(frame, .width, null);
++}
++
++// Positioned coordinates are already viewport-relative. Preserve the synthetic
++// anchor for auto-inset viewport-fixed axes too; only ordinary flow scrolls.
++pub fn clientCoordinate(self: *Element, frame: *Frame, comptime axis: Axis, positions: ?*const FlowPositions) f64 {
++    if (self.positionedCoordinate(frame, axis, positions)) |value| return value;
++    const flow = self.flowCoordinate(frame, axis, positions);
++    if (self.isViewportFixed(frame)) return flow;
++    const owner = self.ownerFrame(frame) orelse return 0;
++    const window_scroll: f64 = @floatFromInt(if (axis == .width) owner.window.getScrollX() else owner.window.getScrollY());
++    return flow - self.ancestorScroll(null, frame, axis) - window_scroll;
+ }
+ 
+ fn flowHorizontalPosition(self: *Element, frame: *Frame) f64 {
+@@ -2176,15 +2187,41 @@ pub fn clone(self: *Element, deep: bool, document: *const Node.Document, frame:
+ }
+ 
+ pub fn scrollIntoViewIfNeeded(self: *Element, center_if_needed: ?bool, frame: *Frame) void {
+-    _ = center_if_needed;
+-    const positioned_y = self.positionedClientCoordinate(frame, .height);
+-    const y = positioned_y orelse calculateDocumentPosition(self.asNode());
+-    const scroll_y: f64 = if (positioned_y != null) 0 else @floatFromInt(frame.window.getScrollY());
+-    const viewport_height: f64 = @floatFromInt(frame.window.getInnerHeight(frame));
+-    if (y >= scroll_y and y <= scroll_y + viewport_height) {
+-        return;
+-    }
+-    self.scrollIntoView(null, frame);
++    self.scrollClientRectIntoView(null, center_if_needed orelse false, frame) catch {};
++}
++
++// Shared by the DOM and CDP entry points. The optional rectangle is relative
++// to the element; only axes outside the viewport need to move. This uses the
++// existing window scroller, not a separate automation-only scroll state.
++pub fn scrollClientRectIntoView(self: *Element, relative_rect: ?DOMRect.Data, center: bool, frame: *Frame) !void {
++    if (!self.isVisible(frame) or self.isViewportFixed(frame)) return;
++    const owner = self.ownerFrame(frame) orelse return;
++    var rect = self.boundingClientRectValuesForVisible(owner);
++    if (relative_rect) |relative| {
++        if (!std.math.isFinite(relative.x) or !std.math.isFinite(relative.y) or
++            !std.math.isFinite(relative.width) or !std.math.isFinite(relative.height) or
++            relative.width < 0 or relative.height < 0) return error.InvalidParams;
++        rect.x += relative.x;
++        rect.y += relative.y;
++        rect.width = relative.width;
++        rect.height = relative.height;
++    }
++    const viewport = owner.page.getViewport();
++    const width: f64 = @floatFromInt(viewport.width);
++    const height: f64 = @floatFromInt(viewport.height);
++    const left = if (rect.x < 0 or rect.x + rect.width > width)
++        scrollOffset(@as(f64, @floatFromInt(owner.window.getScrollX())) + rect.x + if (center) (rect.width - width) / 2 else @as(f64, 0))
++    else
++        null;
++    const top = if (rect.y < 0 or rect.y + rect.height > height)
++        scrollOffset(@as(f64, @floatFromInt(owner.window.getScrollY())) + rect.y + if (center) (rect.height - height) / 2 else @as(f64, 0))
++    else
++        null;
++    try owner.window.scrollTo(.{ .opts = .{ .left = left, .top = top } }, null, owner);
++}
++
++fn scrollOffset(value: f64) i32 {
++    return @intFromFloat(std.math.clamp(value, 0, std.math.maxInt(i32)));
+ }
+ 
+ const ScrollIntoViewOpts = union {
+@@ -2196,11 +2233,8 @@ pub fn scrollIntoView(self: *Element, opts: ?ScrollIntoViewOpts, frame: *Frame)
+     // Convert supported positioned client coordinates back to document space.
+     if (self.isViewportFixed(frame)) return;
+     const owner = self.ownerFrame(frame) orelse return;
+-    const y = if (self.positionedClientCoordinate(frame, .height)) |client_y|
+-        client_y + @as(f64, @floatFromInt(owner.window.getScrollY()))
+-    else
+-        calculateDocumentPosition(self.asNode());
+-    const target: i32 = @intFromFloat(std.math.clamp(y, 0, std.math.maxInt(i32)));
++    const y = self.clientCoordinate(owner, .height, null) + @as(f64, @floatFromInt(owner.window.getScrollY()));
++    const target = scrollOffset(y);
+     owner.window.scrollTo(.{ .x = 0 }, target, owner) catch {};
+ }
+ 
+diff --git a/src/server/cdp/domains/dom.zig b/src/server/cdp/domains/dom.zig
+index be70a06..e437fe4 100644
+--- a/src/server/cdp/domains/dom.zig
++++ b/src/server/cdp/domains/dom.zig
+@@ -478,12 +478,14 @@ fn scrollIntoViewIfNeeded(cmd: *CDP.Command) !void {
+     })) orelse return error.InvalidParams;
+     // Only 1 of nodeId, backendNodeId, objectId may be set, but chrome just takes the first non-null
+ 
+-    // We retrieve the node to at least check if it exists and is valid.
+     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+     const node = try getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
+ 
+     switch (node.dom._type) {
+-        .element => {},
++        .element => {
++            const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
++            try node.dom.as(DOMNode.Element).scrollClientRectIntoView(params.rect, true, frame);
++        },
+         .document => {},
+         .cdata => {},
+         else => return error.NodeDoesNotHaveGeometry,
+diff --git a/src/server/cdp/domains/input.zig b/src/server/cdp/domains/input.zig
+index c590d76..a0ae3e4 100644
+--- a/src/server/cdp/domains/input.zig
++++ b/src/server/cdp/domains/input.zig
+@@ -593,13 +593,14 @@ test "cdp.input: dispatchMouseEvent mouseWheel chains once the container is satu
+     const chained = try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop === 400 && window.scrollY === 100", null);
+     try testing.expect(chained.isTrue());
+ 
++    // Keep the pointer over the container after the viewport moved 100px.
+     // overscroll-behavior keeps the latch on a container that can't move, so
+     // nothing scrolls at all.
+     _ = try ls.local.compileAndRun("document.getElementById('outerscroll').style.overscrollBehavior = 'contain'", null);
+     try ctx.processMessage(.{
+         .id = 3,
+         .method = "Input.dispatchMouseEvent",
+-        .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y, .deltaY = 100 },
++        .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y - 100, .deltaY = 100 },
+     });
+     const contained = try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop === 400 && window.scrollY === 100", null);
+     try testing.expect(contained.isTrue());
+@@ -610,7 +611,7 @@ test "cdp.input: dispatchMouseEvent mouseWheel chains once the container is satu
+     try ctx.processMessage(.{
+         .id = 4,
+         .method = "Input.dispatchMouseEvent",
+-        .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y, .deltaY = -500 },
++        .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y - 100, .deltaY = -500 },
+     });
+     const upward = try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop === 0 && window.scrollY === 100", null);
+     try testing.expect(upward.isTrue());
+diff --git a/src/server/cdp/domains/page.zig b/src/server/cdp/domains/page.zig
+index 97b0cc0..98085de 100644
+--- a/src/server/cdp/domains/page.zig
++++ b/src/server/cdp/domains/page.zig
+@@ -1154,28 +1154,30 @@ fn getLayoutMetrics(cmd: *CDP.Command) !void {
+     const viewport = cmd.cdp.browser.getViewport();
+     const width = viewport.width;
+     const height = viewport.height;
++    const frame = if (cmd.browser_context) |bc| bc.mainFrame() else null;
++    const scroll_x = if (frame) |f| f.window.getScrollX() else 0;
++    const scroll_y = if (frame) |f| f.window.getScrollY() else 0;
+ 
+     // Full-page height as our text rendering lays it out, so a fullPage
+     // screenshot (getLayoutMetrics → captureScreenshot) is consistent.
+     const content_height: u32 = blk: {
+-        const bc = cmd.browser_context orelse break :blk height;
+-        const frame = bc.mainFrame() orelse break :blk height;
+-        const h = lp.screenshot.contentHeight(cmd.arena, frame.window._document.asNode(), width, frame) catch break :blk height;
++        const main_frame = frame orelse break :blk height;
++        const h = lp.screenshot.contentHeight(cmd.arena, main_frame.window._document.asNode(), width, main_frame) catch break :blk height;
+         break :blk @max(height, h);
+     };
+ 
+     return cmd.sendResult(.{
+         .layoutViewport = .{
+-            .pageX = 0,
+-            .pageY = 0,
++            .pageX = scroll_x,
++            .pageY = scroll_y,
+             .clientWidth = width,
+             .clientHeight = height,
+         },
+         .visualViewport = .{
+             .offsetX = 0,
+             .offsetY = 0,
+-            .pageX = 0,
+-            .pageY = 0,
++            .pageX = scroll_x,
++            .pageY = scroll_y,
+             .clientWidth = width,
+             .clientHeight = height,
+             .scale = 1,
+@@ -1188,16 +1190,16 @@ fn getLayoutMetrics(cmd: *CDP.Command) !void {
+             .height = content_height,
+         },
+         .cssLayoutViewport = .{
+-            .pageX = 0,
+-            .pageY = 0,
++            .pageX = scroll_x,
++            .pageY = scroll_y,
+             .clientWidth = width,
+             .clientHeight = height,
+         },
+         .cssVisualViewport = .{
+             .offsetX = 0,
+             .offsetY = 0,
+-            .pageX = 0,
+-            .pageY = 0,
++            .pageX = scroll_x,
++            .pageY = scroll_y,
+             .clientWidth = width,
+             .clientHeight = height,
+             .scale = 1,

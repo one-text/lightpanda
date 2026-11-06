@@ -1,0 +1,434 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 14 Oct 2026 01:39:43 -0300
+Subject: [PATCH] network: spoof opt-in Neo Device-Memory hint natively
+
+Share the base MacBook Neo's 8GB memory value between the native
+navigator.deviceMemory getter and the legacy Device-Memory wire hint.
+Do not read the host's RAM or inject JavaScript.
+
+Persist case-insensitive Device-Memory Accept-CH opt-in by origin within
+each Session, from trustworthy top-level navigation responses (including
+redirects and CDP fulfillment). Validate the complete structured token
+list and its parameters. Missing/malformed lists preserve the preference;
+valid empty/replacement lists remove it.
+
+Generate an unquoted browser-owned HTTP hint before interception and
+recompute it after CDP changes/redirects. Respect explicit legacy-header
+overrides and the default self policy, using effective origins for
+inherited about:blank contexts. Keep WebSocket baseline headers unchanged.
+Do not synthesize third-party delegation or other Client Hints.
+
+Avoid replaying stale opt-in after revalidation. Preserve absent Vary
+request headers so negotiation from no hint to Device-Memory: 8 cannot
+reuse the wrong cached representation; update the existing Vary test.
+No new upstream tests are added.
+
+The benchmark previously reported 8 in JavaScript but no header. Temporary
+ignored diagnostics cover native getter shape, opt-in/reset, invalid and
+parameterized lists, inherited origins, session/origin isolation, insecure
+HTTP, CORS, redirects, interception and HTTP caching. All 1658 existing
+upstream tests and 54 runtime diagnostics pass in the development build.
+
+References:
+https://www.apple.com/macbook-neo/specs/
+https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Device-Memory
+https://raw.githubusercontent.com/chromium/chromium/main/services/network/public/cpp/client_hints.cc
+https://raw.githubusercontent.com/chromium/chromium/main/content/browser/client_hints/client_hints.cc
+---
+ src/Config.zig                   |   2 +
+ src/browser/Session.zig          |   4 +
+ src/browser/global_scope.zig     |   3 +
+ src/browser/webapi/Navigator.zig |   3 +-
+ src/network/HttpClient.zig       | 182 +++++++++++++++++++++++++++++++
+ src/network/cache/Cache.zig      |  17 ++-
+ 6 files changed, 205 insertions(+), 6 deletions(-)
+
+diff --git a/src/Config.zig b/src/Config.zig
+index 775239a..3b227de 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -997,6 +997,8 @@ pub const HttpHeaders = struct {
+     /// list, so the two sides cannot drift.
+     pub const chrome_major_version = "155";
+     pub const chrome_full_version = "155.0.8059.40";
++    pub const device_memory_gb: u8 = 8;
++    pub const device_memory_header: [:0]const u8 = std.fmt.comptimePrint("{d}", .{device_memory_gb});
+     pub const ua_platform = "macOS";
+     pub const sec_ch_ua_platform: [:0]const u8 = "\"" ++ ua_platform ++ "\"";
+ 
+diff --git a/src/browser/Session.zig b/src/browser/Session.zig
+index 31d0c27..edf3eb8 100644
+--- a/src/browser/Session.zig
++++ b/src/browser/Session.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -21,6 +22,7 @@ const lp = @import("lightpanda");
+ 
+ const App = @import("../App.zig");
+ const Config = @import("../Config.zig");
++const HttpClient = @import("../network/HttpClient.zig");
+ 
+ const History = @import("webapi/History.zig");
+ const storage = @import("webapi/storage/storage.zig");
+@@ -61,6 +63,7 @@ cache_store: CacheStore, // Per-origin CacheStorage
+ bridge_store: std.StringHashMapUnmanaged([]const u8) = .empty,
+ notification: *Notification,
+ cookie_jar: storage.Cookie.Jar,
++device_memory_hints: HttpClient.DeviceMemoryHints = .{},
+ /// User-provided scripts to inject into header.
+ inject_scripts: []const []const u8 = &.{},
+ 
+@@ -203,6 +206,7 @@ pub fn deinit(self: *Session) void {
+     }
+ 
+     self.cookie_jar.deinit();
++    self.device_memory_hints.deinit(self.browser.app.allocator);
+ 
+     {
+         // Every context is disposed; this GC must not arm a termination.
+diff --git a/src/browser/global_scope.zig b/src/browser/global_scope.zig
+index 21b7524..888a066 100644
+--- a/src/browser/global_scope.zig
++++ b/src/browser/global_scope.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -187,6 +188,7 @@ pub const GlobalScope = union(enum) {
+                 .document_frame_id = frame._frame_id,
+                 .loader_id = frame._loader_id,
+                 .log_page = &frame.page.log_context,
++                .device_memory_hints = &frame._session.device_memory_hints,
+             },
+             .worker => |worker| .{
+                 .scope = self,
+@@ -196,6 +198,7 @@ pub const GlobalScope = union(enum) {
+                 .document_frame_id = worker._frame._frame_id,
+                 .loader_id = worker._loader_id,
+                 .log_page = &worker.page.log_context,
++                .device_memory_hints = &worker._session.device_memory_hints,
+             },
+         };
+     }
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index fb16d32..8639552 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -18,6 +18,7 @@
+ // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ 
+ const std = @import("std");
++const Config = @import("../../Config.zig");
+ 
+ const js = @import("../js/js.zig");
+ const Frame = @import("../Frame.zig");
+@@ -99,7 +100,7 @@ pub fn getHardwareConcurrency(_: *const Navigator) u32 {
+ }
+ 
+ pub fn getDeviceMemory(_: *const Navigator) f64 {
+-    return 8.0;
++    return @floatFromInt(Config.HttpHeaders.device_memory_gb);
+ }
+ 
+ fn getMaxTouchPoints(_: *const Navigator) u32 {
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index d7932b1..ae1a3ed 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -1069,6 +1069,8 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
+                 }
+             }
+ 
++            try setDeviceMemoryHeader(transfer);
++
+             if (self.network.web_bot_auth) |wba| {
+                 const authority = URL.getHost(transfer.req.url);
+                 try wba.signRequest(transfer, authority);
+@@ -1107,6 +1109,7 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
+             }
+ 
+             if (transfer.req.internal == false) {
++                try setDeviceMemoryHeader(transfer);
+                 try setOriginHeader(transfer);
+                 try setFetchMetadataHeaders(transfer, transfer.destination());
+             }
+@@ -1168,6 +1171,179 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
+     }
+ }
+ 
++// Session-owned opt-in for the legacy memory hint; not shared by browser contexts.
++pub const DeviceMemoryHints = struct {
++    origins: std.StringHashMapUnmanaged(void) = .empty,
++
++    pub fn deinit(self: *DeviceMemoryHints, allocator: Allocator) void {
++        var it = self.origins.keyIterator();
++        while (it.next()) |key| allocator.free(key.*);
++        self.origins.deinit(allocator);
++    }
++
++    fn update(self: *DeviceMemoryHints, allocator: Allocator, origin: []const u8, enabled: bool) !void {
++        if (!enabled) {
++            if (self.origins.fetchRemove(origin)) |removed| allocator.free(removed.key);
++        } else if (!self.origins.contains(origin)) {
++            const owned = try allocator.dupe(u8, origin);
++            errdefer allocator.free(owned);
++            try self.origins.put(allocator, owned, {});
++        }
++    }
++};
++
++// Accept-CH is a structured list of tokens. Validate the entire list before
++// changing opt-in, including parameters (which do not affect hint selection).
++const MemoryHintList = struct {
++    rest: []const u8,
++    allocator: Allocator,
++
++    fn token(self: *MemoryHintList) ?[]const u8 {
++        const text = self.rest;
++        if (text.len == 0 or (!std.ascii.isAlphabetic(text[0]) and text[0] != '*')) return null;
++        var len: usize = 1;
++        while (len < text.len) : (len += 1) {
++            switch (text[len]) {
++                'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~', ':', '/' => {},
++                else => break,
++            }
++        }
++        self.rest = text[len..];
++        return text[0..len];
++    }
++
++    fn bareItem(self: *MemoryHintList) !bool {
++        if (self.rest.len == 0) return false;
++        switch (self.rest[0]) {
++            '"' => {
++                self.rest = self.rest[1..];
++                while (self.rest.len > 0) {
++                    const c = self.rest[0];
++                    self.rest = self.rest[1..];
++                    if (c == '"') return true;
++                    if (c < 0x20 or c > 0x7e) return false;
++                    if (c == '\\') {
++                        if (self.rest.len == 0 or (self.rest[0] != '"' and self.rest[0] != '\\')) return false;
++                        self.rest = self.rest[1..];
++                    }
++                }
++                return false;
++            },
++            '?' => {
++                if (self.rest.len < 2 or (self.rest[1] != '0' and self.rest[1] != '1')) return false;
++                self.rest = self.rest[2..];
++                return true;
++            },
++            ':' => {
++                const end = std.mem.indexOfScalarPos(u8, self.rest, 1, ':') orelse return false;
++                const encoded = self.rest[1..end];
++                const decoder = if (std.mem.endsWith(u8, encoded, "=")) std.base64.standard.Decoder else std.base64.standard_no_pad.Decoder;
++                const size = decoder.calcSizeForSlice(encoded) catch return false;
++                const decoded = try self.allocator.alloc(u8, size);
++                defer self.allocator.free(decoded);
++                decoder.decode(decoded, encoded) catch return false;
++                self.rest = self.rest[end + 1 ..];
++                return true;
++            },
++            '-', '0'...'9' => {
++                if (self.rest[0] == '-') self.rest = self.rest[1..];
++                var digits: usize = 0;
++                while (self.rest.len > 0 and std.ascii.isDigit(self.rest[0])) : (digits += 1) self.rest = self.rest[1..];
++                if (digits == 0 or digits > 15) return false;
++                if (self.rest.len > 0 and self.rest[0] == '.') {
++                    if (digits > 12) return false;
++                    self.rest = self.rest[1..];
++                    var fraction: usize = 0;
++                    while (self.rest.len > 0 and std.ascii.isDigit(self.rest[0])) : (fraction += 1) self.rest = self.rest[1..];
++                    if (fraction == 0 or fraction > 3) return false;
++                }
++                return true;
++            },
++            else => return self.token() != null,
++        }
++    }
++
++    fn parse(allocator: Allocator, value: []const u8) !?bool {
++        var parser = MemoryHintList{ .rest = std.mem.trim(u8, value, " \t"), .allocator = allocator };
++        var requested = false;
++        if (parser.rest.len == 0) return false;
++        while (true) {
++            const hint = parser.token() orelse return null;
++            requested = requested or std.ascii.eqlIgnoreCase(hint, "device-memory");
++            while (parser.rest.len > 0 and parser.rest[0] == ';') {
++                parser.rest = std.mem.trimStart(u8, parser.rest[1..], " ");
++                var len: usize = 0;
++                for (parser.rest) |c| {
++                    if (!(c >= 'a' and c <= 'z') and c != '*' and (len == 0 or (!std.ascii.isDigit(c) and c != '_' and c != '-' and c != '.'))) break;
++                    len += 1;
++                }
++                if (len == 0) return null;
++                parser.rest = parser.rest[len..];
++                if (parser.rest.len > 0 and parser.rest[0] == '=') {
++                    parser.rest = parser.rest[1..];
++                    if (!try parser.bareItem()) return null;
++                }
++            }
++            parser.rest = std.mem.trimStart(u8, parser.rest, " \t");
++            if (parser.rest.len == 0) return requested;
++            if (parser.rest[0] != ',') return null;
++            parser.rest = std.mem.trimStart(u8, parser.rest[1..], " \t");
++        }
++    }
++};
++
++fn setDeviceMemoryHeader(transfer: *Transfer) !void {
++    // Recompute browser-generated values after redirects and CDP URL/header
++    // replacement, without stripping an explicitly supplied legacy header.
++    var i: usize = 0;
++    while (i < transfer.req_headers.items.len) {
++        const hdr = transfer.req_headers.items[i];
++        if (hdr.source == .user_agent and std.ascii.eqlIgnoreCase(hdr.name, "device-memory")) {
++            _ = transfer.req_headers.orderedRemove(i);
++        } else {
++            i += 1;
++        }
++    }
++
++    if (transfer.req.internal or !URL.isPotentiallyTrustworthy(transfer.req.url)) return;
++    const owner = transfer.owner orelse return;
++    const hints = owner.device_memory_hints orelse return;
++    if (transfer.req.resource_type != .document or owner.parent != null) {
++        var top: *const Owner = owner;
++        while (top.parent) |parent| top = parent;
++        const origin = top.scope.origin() orelse return;
++        // The default memory-hint permissions policy is self. No delegation
++        // is synthesized for third-party subresources or nested documents.
++        if (!URL.isSameOrigin(transfer.req.url, origin)) return;
++    }
++    const origin = try URL.getOrigin(transfer.arena.allocator(), transfer.req.url) orelse return;
++    if (hints.origins.contains(origin)) {
++        try transfer.setHeader("Device-Memory", lp.Config.HttpHeaders.device_memory_header, .{});
++    }
++}
++
++fn updateDeviceMemoryHints(transfer: *Transfer, headers: []const http.Header) !void {
++    if (transfer.req.internal or transfer.req.resource_type != .document or !URL.isPotentiallyTrustworthy(transfer.req.url)) return;
++    const owner = transfer.owner orelse return;
++    if (owner.parent != null) return;
++    const hints = owner.device_memory_hints orelse return;
++    var value: std.Io.Writer.Allocating = .init(transfer.arena.allocator());
++    defer value.deinit();
++    var present = false;
++    for (headers) |hdr| {
++        if (!std.ascii.eqlIgnoreCase(hdr.name, "accept-ch")) continue;
++        if (present) try value.writer.writeAll(", ");
++        try value.writer.writeAll(hdr.value);
++        present = true;
++    }
++    // Missing or malformed Accept-CH leaves the previous preference intact;
++    // an empty valid list (or one without Device-Memory) clears it.
++    if (!present) return;
++    const enabled = (try MemoryHintList.parse(transfer.arena.allocator(), value.written())) orelse return;
++    const origin = try URL.getOrigin(transfer.arena.allocator(), transfer.req.url) orelse return;
++    try hints.update(transfer.client.allocator, origin, enabled);
++}
++
+ // A cors request always carries an Origin. Everything else only carries one
+ // for an unsafe method - same origin or not. Can't go in CorsGate since it can
+ // be disabled.
+@@ -2243,6 +2419,7 @@ fn fulfillRedirect(
+         }
+     }
+ 
++    try updateDeviceMemoryHints(transfer, headers);
+     transfer.redirectTiming(headers);
+     try transfer.applyRedirectTarget(transfer.req.url, location, status);
+     try self.pipeline(transfer, .after_intercept);
+@@ -2290,6 +2467,7 @@ pub const Owner = struct {
+ 
+     // The global these requests are made on behalf of.
+     scope: GlobalScope,
++    device_memory_hints: ?*DeviceMemoryHints = null,
+ 
+     // The owning Frame's URL slot. A pointer because it changes during
+     // navigation; a worker has none, its site for cookies is its creating
+@@ -3333,6 +3511,8 @@ pub const Transfer = struct {
+ 
+         self.setResponseHead(cached.status, cached.content_type);
+         self.setResponseHeaders(cached.headers);
++        // A revalidated response already applied the fresh 304 preference.
++        if (cache_state == .local) try updateDeviceMemoryHints(self, cached.headers);
+         self._from_cache = true;
+         self._timing.cache = cache_state;
+         self._content_length = body.len;
+@@ -3363,6 +3543,7 @@ pub const Transfer = struct {
+ 
+         self.setResponseHead(status, content_type);
+         self.setResponseHeaders(headers);
++        try updateDeviceMemoryHints(self, headers);
+         self._content_length = owned_body.len;
+         try self.bufferEvents(owned_body);
+     }
+@@ -3397,6 +3578,7 @@ pub const Transfer = struct {
+         self.res.header.?.url = (try arena.dupeZ(u8, std.mem.span(self.res.header.?.url))).ptr;
+ 
+         self.setResponseHeaders(try conn.collectResponseHeaders(arena.allocator()));
++        try updateDeviceMemoryHints(self, self.res.headers);
+ 
+         if (self.req.credentialsAllowed()) {
+             if (self.cookie_jar) |jar| {
+diff --git a/src/network/cache/Cache.zig b/src/network/cache/Cache.zig
+index 9a667fd..3171a99 100644
+--- a/src/network/cache/Cache.zig
++++ b/src/network/cache/Cache.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -509,14 +510,18 @@ fn varyHeaders(arena: std.mem.Allocator, vary: ?[]const u8, request_headers: []c
+     const vary_value = vary orelse return &.{};
+ 
+     var headers: std.ArrayList(Http.Header) = .empty;
+-    for (request_headers) |hdr| {
+-        var iter = std.mem.splitScalar(u8, vary_value, ',');
+-        while (iter.next()) |part| {
+-            const name = std.mem.trim(u8, part, &std.ascii.whitespace);
++    var iter = std.mem.splitScalar(u8, vary_value, ',');
++    while (iter.next()) |part| {
++        const name = std.mem.trim(u8, part, &std.ascii.whitespace);
++        if (name.len == 0) continue;
++        var found = false;
++        for (request_headers) |hdr| {
+             if (std.ascii.eqlIgnoreCase(hdr.name, name)) {
+                 try headers.append(arena, hdr);
++                found = true;
+             }
+         }
++        if (!found) try headers.append(arena, .{ .name = name, .value = "" });
+     }
+     return headers.items;
+ }
+@@ -727,9 +732,11 @@ test "Cache: tryCache vary headers" {
+         .request_headers = &request_headers,
+     });
+ 
+-    try testing.expectEqual(1, stored.?.vary_headers.len);
++    try testing.expectEqual(2, stored.?.vary_headers.len);
+     try testing.expectString("Accept-Encoding", stored.?.vary_headers[0].name);
+     try testing.expectString("gzip", stored.?.vary_headers[0].value);
++    try testing.expectString("accept-language", stored.?.vary_headers[1].name);
++    try testing.expectString("", stored.?.vary_headers[1].value);
+ 
+     // Vary: * is never stored
+     const wildcard = try tryCache(arena.allocator(), .{

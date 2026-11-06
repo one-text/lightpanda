@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 4 Nov 2026 16:59:06 -0300
+Subject: [PATCH] webapi: support native ImageData typed-array constructors
+
+Dispatch the JavaScript constructor between numeric dimensions and the
+Uint8ClampedArray overloads without changing the native allocating helper
+or canvas callers. Derive omitted height, retain the original typed-array
+view and identity, and validate dimensions, RGBA length and settings.
+Keep native arity and the existing constructor/prototype bindings.
+
+Reject shared and resizable backing stores before coercion. Capture the
+native ArrayBuffer.resizable getter per context before page scripts run,
+release it on initialization failure and context teardown, and do not trust
+replaceable JavaScript buffer properties. Read view length after argument
+and dictionary conversions so reentrant detachment fails safely.
+
+Apply Chrome's 2 GiB minus 2 MiB view-size ceiling with NotSupportedError.
+This also prevents the newly accepted views from overflowing the u32 length
+used by structured-clone serialization. One reviewer pass identified this
+missing ceiling; it was fixed and validated before export.
+
+Reuse the existing synthetic canvas recording/readback implementation.
+This patch supports the existing sRGB/rgba-unorm8 profile only; it adds no
+renderer, float pixel storage, display-p3 mode, benchmark changes or tests.
+
+References:
+https://html.spec.whatwg.org/multipage/canvas.html#dom-imagedata
+https://github.com/chromium/chromium/blob/main/third_party/blink/renderer/core/html/canvas/image_data.cc
+https://github.com/chromium/chromium/blob/main/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_public_constants.h
+
+Validation: ReleaseFast build and all 1658 upstream tests pass. The unchanged
+benchmark improves from 116/130 to 117/130 (90%), with only
+canvas-pixel-readback changing verdict. Temporary diagnostics cover 65 cases:
+60 exact matches against desktop Chrome 154 on Linux, three oversized-view
+safety checks passing locally (Chrome cannot allocate the reference arrays),
+and two known pre-existing own-data caching differences left unchanged.
+No claim of a macOS-machine reference run or full Chrome API compatibility.
+---
+ src/browser/js/Context.zig       |  4 ++
+ src/browser/js/Env.zig           |  9 ++++
+ src/browser/webapi/ImageData.zig | 81 +++++++++++++++++++++++++++-----
+ 3 files changed, 81 insertions(+), 13 deletions(-)
+
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index 20e8b2a..30886b1 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -63,6 +63,9 @@ handle: v8.Global,
+ // Captured before page scripts can replace Object.freeze.
+ object_freeze: v8.Global,
+ 
++// Native getter captured before page scripts can replace ArrayBuffer properties.
++array_buffer_resizable: v8.Global,
++
+ // Native entries saved only while [SecureContext] battery APIs are hidden.
+ battery_bindings: ?struct { method: v8.Global, interface: v8.Global } = null,
+ web_share_bindings: ?[2]v8.Global = null,
+@@ -281,6 +284,7 @@ pub fn deinit(self: *Context) void {
+         for (bindings) |*binding| v8.v8__Global__Reset(binding);
+     }
+     v8.v8__Global__Reset(&self.object_freeze);
++    v8.v8__Global__Reset(&self.array_buffer_resizable);
+     v8.v8__Global__Reset(&self.handle);
+     env.isolate.notifyContextDisposed();
+     // There can be other tasks associated with this context that we need to
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 611f338..8abeeb7 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -383,6 +383,14 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+     v8.v8__Global__New(isolate.handle, freeze, &object_freeze);
+     errdefer v8.v8__Global__Reset(&object_freeze);
+ 
++    const array_buffer = v8.v8__Object__Get(global_obj, v8_context, isolate.initStringHandle("ArrayBuffer")).?;
++    const buffer_prototype = v8.v8__Object__Get(@ptrCast(array_buffer), v8_context, isolate.initStringHandle("prototype")).?;
++    const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(@ptrCast(buffer_prototype), v8_context, isolate.initStringHandle("resizable")).?;
++    const resizable = v8.v8__Object__Get(@ptrCast(descriptor), v8_context, isolate.initStringHandle("get")).?;
++    var array_buffer_resizable: v8.Global = undefined;
++    v8.v8__Global__New(isolate.handle, resizable, &array_buffer_resizable);
++    errdefer v8.v8__Global__Reset(&array_buffer_resizable);
++
+     const context = try context_arena.create(Context);
+     context.* = .{
+         .env = self,
+@@ -394,6 +402,7 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+         .arena = context_arena,
+         .handle = context_global,
+         .object_freeze = object_freeze,
++        .array_buffer_resizable = array_buffer_resizable,
+         .templates = self.templates,
+         .call_arena = params.call_arena,
+         .local_arena = params.local_arena,
+diff --git a/src/browser/webapi/ImageData.zig b/src/browser/webapi/ImageData.zig
+index 7e4a1ec..284ed9b 100644
+--- a/src/browser/webapi/ImageData.zig
++++ b/src/browser/webapi/ImageData.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -42,18 +43,72 @@ pub const ConstructorSettings = struct {
+     pixelFormat: String = .wrap("rgba-unorm8"),
+ };
+ 
+-/// This has many constructors:
+-///
+-/// ```js
+-/// new ImageData(width, height)
+-/// new ImageData(width, height, settings)
+-///
+-/// new ImageData(dataArray, width)
+-/// new ImageData(dataArray, width, height)
+-/// new ImageData(dataArray, width, height, settings)
+-/// ```
+-///
+-/// We currently support only the first 2.
++fn construct(
++    width_or_data: js.Value,
++    height_or_width: js.Value,
++    height_or_settings: ?js.Value,
++    maybe_settings: ?js.Value,
++    exec: *Execution,
++) !*ImageData {
++    if (!width_or_data.isUint8ClampedArray()) {
++        if (width_or_data.isTypedArray() or maybe_settings != null) return error.TypeError;
++        const width = try width_or_data.toU32();
++        const height = try height_or_width.toU32();
++        const settings = if (height_or_settings) |value| try value.toZig(?ConstructorSettings) else null;
++        return init(width, height, settings, exec);
++    }
++
++    const view: *const js.v8.ArrayBufferView = @ptrCast(width_or_data.handle);
++    const buffer = js.v8.v8__ArrayBufferView__Buffer(view).?;
++    if (js.arrayBufferIsShared(buffer)) return error.TypeError;
++    const resizable: js.Function = .{
++        .local = width_or_data.local,
++        .handle = @ptrCast(js.v8.v8__Global__Get(&exec.js.array_buffer_resizable, exec.js.isolate.handle).?),
++        .this = @ptrCast(buffer),
++    };
++    if (try resizable.callRethrow(bool, .{})) return error.TypeError;
++
++    const width = try height_or_width.toU32();
++    const height: ?u32 = blk: {
++        const value = height_or_settings orelse break :blk null;
++        break :blk if (value.isUndefined() and (maybe_settings == null or maybe_settings.?.isUndefined())) null else try value.toU32();
++    };
++    const settings: ConstructorSettings = if (maybe_settings) |value|
++        (try value.toZig(?ConstructorSettings)) orelse .{}
++    else
++        .{};
++
++    const max_i32 = std.math.maxInt(i32);
++    if (width == 0 or width > max_i32) return error.IndexSizeError;
++    if (height) |h| if (h == 0 or h > max_i32) return error.IndexSizeError;
++    if (!settings.colorSpace.eql(comptime .wrap("srgb"))) return error.TypeError;
++    if (!settings.pixelFormat.eql(comptime .wrap("rgba-unorm8"))) {
++        if (settings.pixelFormat.eql(comptime .wrap("rgba-float16")) or
++            settings.pixelFormat.eql(comptime .wrap("rgba-float32"))) return error.InvalidStateError;
++        return error.TypeError;
++    }
++
++    // Read the view length after conversions: user getters can detach its buffer.
++    const length = js.v8.v8__ArrayBufferView__ByteLength(view);
++    if (length == 0) return error.InvalidStateError;
++    // Chrome's PartitionAlloc ceiling also keeps structured-clone lengths in u32.
++    const max_bytes = (1 << 31) - (1 << 21);
++    if (length > max_bytes) return error.NotSupported;
++    if (length % 4 != 0) return error.InvalidStateError;
++    const pixels = length / 4;
++    if (pixels % width != 0) return error.IndexSizeError;
++    const derived_height = pixels / width;
++    if (derived_height > max_i32) return error.IndexSizeError;
++    if (height) |h| if (h != derived_height) return error.IndexSizeError;
++
++    const data: js.ArrayBufferRef(.uint8_clamped) = .{ .local = width_or_data.local, .handle = width_or_data.handle };
++    return exec._factory.create(ImageData{
++        ._width = width,
++        ._height = @intCast(derived_height),
++        ._data = try data.persist(),
++    });
++}
++
+ pub fn init(
+     width: u32,
+     height: u32,
+@@ -147,7 +202,7 @@ pub const JsApi = struct {
+         pub var class_id: bridge.ClassId = undefined;
+     };
+ 
+-    pub const constructor = bridge.constructor(ImageData.init, .{});
++    pub const constructor = bridge.constructor(ImageData.construct, .{});
+ 
+     pub const colorSpace = bridge.property("srgb", .{ .template = false, .readonly = true });
+     pub const pixelFormat = bridge.property("rgba-unorm8", .{ .template = false, .readonly = true });

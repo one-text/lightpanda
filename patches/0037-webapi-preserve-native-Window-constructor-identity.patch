@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 20 Oct 2026 11:58:24 -0300
+Subject: [PATCH] webapi: preserve native Window constructor identity
+
+Reuse the canonical Window interface function for the inherited
+constructor property of V8's extra global template. Keep the property
+writable, configurable and non-enumerable without adding an own
+constructor to window or changing worker globals.
+
+Ember checks self.constructor === Window while detecting DOM support.
+The separate global-template constructor failed this comparison, so
+American Eagle booted in non-interactive mode on the home route instead
+of rendering its cart. Correcting the native identity makes the original
+cart checks pass without injected JavaScript or hardcoding hasDOM.
+
+Validation: 1658 upstream tests pass; constructor identity survives
+navigation, reload and iframe-local execution; dedicated-worker behavior
+is unchanged. American Eagle passes all four compatibility checks.
+The benchmark remains 109/111 with the same baseline failures.
+
+The full compatibility run remains 14/23: American Eagle cart is fixed,
+but Target product now reports a CAPTCHA challenge, also observed in an
+isolated comparison against the SVG-only baseline. No unrelated CAPTCHA
+or cross-frame Window-wrapper mitigation is included.
+---
+ src/browser/js/Snapshot.zig | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/browser/js/Snapshot.zig b/src/browser/js/Snapshot.zig
+index c9e7f51..040d91c 100644
+--- a/src/browser/js/Snapshot.zig
++++ b/src/browser/js/Snapshot.zig
+@@ -336,6 +336,16 @@ fn createSnapshotContext(
+             // Web IDL: interface objects on the global are non-enumerable.
+             v8.v8__Object__DefineOwnProperty(global_obj, context, v8_class_name, func, v8.DontEnum, &maybe_result);
+ 
++            if (comptime realm == .window and JsApi == GlobalScopeApi) {
++                // The extra global template must not expose a second Window constructor.
++                const global_func = v8.v8__FunctionTemplate__GetFunction(js_global, context) orelse return error.GlobalConstructorLookupFailed;
++                const global_proto = v8.v8__Object__Get(@ptrCast(global_func), context, prototype_key) orelse return error.PrototypeLookupFailed;
++                const constructor_key = v8.v8__String__NewFromUtf8(isolate, "constructor", v8.kNormal, 11);
++                var result: v8.MaybeBool = undefined;
++                v8.v8__Object__DefineOwnProperty(@ptrCast(global_proto), context, constructor_key, func, v8.DontEnum, &result);
++                if (!result.has_value or !result.value) return error.GlobalConstructorInstallFailed;
++            }
++
+             if (@hasDecl(JsApi.Meta, "constructor_alias")) {
+                 const alias = JsApi.Meta.constructor_alias;
+                 const alias_func = generateLegacyFactoryFunction(JsApi, isolate, templates[template_index], func.?, context.?);

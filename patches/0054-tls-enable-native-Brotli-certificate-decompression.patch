@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Sat, 31 Oct 2026 20:39:23 -0300
+Subject: [PATCH] tls: enable native Brotli certificate decompression
+
+Register Brotli (algorithm 2) with BoringSSL's native certificate
+compression API. Reuse the already-linked Brotli decoder and transfer
+a CRYPTO_BUFFER only after successful, exact-length decompression.
+BoringSSL enforces the certificate-list size bound before the callback;
+retain existing trust, hostname verification and other TLS settings.
+
+Match Chromium's decompression-only policy and its extension 27 offer
+with payload [2]. This adds seven ClientHello bytes; ALPS and trust-anchor
+IDs remain separate fingerprint gaps. No new dependencies or unit tests.
+
+Reference: Chromium 155 net/ssl/cert_compression.cc at
+cfaadc5a132d78e1828635aa8405a499f3e14864; fingerprint/README.md.
+---
+ src/network/http.zig  | 24 ++++++++++++++++++++++++
+ src/sys/libcrypto.zig | 12 ++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/src/network/http.zig b/src/network/http.zig
+index 6bdb650..3de0316 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -25,6 +25,27 @@ const sys_net = @import("../sys/net.zig");
+ const libcurl = @import("../sys/libcurl.zig");
+ const crypto = @import("../sys/libcrypto.zig");
+ 
++extern fn BrotliDecoderDecompress(encoded_size: usize, encoded_buffer: [*]const u8, decoded_size: *usize, decoded_buffer: [*]u8) c_int;
++
++fn decompressBrotliCertificate(
++    _: *crypto.SSL,
++    out: *?*crypto.CRYPTO_BUFFER,
++    uncompressed_len: usize,
++    input: [*]const u8,
++    input_len: usize,
++) callconv(.c) c_int {
++    // BoringSSL bounds uncompressed_len by its maximum certificate-list size.
++    var data: [*]u8 = undefined;
++    const buffer = crypto.CRYPTO_BUFFER_alloc(&data, uncompressed_len) orelse return 0;
++    var output_size = uncompressed_len;
++    if (BrotliDecoderDecompress(input_len, input, &output_size, data) != 1 or output_size != uncompressed_len) {
++        crypto.CRYPTO_BUFFER_free(buffer);
++        return 0;
++    }
++    out.* = buffer;
++    return 1;
++}
++
+ const IpFilter = @import("IpFilter.zig");
+ const Certificates = @import("Certificates.zig");
+ 
+@@ -485,6 +506,9 @@ pub const Connection = struct {
+                 crypto.SSL_CTX_set_permute_extensions(ssl_ctx, 1);
+                 crypto.SSL_CTX_enable_signed_cert_timestamps(ssl_ctx);
+                 crypto.SSL_CTX_enable_ocsp_stapling(ssl_ctx);
++                if (crypto.SSL_CTX_add_cert_compression_alg(ssl_ctx, crypto.TLSEXT_cert_compression_brotli, null, decompressBrotliCertificate) != 1) {
++                    return libcurl.CURLE.ABORTED_BY_CALLBACK;
++                }
+ 
+                 // Chromium's cipher policy retains the backend's AES-aware ordering.
+                 if (crypto.SSL_CTX_set_strict_cipher_list(ssl_ctx, "ALL:!aPSK:!ECDSA+SHA1:!3DES") != 1) {
+diff --git a/src/sys/libcrypto.zig b/src/sys/libcrypto.zig
+index 125a287..19e84d9 100644
+--- a/src/sys/libcrypto.zig
++++ b/src/sys/libcrypto.zig
+@@ -186,6 +186,18 @@ pub extern fn SSL_CTX_set_grease_sigalgs_enabled(ctx: *SSL_CTX, enabled: c_int)
+ pub extern fn SSL_CTX_set_permute_extensions(ctx: *SSL_CTX, enabled: c_int) void;
+ pub extern fn SSL_CTX_enable_signed_cert_timestamps(ctx: *SSL_CTX) void;
+ pub extern fn SSL_CTX_enable_ocsp_stapling(ctx: *SSL_CTX) void;
++
++pub const CRYPTO_BUFFER = opaque {};
++const CBB = opaque {};
++pub extern fn CRYPTO_BUFFER_alloc(out_data: *[*]u8, len: usize) ?*CRYPTO_BUFFER;
++pub extern fn CRYPTO_BUFFER_free(buffer: *CRYPTO_BUFFER) void;
++pub const TLSEXT_cert_compression_brotli: u16 = 2;
++pub extern fn SSL_CTX_add_cert_compression_alg(
++    ctx: *SSL_CTX,
++    alg_id: u16,
++    compress: ?*const fn (*SSL, *CBB, [*]const u8, usize) callconv(.c) c_int,
++    decompress: ?*const fn (*SSL, *?*CRYPTO_BUFFER, usize, [*]const u8, usize) callconv(.c) c_int,
++) c_int;
+ pub extern fn SSL_CTX_set_strict_cipher_list(ctx: *SSL_CTX, str: [*:0]const u8) c_int;
+ pub extern fn SSL_CTX_set_verify_algorithm_prefs(ctx: *SSL_CTX, prefs: [*]const u16, num_prefs: usize) c_int;
+ 

@@ -1,0 +1,1365 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 19 Oct 2026 20:47:38 -0300
+Subject: [PATCH] webapi: mock Chrome data-channel offers and host ICE natively
+
+Expose Window-only RTCPeerConnection, RTCDataChannel,
+RTCSessionDescription, RTCIceCandidate and RTCPeerConnectionIceEvent with
+native prototypes, promises, configuration, event handlers and state.
+Generate coherent local data-channel SDP, per-peer opaque mDNS host
+candidates and asynchronous gathering completion. Honor relay-only policy
+without manufacturing a relay candidate. Do not inspect host interfaces,
+contact STUN/TURN or implement UDP, DTLS, SCTP or media transport. A peer
+never reports connected and a data channel never reports open.
+
+Support implicit/repeated local offers, candidate-enriched local description
+round-trips, rollback, restart and close. Keep offer history separate from
+live channels. Own callback, channel, event-candidate and event-target edges
+in the JS heap, with temporary roots only for queued tasks. Release closed
+channels and removed/once/aborted listeners; detach peers during frame and
+context teardown. Resolve no remote negotiation: remote/media operations
+are unsupported rather than reporting fictitious success. Arbitrary or
+modified local SDP, certificates, media tracks and the full RTCStatsReport
+surface remain outside this mock.
+
+Follow the WebRTC IDL/state model and reference Chrome 154's standard
+constructor, descriptor, configuration and return-type behavior; retain the
+fork's existing Chrome 155/macOS MacBook Neo persona. Reference:
+https://w3c.github.io/webrtc-pc/
+
+Use temporary ignored diagnostics, not new upstream unit tests. Leave the
+benchmark and all earlier patches unchanged. The intended benchmark gain
+is webrtc-gathers and webrtc-leak; inspector timing and ServiceWorkers are
+separate work.
+---
+ src/browser/Frame.zig              |    4 +
+ src/browser/js/Context.zig         |    5 +
+ src/browser/js/bridge.zig          |    1 +
+ src/browser/webapi/AbortSignal.zig |    9 +-
+ src/browser/webapi/Event.zig       |    2 +
+ src/browser/webapi/EventTarget.zig |   16 +-
+ src/browser/webapi/WebRTC.zig      | 1129 ++++++++++++++++++++++++++++
+ 7 files changed, 1163 insertions(+), 3 deletions(-)
+ create mode 100644 src/browser/webapi/WebRTC.zig
+
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index 2dc86a0..cb2633c 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -550,6 +550,10 @@ pub fn deinit(self: *Frame) void {
+ }
+ 
+ pub fn detachPdf(self: *Frame) void {
++    while (self.js.rtc_peers.first) |node| {
++        const peer: *@import("webapi/WebRTC.zig").Peer = @fieldParentPtr("_context_node", node);
++        peer.detach();
++    }
+     while (self.js.audio_contexts.first) |node| {
+         const audio: *@import("webapi/AudioContext.zig") = @fieldParentPtr("_context_node", node);
+         audio.detach();
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index 54f4e15..0c0c953 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -78,6 +78,7 @@ eme_bindings: ?[10]v8.Global = null,
+ eme_hidden: bool = false,
+ video_bindings: ?[4]v8.Global = null,
+ video_decoders: std.DoublyLinkedList = .{},
++rtc_peers: std.DoublyLinkedList = .{},
+ audio_contexts: std.DoublyLinkedList = .{},
+ 
+ cpu_profiler: ?*v8.CpuProfiler = null,
+@@ -220,6 +221,10 @@ pub fn deinit(self: *Context) void {
+     const entered = self.enter(&hs);
+     defer entered.exit();
+ 
++    while (self.rtc_peers.first) |node| {
++        const peer: *@import("../webapi/WebRTC.zig").Peer = @fieldParentPtr("_context_node", node);
++        peer.detach();
++    }
+     while (self.video_decoders.first) |node| {
+         const decoder: *@import("../webapi/VideoDecoder.zig") = @fieldParentPtr("_context_node", node);
+         decoder.detach();
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 0ab7e29..452461b 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1029,6 +1029,7 @@ pub const SubType = enum {
+ 
+ // APIs for Page/Window contexts. Used by Snapshot.zig for Page snapshot creation.
+ pub const PageJsApis = flattenTypes(&.{
++    @import("../webapi/WebRTC.zig"),
+     @import("../webapi/EncryptedMedia.zig"),
+     @import("../webapi/AudioContext.zig"),
+     @import("../webapi/SpeechSynthesis.zig"),
+diff --git a/src/browser/webapi/AbortSignal.zig b/src/browser/webapi/AbortSignal.zig
+index 1b6d4b5..735f905 100644
+--- a/src/browser/webapi/AbortSignal.zig
++++ b/src/browser/webapi/AbortSignal.zig
+@@ -43,6 +43,7 @@ const Dependend = union(enum) {
+     scheduler_task: *Scheduler.Task,
+     audio_listener: *@import("AudioContext.zig").ListenerRoot,
+     eme_listener: *@import("EncryptedMedia.zig").Session.ListenerRoot,
++    rtc_listener: *@import("WebRTC.zig").ListenerRoot,
+ 
+     // Returns false if the dependent was already aborted, in which case no
+     // abort event must be dispatched for it.
+@@ -57,14 +58,14 @@ const Dependend = union(enum) {
+                 try dep.markAborted(exec);
+                 return true;
+             },
+-            .scheduler_task, .audio_listener, .eme_listener => return false,
++            .scheduler_task, .audio_listener, .eme_listener, .rtc_listener => return false,
+         }
+     }
+ 
+     fn dispatchAbortEvent(self: Dependend, exec: *const Execution) !void {
+         switch (self) {
+             .signal => |dep| try dep.dispatchAbortEvent(exec),
+-            .model_context_tool, .scheduler_task, .audio_listener, .eme_listener => {},
++            .model_context_tool, .scheduler_task, .audio_listener, .eme_listener, .rtc_listener => {},
+         }
+     }
+ };
+@@ -160,6 +161,10 @@ fn markAborted(self: *AbortSignal, reason_: ?Reason, exec: *const Execution) !vo
+             _ = self._dependents.swapRemove(index);
+             dep.audio_listener.signal = null;
+             dep.audio_listener.abort(exec);
++        } else if (dep == .rtc_listener) {
++            _ = self._dependents.swapRemove(index);
++            dep.rtc_listener.signal = null;
++            dep.rtc_listener.abort(exec);
+         } else if (dep == .eme_listener) {
+             _ = self._dependents.swapRemove(index);
+             dep.eme_listener.signal = null;
+diff --git a/src/browser/webapi/Event.zig b/src/browser/webapi/Event.zig
+index 512e2d1..5dff46c 100644
+--- a/src/browser/webapi/Event.zig
++++ b/src/browser/webapi/Event.zig
+@@ -85,6 +85,7 @@ const EventPhase = enum(u8) {
+ pub const Type = union(enum) {
+     generic,
+     speech_synthesis_event: *@import("event/SpeechSynthesisEvent.zig"),
++    rtc_ice_event: *@import("WebRTC.zig").IceEvent,
+     error_event: *@import("event/ErrorEvent.zig"),
+     custom_event: *@import("event/CustomEvent.zig"),
+     message_event: *@import("event/MessageEvent.zig"),
+@@ -205,6 +206,7 @@ pub fn is(self: *Event, comptime T: type) ?*T {
+     switch (self._type) {
+         .generic => return if (T == Event) self else null,
+         .speech_synthesis_event => |e| return e.is(T),
++        .rtc_ice_event => |e| return if (T == @import("WebRTC.zig").IceEvent) e else null,
+         .error_event => |e| return if (T == @import("event/ErrorEvent.zig")) e else null,
+         .custom_event => |e| return if (T == @import("event/CustomEvent.zig")) e else null,
+         .message_event => |e| return if (T == @import("event/MessageEvent.zig")) e else null,
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index afa42ad..d9ae3ab 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -68,6 +68,7 @@ const MediaDevices = @import("MediaDevices.zig");
+ const SpeechSynthesis = @import("SpeechSynthesis.zig");
+ const SpeechSynthesisUtterance = @import("SpeechSynthesisUtterance.zig");
+ const VideoDecoder = @import("VideoDecoder.zig");
++const WebRTC = @import("WebRTC.zig");
+ const AudioContext = @import("AudioContext.zig");
+ const MediaKeySession = @import("EncryptedMedia.zig").Session;
+ 
+@@ -114,6 +115,8 @@ pub const Type = enum(u8) {
+     speech_synthesis,
+     speech_synthesis_utterance,
+     text_track_cue,
++    rtc_peer,
++    rtc_channel,
+     video_decoder,
+     visual_viewport,
+     websocket,
+@@ -159,6 +162,8 @@ pub fn Subtype(comptime tag: Type) type {
+         .speech_synthesis => SpeechSynthesis,
+         .speech_synthesis_utterance => SpeechSynthesisUtterance,
+         .text_track_cue => TextTrackCue,
++        .rtc_peer => WebRTC.Peer,
++        .rtc_channel => WebRTC.Channel,
+         .video_decoder => VideoDecoder,
+         .visual_viewport => VisualViewport,
+         .websocket => WebSocket,
+@@ -234,7 +239,7 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
+             try self.subtype(Subtype(tag))._audio.dispatchAt(self, event, exec);
+             return !event._cancelable or !event._prevent_default;
+         },
+-        inline .speech_synthesis, .speech_synthesis_utterance, .video_decoder, .media_key_session => |tag| {
++        inline .speech_synthesis, .speech_synthesis_utterance, .video_decoder, .media_key_session, .rtc_peer, .rtc_channel => |tag| {
+             try self.subtype(Subtype(tag)).dispatch(event, exec);
+             return !event._cancelable or !event._prevent_default;
+         },
+@@ -354,6 +359,7 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
+         .speech_synthesis_utterance => return self.subtype(SpeechSynthesisUtterance).registerListener(typ, em_callback, options, exec),
+         .media_key_session => return self.subtype(MediaKeySession).registerListener(typ, em_callback, options, exec),
+         .video_decoder => return self.subtype(VideoDecoder).registerListener(typ, em_callback, options, exec),
++        inline .rtc_peer, .rtc_channel => |tag| return self.subtype(Subtype(tag)).registerListener(typ, em_callback, options, exec),
+         inline .audio_node, .base_audio_context => |tag| return self.subtype(Subtype(tag))._audio.registerListenerAt(self, typ, em_callback, options, exec),
+         else => {},
+     }
+@@ -408,6 +414,10 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
+             self.subtype(Subtype(tag))._audio.removeListenerAt(self, typ, em_callback, use_capture, exec);
+             return;
+         },
++        inline .rtc_peer, .rtc_channel => |tag| {
++            self.subtype(Subtype(tag)).removeListener(typ, em_callback, use_capture, exec);
++            return;
++        },
+         .media_key_session => {
+             self.subtype(MediaKeySession).removeListener(typ, em_callback, use_capture, exec);
+             return;
+@@ -448,6 +458,8 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         .navigation => writer.writeAll("<Navigation>"),
+         .screen => writer.writeAll("<Screen>"),
+         .screen_orientation => writer.writeAll("<ScreenOrientation>"),
++        .rtc_peer => writer.writeAll("<RTCPeerConnection>"),
++        .rtc_channel => writer.writeAll("<RTCDataChannel>"),
+         .video_decoder => writer.writeAll("<VideoDecoder>"),
+         .visual_viewport => writer.writeAll("<VisualViewport>"),
+         .file_reader => writer.writeAll("<FileReader>"),
+@@ -498,6 +510,8 @@ pub fn toString(self: *EventTarget) []const u8 {
+         .speech_synthesis => return "[object SpeechSynthesis]",
+         .speech_synthesis_utterance => return "[object SpeechSynthesisUtterance]",
+         .text_track_cue => return "[object TextTrackCue]",
++        .rtc_peer => return "[object RTCPeerConnection]",
++        .rtc_channel => return "[object RTCDataChannel]",
+         .video_decoder => return "[object VideoDecoder]",
+         .visual_viewport => return "[object VisualViewport]",
+         .websocket => return "[object WebSocket]",
+diff --git a/src/browser/webapi/WebRTC.zig b/src/browser/webapi/WebRTC.zig
+new file mode 100644
+index 0000000..1167f38
+--- /dev/null
++++ b/src/browser/webapi/WebRTC.zig
+@@ -0,0 +1,1129 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const Event = @import("Event.zig");
++const EventTarget = @import("EventTarget.zig");
++const EventManager = @import("../EventManagerBase.zig");
++const Speech = @import("SpeechSynthesis.zig");
++const Convert = @import("media_constraints.zig");
++const DOMException = @import("DOMException.zig");
++
++// Native data-channel offer/ICE emulation, not a transport. Never inspect the
++// host's interfaces, contact STUN/TURN, or claim a connected peer/open channel.
++pub fn registerTypes() []const type {
++    return &.{ Peer, Channel, Description, Candidate, IceEvent };
++}
++
++fn resolved(exec: *js.Execution, value: anytype) !js.Promise {
++    const resolver = js.PromiseResolver.init(exec.js.local.?);
++    try resolver.resolveValue(try exec.js.local.?.zigValueToJs(value, .{}));
++    return resolver.promise();
++}
++fn rejectCaught(exec: *js.Execution, caught: *js.TryCatch, err: anyerror) !js.Promise {
++    if (err == error.ExecutionTerminated or exec.js.env.terminatePending()) return error.ExecutionTerminated;
++    const reason = caught.exceptionValue() orelse return err;
++    const resolver = js.PromiseResolver.init(exec.js.local.?);
++    try resolver.rejectValue(reason);
++    return resolver.promise();
++}
++fn dictionary(comptime T: type, input: ?js.Value) !T {
++    const object = try Convert.dictionary(input) orelse return T{};
++    return object.toZig(T);
++}
++fn text(value: js.Value) ![]const u8 {
++    return (try Convert.domString(value)).toSlice();
++}
++fn copy(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
++    return allocator.dupe(u8, value);
++}
++fn edgeData(owner: anytype, local: *const js.Local) !js.Object {
++    const wrapper = try local.zigValueToJs(owner, .{});
++    const key: *const js.v8.Private = @ptrCast(js.v8.v8__Global__Get(&local.ctx.env.private_symbols.speech_callbacks.handle, local.isolate.handle).?);
++    if (js.v8.v8__Object__GetPrivate(@ptrCast(wrapper.handle), local.handle, key)) |value| {
++        const data = js.Value{ .local = local, .handle = @ptrCast(value) };
++        if (data.isObject()) return data.toObject();
++    }
++    const data = local.newObject();
++    var saved: js.v8.MaybeBool = undefined;
++    js.v8.v8__Object__SetPrivate(@ptrCast(wrapper.handle), local.handle, key, @ptrCast(data.handle), &saved);
++    if (!saved.has_value or !saved.value) return error.JsException;
++    return data;
++}
++fn edge(owner: anytype, name: []const u8, value: anytype, local: *const js.Local) !void {
++    const data = try edgeData(owner, local);
++    if (!(data.defineOwnProperty(name, try local.zigValueToJs(value, .{}), 0) orelse false)) return error.JsException;
++}
++
++// Same JS-owned callback storage as the other native mocks. Queued work roots
++// wrappers temporarily; callback cycles themselves remain collectible.
++fn Listeners(comptime T: type) type {
++    return struct {
++        pub fn register(self: *T, typ: []const u8, callback: EventManager.Callback, options: EventManager.RegisterOptions, exec: *js.Execution) !void {
++            const listener = (try self._events.register(self._proto, typ, callback, options)) orelse return;
++            const slot = switch (listener.function) {
++                .value => |v| v.slot,
++                .object => |v| v.slot,
++                .string => unreachable,
++            };
++            errdefer {
++                self._events.remove(self._proto, typ, callback, options.capture);
++                slot.release();
++            }
++            const root = try self._listener_pool.create(self._arena.allocator());
++            errdefer self._listener_pool.destroy(root);
++            const value = switch (callback) {
++                .function => |f| js.Value{ .local = f.local, .handle = @ptrCast(f.handle) },
++                .object => |o| o.toValue(),
++            };
++            const data = try Speech.callbackData(self._proto, exec.js.local.?);
++            root.* = .{ .owner = if (T == Peer) .{ .peer = self } else .{ .channel = self }, .target = self._proto, .listener = listener, .slot = slot, .data = try data.persist(), .signal = options.signal };
++            errdefer root.data.release();
++            const key = try std.fmt.bufPrint(&root.key, "listener{d}", .{@intFromPtr(root)});
++            root.key_len = key.len;
++            if (!(data.defineOwnProperty(key, value, 0) orelse false)) return error.JsException;
++            if (options.signal) |signal| try signal._dependents.append(exec.arena, .{ .rtc_listener = root });
++            js.v8.v8__Global__SetWeak(&slot.handle);
++            js.v8.v8__Global__SetWeak(&root.data.slot.handle);
++            self._listener_roots.append(&root.node);
++            listener.on_remove = .{ .ctx = root, .callback = ListenerRoot.removed };
++        }
++        pub fn remove(self: *T, typ: []const u8, callback: EventManager.Callback, capture: bool, exec: *js.Execution) void {
++            const previous = self._listener_local;
++            self._listener_local = exec.js.local.?;
++            defer self._listener_local = previous;
++            self._events.remove(self._proto, typ, callback, capture);
++        }
++        pub fn dispatch(self: *T, event: *Event, exec: *js.Execution) !void {
++            // Retained events keep their native target alive via a JS edge.
++            var scope: js.Local.Scope = undefined;
++            exec.js.localScope(&scope);
++            defer scope.deinit();
++            const local = &scope.local;
++            const previous = self._listener_local;
++            self._listener_local = local;
++            defer self._listener_local = previous;
++            try edge(event, "target", self, local);
++            try Speech.dispatchDirect(self._proto, &self._events, event, exec);
++        }
++        pub fn emit(self: *T, typ: []const u8, exec: *js.Execution) !void {
++            const event = try Event.init(typ, null, exec.page);
++            event._is_trusted = true;
++            try dispatch(self, event, exec);
++        }
++    };
++}
++
++pub const ListenerRoot = struct {
++    owner: union(enum) { peer: *Peer, channel: *Channel },
++    target: *EventTarget,
++    listener: *EventManager.Listener,
++    slot: *js.GlobalSlot,
++    data: js.Object.Global,
++    signal: ?*@import("AbortSignal.zig"),
++    node: std.DoublyLinkedList.Node = .{},
++    key: [32]u8 = undefined,
++    key_len: usize = 0,
++    fn dispose(self: *ListenerRoot, local: ?*const js.Local) void {
++        if (local) |l| {
++            var deleted: js.v8.MaybeBool = undefined;
++            js.v8.v8__Object__Delete(self.data.local(l).handle, l.handle, @ptrCast(l.newString(self.key[0..self.key_len]).handle), &deleted);
++        }
++        if (self.signal) |signal| {
++            for (signal._dependents.items, 0..) |dep, i| {
++                if (dep == .rtc_listener and dep.rtc_listener == self) {
++                    _ = signal._dependents.swapRemove(i);
++                    break;
++                }
++            }
++        }
++        self.slot.release();
++        self.data.release();
++        switch (self.owner) {
++            inline else => |owner| {
++                owner._listener_roots.remove(&self.node);
++                owner._listener_pool.destroy(self);
++            },
++        }
++    }
++    fn removed(ptr: *anyopaque) void {
++        const self: *ListenerRoot = @ptrCast(@alignCast(ptr));
++        switch (self.owner) {
++            inline else => |owner| self.dispose(owner._listener_local),
++        }
++    }
++    pub fn abort(self: *ListenerRoot, exec: *const js.Execution) void {
++        var scope: js.Local.Scope = undefined;
++        exec.js.localScope(&scope);
++        defer scope.deinit();
++        _ = scope.local.zigValueToJs(self.target, .{}) catch return;
++        switch (self.owner) {
++            inline else => |owner| {
++                const previous = owner._listener_local;
++                owner._listener_local = &scope.local;
++                defer owner._listener_local = previous;
++                const list = owner._events.getListeners(self.target, self.listener.typ) orelse return;
++                owner._events.removeListener(list, self.listener);
++            },
++        }
++    }
++};
++
++const Policy = enum {
++    all,
++    relay,
++    pub const js_enum_from_string = true;
++};
++const Bundle = enum {
++    balanced,
++    @"max-compat",
++    @"max-bundle",
++    pub const js_enum_from_string = true;
++};
++const Mux = enum {
++    negotiate,
++    require,
++    pub const js_enum_from_string = true;
++};
++const Server = struct { urls: []const []const u8, username: ?[]const u8 = null, credential: ?[]const u8 = null };
++const Configuration = struct {
++    bundle: Bundle = .balanced,
++    policy: Policy = .all,
++    pool: u8 = 0,
++    servers: []const Server = &.{},
++    encoded: bool = false,
++    always_data: bool = false,
++
++    fn parse(input: ?js.Value, allocator: std.mem.Allocator) !Configuration {
++        const object = try Convert.dictionary(input) orelse return .{};
++        var result: Configuration = .{};
++        const always = try object.get("alwaysNegotiateDataChannels");
++        if (!always.isUndefined()) result.always_data = always.toBool();
++        const bundle = try object.get("bundlePolicy");
++        if (!bundle.isUndefined()) result.bundle = std.meta.stringToEnum(Bundle, try text(bundle)) orelse return error.TypeError;
++        const certificates = try object.get("certificates");
++        if (!certificates.isUndefined()) {
++            const iterator = try certificates.iterator() orelse return error.TypeError;
++            if (try iterator.next() != null) return error.NotSupported;
++        }
++        const encoded = try object.get("encodedInsertableStreams");
++        if (!encoded.isUndefined()) result.encoded = encoded.toBool();
++        const pool = try object.get("iceCandidatePoolSize");
++        if (!pool.isUndefined()) {
++            const n = try pool.toF64();
++            if (!std.math.isFinite(n) or n < 0 or n > 255) return error.TypeError;
++            result.pool = @intFromFloat(n);
++        }
++        const servers = try object.get("iceServers");
++        if (!servers.isUndefined()) {
++            const iterator = try servers.iterator() orelse return error.TypeError;
++            var list: std.ArrayList(Server) = .empty;
++            while (try iterator.next()) |item| {
++                const server = try Convert.dictionary(item) orelse return error.TypeError;
++                const credential = try server.get("credential");
++                const credential_type = try server.get("credentialType");
++                if (!credential_type.isUndefined() and !std.mem.eql(u8, try text(credential_type), "password")) return error.TypeError;
++                const urls = try server.get("urls");
++                var url_list: std.ArrayList([]const u8) = .empty;
++                if (urls.isUndefined()) return error.TypeError;
++                if (urls.isString() != null) {
++                    try url_list.append(allocator, try copy(allocator, try text(urls)));
++                } else {
++                    const url_iterator = try urls.iterator() orelse return error.TypeError;
++                    while (try url_iterator.next()) |url| try url_list.append(allocator, try copy(allocator, try text(url)));
++                }
++                const username = try server.get("username");
++                const entry = Server{
++                    .urls = url_list.items,
++                    .username = if (username.isUndefined()) null else try copy(allocator, try text(username)),
++                    .credential = if (credential.isUndefined()) null else try copy(allocator, try text(credential)),
++                };
++                for (entry.urls) |url| {
++                    const colon = std.mem.indexOfScalar(u8, url, ':') orelse return error.SyntaxError;
++                    const scheme = url[0..colon];
++                    const turn = std.mem.eql(u8, scheme, "turn") or std.mem.eql(u8, scheme, "turns");
++                    if ((!turn and !std.mem.eql(u8, scheme, "stun") and !std.mem.eql(u8, scheme, "stuns")) or colon + 1 == url.len or std.mem.indexOfAny(u8, url, " \r\n\t/#") != null) return error.SyntaxError;
++                    if (turn and (entry.username == null or entry.credential == null)) return error.InvalidAccessError;
++                }
++                try list.append(allocator, entry);
++            }
++            result.servers = list.items;
++        }
++        const policy = try object.get("iceTransportPolicy");
++        if (!policy.isUndefined()) result.policy = std.meta.stringToEnum(Policy, try text(policy)) orelse return error.TypeError;
++        const mux = try object.get("rtcpMuxPolicy");
++        if (!mux.isUndefined()) _ = std.meta.stringToEnum(Mux, try text(mux)) orelse return error.TypeError;
++        return result;
++    }
++    fn toObject(self: Configuration, local: *const js.Local) !js.Object {
++        const result = local.newObject();
++        _ = try result.set("alwaysNegotiateDataChannels", self.always_data, .{});
++        _ = try result.set("bundlePolicy", @tagName(self.bundle), .{});
++        _ = try result.set("certificates", @as([]const js.Value, &.{}), .{});
++        _ = try result.set("encodedInsertableStreams", self.encoded, .{});
++        _ = try result.set("iceCandidatePoolSize", self.pool, .{});
++        const servers = try local.call_arena.alloc(js.Object, self.servers.len);
++        for (self.servers, servers) |server, *o| {
++            o.* = local.newObject();
++            _ = try o.set("urls", server.urls, .{});
++            if (server.username) |v| _ = try o.set("username", v, .{});
++            if (server.credential) |v| _ = try o.set("credential", v, .{});
++        }
++        _ = try result.set("iceServers", servers, .{});
++        _ = try result.set("iceTransportPolicy", @tagName(self.policy), .{});
++        _ = try result.set("rtcpMuxPolicy", "require", .{});
++        return result;
++    }
++};
++
++pub const Peer = struct {
++    pub const Proto = EventTarget;
++    _proto: *EventTarget,
++    _arena: *lp.Arena,
++    _rc: lp.RC = .{},
++    _context: ?*js.Context,
++    _context_node: std.DoublyLinkedList.Node = .{},
++    _events: EventManager,
++    _handlers: [11]Speech.Handler = undefined,
++    _listener_roots: std.DoublyLinkedList = .{},
++    _listener_pool: std.heap.MemoryPool(ListenerRoot) = .empty,
++    _listener_local: ?*const js.Local = null,
++    _channels: std.ArrayList(*Channel) = .empty,
++    _data_section: bool = false,
++    _config: Configuration,
++    _signaling: enum { stable, @"have-local-offer", closed } = .stable,
++    _gathering: enum { new, gathering, complete } = .new,
++    _local_sdp: ?[]const u8 = null,
++    _local_base: ?[]const u8 = null,
++    _offers: std.ArrayList(Offer) = .empty,
++    _local_ufrag: ?[4]u8 = null,
++    _candidate_line: ?[]const u8 = null,
++    _restart_pending: bool = false,
++    _generation: u64 = 0,
++    _negotiation_pending: bool = false,
++    _session: u64,
++    _version: u64 = 1,
++    _ufrag: [4]u8,
++    _password: [24]u8,
++    _fingerprint: [95]u8,
++    _hostname: [42]u8,
++    _port: u16,
++
++    const names = [_][]const u8{ "negotiationneeded", "icecandidate", "signalingstatechange", "iceconnectionstatechange", "connectionstatechange", "icegatheringstatechange", "icecandidateerror", "track", "datachannel", "addstream", "removestream" };
++
++    fn init(options: ?js.Value, exec: *js.Execution) !*Peer {
++        const arena = try exec.getArena(.small, "RTCPeerConnection");
++        errdefer arena.release();
++        const config = try Configuration.parse(options, arena.allocator());
++        var entropy: [64]u8 = undefined;
++        lp.io.random(&entropy);
++        const self = try exec._factory.eventTargetWithAllocator(arena.allocator(), Peer{
++            ._proto = undefined,
++            ._arena = arena,
++            ._context = exec.js,
++            ._events = .init(arena.allocator()),
++            ._config = config,
++            ._session = std.mem.readInt(u64, entropy[0..8], .little) >> 1,
++            ._port = 49152 + @as(u16, std.mem.readInt(u16, entropy[8..10], .little) % 16384),
++            ._ufrag = undefined,
++            ._password = undefined,
++            ._fingerprint = undefined,
++            ._hostname = undefined,
++        });
++        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++        for (&self._ufrag, entropy[10..14]) |*c, n| c.* = alphabet[n % 64];
++        for (&self._password, entropy[14..38]) |*c, n| c.* = alphabet[n % 64];
++        var digest: [32]u8 = undefined;
++        lp.io.random(&digest);
++        for (digest, 0..) |n, i| {
++            self._fingerprint[i * 3] = "0123456789ABCDEF"[n >> 4];
++            self._fingerprint[i * 3 + 1] = "0123456789ABCDEF"[n & 15];
++            if (i != 31) self._fingerprint[i * 3 + 2] = ':';
++        }
++        @import("../../id.zig").uuidv4(self._hostname[0..36]);
++        @memcpy(self._hostname[36..], ".local");
++        for (&self._handlers, names) |*handler, name| handler.* = .{ .target = self._proto, .events = &self._events, .name = name, .weak = true };
++        exec.js.rtc_peers.append(&self._context_node);
++        return self;
++    }
++    pub fn acquireRef(self: *Peer) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *Peer, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *Peer, _: *Page) void {
++        if (self._context) |ctx| ctx.rtc_peers.remove(&self._context_node);
++        for (&self._handlers) |*handler| handler.deinit();
++        while (self._listener_roots.first) |node| {
++            const root: *ListenerRoot = @fieldParentPtr("node", node);
++            root.dispose(null);
++        }
++        self._arena.release();
++    }
++    pub fn detach(self: *Peer) void {
++        if (self._context) |ctx| ctx.rtc_peers.remove(&self._context_node);
++        self._context = null;
++        self._signaling = .closed;
++        self._generation +%= 1;
++        for (self._channels.items) |channel| channel._state = .closed;
++    }
++    pub const registerListener = Listeners(Peer).register;
++    pub const removeListener = Listeners(Peer).remove;
++    pub const dispatch = Listeners(Peer).dispatch;
++    fn requireOpen(self: *const Peer) !void {
++        if (self._context == null or self._signaling == .closed) return error.InvalidStateError;
++    }
++    fn getConfiguration(self: *const Peer, exec: *js.Execution) !js.Object {
++        return self._config.toObject(exec.js.local.?);
++    }
++    fn setConfiguration(self: *Peer, options: ?js.Value) !void {
++        try self.requireOpen();
++        const config = try Configuration.parse(options, self._arena.allocator());
++        if (config.bundle != self._config.bundle or (self._local_sdp != null and config.pool != self._config.pool)) return error.InvalidModification;
++        self._config = config;
++    }
++    fn createDataChannel(self: *Peer, label: []const u8, options: ?Channel.Options, exec: *js.Execution) !*Channel {
++        try self.requireOpen();
++        const channel = try Channel.init(self, label, options orelse .{}, exec);
++        try self._channels.ensureUnusedCapacity(self._arena.allocator(), 1);
++        var key: [32]u8 = undefined;
++        try edge(self._proto, try std.fmt.bufPrint(&key, "channel{d}", .{@intFromPtr(channel)}), channel, exec.js.local.?);
++        try edge(channel._proto, "peer", self, exec.js.local.?);
++        self._channels.appendAssumeCapacity(channel);
++        if (!self._data_section) {
++            self._data_section = true;
++            self._negotiation_pending = true;
++            _ = try self.schedule(.negotiate, exec);
++        }
++        return channel;
++    }
++    fn releaseChannel(self: *Peer, channel: *Channel, local: *const js.Local) !void {
++        for (self._channels.items, 0..) |live, i| {
++            if (live == channel) {
++                _ = self._channels.swapRemove(i);
++                break;
++            }
++        }
++        const data = try edgeData(self, local);
++        var key: [32]u8 = undefined;
++        const name = try std.fmt.bufPrint(&key, "channel{d}", .{@intFromPtr(channel)});
++        var deleted: js.v8.MaybeBool = undefined;
++        js.v8.v8__Object__Delete(data.handle, local.handle, @ptrCast(local.newString(name).handle), &deleted);
++    }
++    const Offer = struct { sdp: []const u8, base: []const u8, ufrag: [4]u8 };
++    fn offer(self: *Peer) ![]const u8 {
++        if (self._restart_pending) {
++            var entropy: [28]u8 = undefined;
++            lp.io.random(&entropy);
++            const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++            for (&self._ufrag, entropy[0..4]) |*c, n| c.* = alphabet[n % 64];
++            for (&self._password, entropy[4..]) |*c, n| c.* = alphabet[n % 64];
++            self._restart_pending = false;
++        }
++        const allocator = self._arena.allocator();
++        self._version += 1;
++        const header = try std.fmt.allocPrint(allocator, "v=0\r\no=- {d} {d} IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n", .{ self._session, self._version });
++        const sdp = if (!self._data_section and !self._config.always_data) header else try std.fmt.allocPrint(allocator, "{s}a=group:BUNDLE 0\r\na=extmap-allow-mixed\r\na=msid-semantic: WMS\r\n" ++
++            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\n" ++
++            "a=ice-ufrag:{s}\r\na=ice-pwd:{s}\r\na=ice-options:trickle\r\na=fingerprint:sha-256 {s}\r\n" ++
++            "a=setup:actpass\r\na=mid:0\r\na=sctp-port:5000\r\na=max-message-size:262144\r\n", .{ header, self._ufrag, self._password, self._fingerprint });
++        try self._offers.append(allocator, .{ .sdp = sdp, .base = sdp, .ufrag = self._ufrag });
++        return sdp;
++    }
++    const OfferOptions = struct { iceRestart: bool = false, offerToReceiveAudio: bool = false, offerToReceiveVideo: bool = false };
++    fn createOffer(self: *Peer, options: ?js.Value, exec: *js.Execution) !js.Promise {
++        var caught: js.TryCatch = undefined;
++        caught.init(exec.js.local.?);
++        defer caught.deinit();
++        return self.makeOffer(options, exec) catch |err| rejectCaught(exec, &caught, err);
++    }
++    fn makeOffer(self: *Peer, options: ?js.Value, exec: *js.Execution) !js.Promise {
++        const opts = try dictionary(OfferOptions, options);
++        try self.requireOpen();
++        if (opts.offerToReceiveAudio or opts.offerToReceiveVideo) return error.NotSupported;
++        if (opts.iceRestart) self._restart_pending = true;
++        return resolved(exec, Description.Init{ .type = .offer, .sdp = try self.offer() });
++    }
++    fn createAnswer(self: *Peer, _: ?js.Value) !js.Promise {
++        try self.requireOpen();
++        return error.InvalidStateError;
++    }
++    fn setRemoteDescription(self: *Peer, input: Description.Required) !js.Promise {
++        _ = input;
++        try self.requireOpen();
++        return error.NotSupported;
++    }
++    fn addIceCandidate(self: *Peer, _: ?js.Value) !js.Promise {
++        try self.requireOpen();
++        return error.InvalidStateError;
++    }
++    fn restartIce(self: *Peer, exec: *js.Execution) !void {
++        if (self._signaling == .closed) return;
++        self._restart_pending = true;
++        if (!self._negotiation_pending) {
++            self._negotiation_pending = true;
++            _ = try self.schedule(.negotiate, exec);
++        }
++    }
++    fn setLocalDescription(self: *Peer, input: ?js.Value, exec: *js.Execution) !js.Promise {
++        var caught: js.TryCatch = undefined;
++        caught.init(exec.js.local.?);
++        defer caught.deinit();
++        return self.queueLocal(input, exec) catch |err| rejectCaught(exec, &caught, err);
++    }
++    fn queueLocal(self: *Peer, input: ?js.Value, exec: *js.Execution) !js.Promise {
++        var desc = try dictionary(Description.Init, input);
++        try self.requireOpen();
++        const typ = desc.type orelse .offer;
++        if (typ != .offer and typ != .rollback) return error.InvalidStateError;
++        if (desc.sdp.len == 0 and typ == .offer) {
++            desc.sdp = try self.offer();
++        }
++        desc.type = typ;
++        desc.sdp = try copy(self._arena.allocator(), desc.sdp);
++        const resolver = js.PromiseResolver.init(exec.js.local.?);
++        const global = try resolver.persist();
++        errdefer global.release();
++        const task = try self.schedule(.set_local, exec);
++        task.description = desc;
++        task.resolver = global;
++        return resolver.promise();
++    }
++    fn localDescription(self: *const Peer, exec: *js.Execution) !?*Description {
++        return if (self._local_sdp) |sdp| try Description.init(.{ .type = .offer, .sdp = sdp }, exec) else null;
++    }
++    fn noDescription(_: *const Peer) ?*Description {
++        return null;
++    }
++    fn signaling(self: *const Peer) []const u8 {
++        return @tagName(self._signaling);
++    }
++    fn gathering(self: *const Peer) []const u8 {
++        return @tagName(self._gathering);
++    }
++    fn connection(self: *const Peer) []const u8 {
++        return if (self._signaling == .closed) "closed" else "new";
++    }
++    fn canTrickle(_: *const Peer) ?bool {
++        return null;
++    }
++    fn sctp(_: *const Peer) ?js.Value {
++        return null;
++    }
++    fn empty(_: *const Peer) []const js.Value {
++        return &.{};
++    }
++    fn close(self: *Peer, exec: *js.Execution) !void {
++        if (self._signaling == .closed) return;
++        self._signaling = .closed;
++        self._generation +%= 1;
++        for (self._channels.items) |channel| try channel.close(exec);
++    }
++    fn applyLocal(self: *Peer, desc: Description.Init, exec: *js.Execution) !void {
++        try self.requireOpen();
++        if (desc.type.? == .rollback) {
++            if (self._signaling == .stable) return error.InvalidStateError;
++            self._local_sdp = null;
++            self._local_base = null;
++            self._signaling = .stable;
++            self._generation +%= 1;
++            self._gathering = .new;
++            self._local_ufrag = null;
++            self._candidate_line = null;
++            self._negotiation_pending = self._data_section or self._restart_pending;
++            if (self._negotiation_pending) _ = try self.schedule(.negotiate, exec);
++        } else {
++            // Only locally generated data-only offers are supported. Do not
++            // pretend to negotiate arbitrary media or a remote transport.
++            if (!std.mem.startsWith(u8, desc.sdp, "v=0\r\n")) return error.OperationError;
++            const selected = for (self._offers.items) |offered| {
++                if (std.mem.eql(u8, offered.sdp, desc.sdp)) break offered;
++            } else return error.NotSupported;
++            const has_data = std.mem.indexOf(u8, desc.sdp, "m=application ") != null;
++            const restart = self._local_ufrag == null or !std.mem.eql(u8, &self._local_ufrag.?, &selected.ufrag);
++            self._local_base = selected.base;
++            self._local_sdp = selected.base;
++            self._signaling = .@"have-local-offer";
++            if (has_data and restart) {
++                self._local_ufrag = selected.ufrag;
++                self._candidate_line = null;
++                self._gathering = .new;
++                self._generation +%= 1;
++                _ = try self.schedule(.start, exec);
++            } else if (has_data) {
++                if (self._candidate_line) |line| try self.saveCandidate(line);
++            } else {
++                self._generation +%= 1;
++                self._local_ufrag = null;
++                self._candidate_line = null;
++                self._gathering = .new;
++            }
++            self._negotiation_pending = false;
++        }
++        try Listeners(Peer).emit(self, "signalingstatechange", exec);
++    }
++    fn saveCandidate(self: *Peer, line: []const u8) !void {
++        self._candidate_line = line;
++        const allocator = self._arena.allocator();
++        self._local_sdp = try std.fmt.allocPrint(allocator, "{s}a={s}\r\n", .{ self._local_base.?, line });
++        try self._offers.append(allocator, .{ .sdp = self._local_sdp.?, .base = self._local_base.?, .ufrag = self._local_ufrag.? });
++    }
++    const Task = struct {
++        const Kind = enum { negotiate, set_local, start, candidate, complete, channel_close };
++        peer: *Peer,
++        arena: *lp.Arena,
++        root: js.Value.Global,
++        generation: u64,
++        kind: Kind,
++        description: Description.Init = .{},
++        resolver: ?js.PromiseResolver.Global = null,
++        channel: ?*Channel = null,
++        fn dispose(self: *Task) void {
++            if (self.resolver) |resolver| resolver.release();
++            self.root.release();
++            self.arena.release();
++        }
++        fn cancelled(ptr: *anyopaque) void {
++            const self: *Task = @ptrCast(@alignCast(ptr));
++            self.dispose();
++        }
++        fn run(ptr: *anyopaque) !?u32 {
++            const self: *Task = @ptrCast(@alignCast(ptr));
++            defer self.dispose();
++            const peer = self.peer;
++            const ctx = peer._context orelse return null;
++            var scope: js.Local.Scope = undefined;
++            ctx.localScope(&scope);
++            defer scope.deinit();
++            defer scope.local.runMicrotasks();
++            const exec = &ctx.execution;
++            if (self.kind == .set_local) {
++                const resolver = self.resolver.?.local(&scope.local);
++                peer.applyLocal(self.description, exec) catch |err| {
++                    try resolver.rejectValue(try scope.local.zigValueToJs((DOMException.fromError(err) orelse DOMException.init("Cannot set the local description", @errorName(err))), .{}));
++                    return null;
++                };
++                try resolver.resolveValue(try scope.local.zigValueToJs({}, .{}));
++                return null;
++            }
++            if (self.kind == .channel_close) {
++                const channel = self.channel.?;
++                if (channel._state == .closing) {
++                    channel._state = .closed;
++                    defer peer.releaseChannel(channel, &scope.local) catch |err| exec.page.recordJsError(err);
++                    try Listeners(Channel).emit(channel, "close", exec);
++                }
++                return null;
++            }
++            if (self.generation != peer._generation or peer._signaling == .closed) return null;
++            switch (self.kind) {
++                .negotiate => {
++                    if (peer._negotiation_pending and peer._signaling == .stable) try Listeners(Peer).emit(peer, "negotiationneeded", exec);
++                },
++                .start => {
++                    peer._gathering = .gathering;
++                    _ = try peer.schedule(.candidate, exec);
++                    try Listeners(Peer).emit(peer, "icegatheringstatechange", exec);
++                },
++                .candidate => {
++                    // Relay-only cannot yield a synthetic host candidate.
++                    if (peer._config.policy == .all) {
++                        const line = try std.fmt.allocPrint(peer._arena.allocator(), "candidate:1 1 udp 2113937151 {s} {d} typ host generation 0 ufrag {s} network-cost 999", .{ peer._hostname, peer._port, peer._local_ufrag.? });
++                        const candidate = try Candidate.init(.{ .candidate = line, .sdpMid = "0", .sdpMLineIndex = 0, .usernameFragment = &peer._local_ufrag.? }, exec);
++                        try peer.saveCandidate(line);
++                        const event = try IceEvent.init("icecandidate", .{ .candidate = candidate }, exec);
++                        event._proto._is_trusted = true;
++                        try peer.dispatch(event._proto, exec);
++                    }
++                    if (self.generation == peer._generation and peer._signaling != .closed) _ = try peer.schedule(.complete, exec);
++                },
++                .complete => {
++                    peer._gathering = .complete;
++                    try Listeners(Peer).emit(peer, "icegatheringstatechange", exec);
++                    if (self.generation != peer._generation or peer._signaling == .closed) return null;
++                    const event = try IceEvent.init("icecandidate", null, exec);
++                    event._proto._is_trusted = true;
++                    try peer.dispatch(event._proto, exec);
++                },
++                .set_local, .channel_close => unreachable,
++            }
++            return null;
++        }
++    };
++    fn schedule(self: *Peer, kind: Task.Kind, exec: *js.Execution) !*Task {
++        const ctx = self._context orelse return error.InvalidStateError;
++        const arena = try exec.getArena(.tiny, "WebRTC.task");
++        errdefer arena.release();
++        var scope: js.Local.Scope = undefined;
++        ctx.localScope(&scope);
++        defer scope.deinit();
++        const root = try (try scope.local.zigValueToJs(self, .{})).persist();
++        errdefer root.release();
++        const task = try arena.create(Task);
++        task.* = .{ .peer = self, .arena = arena, .root = root, .generation = self._generation, .kind = kind };
++        try ctx.scheduler.add(task, Task.run, 1, .{ .name = "WebRTC", .finalizer = Task.cancelled });
++        return task;
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Peer);
++        pub const Meta = struct {
++            pub const name = "RTCPeerConnection";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const constructor = bridge.constructor(Peer.init, .{});
++        pub const localDescription = bridge.accessor(Peer.localDescription, null, .{});
++        pub const pendingLocalDescription = bridge.accessor(Peer.localDescription, null, .{});
++        pub const currentLocalDescription = bridge.accessor(Peer.noDescription, null, .{});
++        pub const remoteDescription = bridge.accessor(Peer.noDescription, null, .{});
++        pub const currentRemoteDescription = bridge.accessor(Peer.noDescription, null, .{});
++        pub const pendingRemoteDescription = bridge.accessor(Peer.noDescription, null, .{});
++        pub const signalingState = bridge.accessor(Peer.signaling, null, .{});
++        pub const iceGatheringState = bridge.accessor(Peer.gathering, null, .{});
++        pub const iceConnectionState = bridge.accessor(Peer.connection, null, .{});
++        pub const connectionState = bridge.accessor(Peer.connection, null, .{});
++        pub const canTrickleIceCandidates = bridge.accessor(Peer.canTrickle, null, .{});
++        pub const sctp = bridge.accessor(Peer.sctp, null, .{});
++        pub const onnegotiationneeded = bridge.accessor(Speech.Binding(Peer, 0).get, Speech.Binding(Peer, 0).set, .{});
++        pub const onicecandidate = bridge.accessor(Speech.Binding(Peer, 1).get, Speech.Binding(Peer, 1).set, .{});
++        pub const onsignalingstatechange = bridge.accessor(Speech.Binding(Peer, 2).get, Speech.Binding(Peer, 2).set, .{});
++        pub const oniceconnectionstatechange = bridge.accessor(Speech.Binding(Peer, 3).get, Speech.Binding(Peer, 3).set, .{});
++        pub const onconnectionstatechange = bridge.accessor(Speech.Binding(Peer, 4).get, Speech.Binding(Peer, 4).set, .{});
++        pub const onicegatheringstatechange = bridge.accessor(Speech.Binding(Peer, 5).get, Speech.Binding(Peer, 5).set, .{});
++        pub const onicecandidateerror = bridge.accessor(Speech.Binding(Peer, 6).get, Speech.Binding(Peer, 6).set, .{});
++        pub const ontrack = bridge.accessor(Speech.Binding(Peer, 7).get, Speech.Binding(Peer, 7).set, .{});
++        pub const ondatachannel = bridge.accessor(Speech.Binding(Peer, 8).get, Speech.Binding(Peer, 8).set, .{});
++        pub const onaddstream = bridge.accessor(Speech.Binding(Peer, 9).get, Speech.Binding(Peer, 9).set, .{});
++        pub const onremovestream = bridge.accessor(Speech.Binding(Peer, 10).get, Speech.Binding(Peer, 10).set, .{});
++        pub const createDataChannel = bridge.function(Peer.createDataChannel, .{});
++        pub const createOffer = bridge.function(Peer.createOffer, .{});
++        pub const createAnswer = bridge.function(Peer.createAnswer, .{});
++        pub const setLocalDescription = bridge.function(Peer.setLocalDescription, .{});
++        pub const setRemoteDescription = bridge.function(Peer.setRemoteDescription, .{});
++        pub const addIceCandidate = bridge.function(Peer.addIceCandidate, .{});
++        pub const getConfiguration = bridge.function(Peer.getConfiguration, .{});
++        pub const setConfiguration = bridge.function(Peer.setConfiguration, .{});
++        pub const restartIce = bridge.function(Peer.restartIce, .{});
++        pub const getSenders = bridge.function(Peer.empty, .{});
++        pub const getReceivers = bridge.function(Peer.empty, .{});
++        pub const getTransceivers = bridge.function(Peer.empty, .{});
++        pub const close = bridge.function(Peer.close, .{});
++    };
++};
++
++pub const Channel = struct {
++    pub const Proto = EventTarget;
++    _proto: *EventTarget,
++    _arena: *lp.Arena,
++    _rc: lp.RC = .{},
++    _peer: *Peer,
++    _events: EventManager,
++    _handlers: [6]Speech.Handler = undefined,
++    _listener_roots: std.DoublyLinkedList = .{},
++    _listener_pool: std.heap.MemoryPool(ListenerRoot) = .empty,
++    _listener_local: ?*const js.Local = null,
++    _label: []const u8,
++    _options: Options,
++    _state: enum { connecting, closing, closed } = .connecting,
++    _threshold: u32 = 0,
++    _binary: enum {
++        blob,
++        arraybuffer,
++        pub const js_enum_from_string = true;
++    } = .arraybuffer,
++    pub const Options = struct {
++        id: ?u16 = null,
++        maxPacketLifeTime: ?u16 = null,
++        maxRetransmits: ?u16 = null,
++        negotiated: bool = false,
++        ordered: bool = true,
++        protocol: []const u8 = "",
++    };
++    fn init(peer: *Peer, label_: []const u8, options: Options, exec: *js.Execution) !*Channel {
++        if (label_.len > 65535 or options.protocol.len > 65535) return error.TypeError;
++        if (options.maxPacketLifeTime != null and options.maxRetransmits != null) return error.TypeError;
++        if (options.id == 65535 or (options.negotiated and options.id == null)) return error.TypeError;
++        for (peer._channels.items) |channel| {
++            if (options.id != null and channel._options.id == options.id and channel._state != .closed) return error.OperationError;
++        }
++        const arena = try exec.getArena(.small, "RTCDataChannel");
++        errdefer arena.release();
++        var opts = options;
++        opts.protocol = try copy(arena.allocator(), opts.protocol);
++        const self = try exec._factory.eventTargetWithAllocator(arena.allocator(), Channel{
++            ._proto = undefined,
++            ._arena = arena,
++            ._peer = peer,
++            ._events = .init(arena.allocator()),
++            ._label = try copy(arena.allocator(), label_),
++            ._options = opts,
++        });
++        for (&self._handlers, [_][]const u8{ "open", "bufferedamountlow", "error", "closing", "close", "message" }) |*handler, name| handler.* = .{ .target = self._proto, .events = &self._events, .name = name, .weak = true };
++        return self;
++    }
++    pub fn acquireRef(self: *Channel) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *Channel, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *Channel, _: *Page) void {
++        for (&self._handlers) |*handler| handler.deinit();
++        while (self._listener_roots.first) |node| {
++            const root: *ListenerRoot = @fieldParentPtr("node", node);
++            root.dispose(null);
++        }
++        self._arena.release();
++    }
++    pub const registerListener = Listeners(Channel).register;
++    pub const removeListener = Listeners(Channel).remove;
++    pub const dispatch = Listeners(Channel).dispatch;
++    fn label(self: *const Channel) []const u8 {
++        return self._label;
++    }
++    fn ordered(self: *const Channel) bool {
++        return self._options.ordered;
++    }
++    fn reliable(self: *const Channel) bool {
++        return self._options.maxPacketLifeTime == null and self._options.maxRetransmits == null;
++    }
++    fn lifetime(self: *const Channel) ?u16 {
++        return self._options.maxPacketLifeTime;
++    }
++    fn retransmits(self: *const Channel) ?u16 {
++        return self._options.maxRetransmits;
++    }
++    fn protocol(self: *const Channel) []const u8 {
++        return self._options.protocol;
++    }
++    fn negotiated(self: *const Channel) bool {
++        return self._options.negotiated;
++    }
++    fn id(self: *const Channel) ?u16 {
++        return self._options.id;
++    }
++    fn state(self: *const Channel) []const u8 {
++        return @tagName(self._state);
++    }
++    fn buffered(_: *const Channel) u32 {
++        return 0;
++    }
++    fn threshold(self: *const Channel) u32 {
++        return self._threshold;
++    }
++    fn setThreshold(self: *Channel, value: u32) void {
++        self._threshold = value;
++    }
++    fn binary(self: *const Channel) []const u8 {
++        return @tagName(self._binary);
++    }
++    fn setBinary(self: *Channel, value: @FieldType(Channel, "_binary")) void {
++        self._binary = value;
++    }
++    fn send(_: *Channel, _: js.Value) !void {
++        return error.InvalidStateError;
++    }
++    fn close(self: *Channel, exec: *js.Execution) !void {
++        if (self._state != .connecting) return;
++        self._state = .closing;
++        if (self._peer._context == null) {
++            self._state = .closed;
++            return;
++        }
++        const task = try self._peer.schedule(.channel_close, exec);
++        task.channel = self;
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Channel);
++        pub const Meta = struct {
++            pub const name = "RTCDataChannel";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const label = bridge.accessor(Channel.label, null, .{});
++        pub const ordered = bridge.accessor(Channel.ordered, null, .{});
++        pub const reliable = bridge.accessor(Channel.reliable, null, .{});
++        pub const maxPacketLifeTime = bridge.accessor(Channel.lifetime, null, .{});
++        pub const maxRetransmits = bridge.accessor(Channel.retransmits, null, .{});
++        pub const protocol = bridge.accessor(Channel.protocol, null, .{});
++        pub const negotiated = bridge.accessor(Channel.negotiated, null, .{});
++        pub const id = bridge.accessor(Channel.id, null, .{});
++        pub const readyState = bridge.accessor(Channel.state, null, .{});
++        pub const bufferedAmount = bridge.accessor(Channel.buffered, null, .{});
++        pub const bufferedAmountLowThreshold = bridge.accessor(Channel.threshold, Channel.setThreshold, .{});
++        pub const binaryType = bridge.accessor(Channel.binary, Channel.setBinary, .{});
++        pub const onopen = bridge.accessor(Speech.Binding(Channel, 0).get, Speech.Binding(Channel, 0).set, .{});
++        pub const onbufferedamountlow = bridge.accessor(Speech.Binding(Channel, 1).get, Speech.Binding(Channel, 1).set, .{});
++        pub const onerror = bridge.accessor(Speech.Binding(Channel, 2).get, Speech.Binding(Channel, 2).set, .{});
++        pub const onclosing = bridge.accessor(Speech.Binding(Channel, 3).get, Speech.Binding(Channel, 3).set, .{});
++        pub const onclose = bridge.accessor(Speech.Binding(Channel, 4).get, Speech.Binding(Channel, 4).set, .{});
++        pub const onmessage = bridge.accessor(Speech.Binding(Channel, 5).get, Speech.Binding(Channel, 5).set, .{});
++        pub const send = bridge.function(Channel.send, .{});
++        pub const close = bridge.function(Channel.close, .{});
++    };
++};
++
++const SDPType = enum {
++    offer,
++    pranswer,
++    answer,
++    rollback,
++    pub const js_enum_from_string = true;
++    pub fn toString(self: SDPType) []const u8 {
++        return @tagName(self);
++    }
++};
++pub const Description = struct {
++    _arena: *lp.Arena,
++    _rc: lp.RC = .{},
++    _type: ?SDPType,
++    _sdp: []const u8,
++    const Init = struct { sdp: []const u8 = "", type: ?SDPType = null };
++    const Required = struct { sdp: []const u8 = "", type: SDPType };
++    fn init(options: ?Init, exec: *js.Execution) !*Description {
++        const opts = options orelse Init{};
++        const arena = try exec.getArena(.tiny, "RTCSessionDescription");
++        errdefer arena.release();
++        const self = try arena.create(Description);
++        self.* = .{ ._arena = arena, ._type = opts.type, ._sdp = try copy(arena.allocator(), opts.sdp) };
++        return self;
++    }
++    pub fn acquireRef(self: *Description) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *Description, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *Description, _: *Page) void {
++        self._arena.release();
++    }
++    fn typ(self: *const Description) ?[]const u8 {
++        return if (self._type) |t| @tagName(t) else null;
++    }
++    fn setType(self: *Description, value: ?SDPType) void {
++        self._type = value;
++    }
++    fn sdp(self: *const Description) []const u8 {
++        return self._sdp;
++    }
++    fn setSdp(self: *Description, value: []const u8) !void {
++        self._sdp = try copy(self._arena.allocator(), value);
++    }
++    fn toJSON(self: *const Description, exec: *js.Execution) !js.Object {
++        const o = exec.js.local.?.newObject();
++        _ = try o.set("type", self.typ(), .{});
++        _ = try o.set("sdp", self._sdp, .{});
++        return o;
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Description);
++        pub const Meta = struct {
++            pub const name = "RTCSessionDescription";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const constructor = bridge.constructor(Description.init, .{});
++        pub const @"type" = bridge.accessor(Description.typ, Description.setType, .{});
++        pub const sdp = bridge.accessor(Description.sdp, Description.setSdp, .{});
++        pub const toJSON = bridge.function(Description.toJSON, .{});
++    };
++};
++
++pub const Candidate = struct {
++    _arena: *lp.Arena,
++    _rc: lp.RC = .{},
++    _input: Init,
++    _foundation: ?[]const u8 = null,
++    _component: ?[]const u8 = null,
++    _priority: ?u32 = null,
++    _address: ?[]const u8 = null,
++    _protocol: ?[]const u8 = null,
++    _port: ?u16 = null,
++    _type: ?[]const u8 = null,
++    _tcp: ?[]const u8 = null,
++    _related_address: ?[]const u8 = null,
++    _related_port: ?u16 = null,
++    const Init = struct { candidate: []const u8 = "", sdpMLineIndex: ?u16 = null, sdpMid: ?[]const u8 = null, usernameFragment: ?[]const u8 = null };
++    fn init(options: ?Init, exec: *js.Execution) !*Candidate {
++        const opts = options orelse Init{};
++        if (opts.sdpMid == null and opts.sdpMLineIndex == null) return error.TypeError;
++        const arena = try exec.getArena(.tiny, "RTCIceCandidate");
++        errdefer arena.release();
++        const self = try arena.create(Candidate);
++        self.* = .{ ._arena = arena, ._input = .{
++            .candidate = try copy(arena.allocator(), opts.candidate),
++            .sdpMid = if (opts.sdpMid) |v| try copy(arena.allocator(), v) else null,
++            .sdpMLineIndex = opts.sdpMLineIndex,
++            .usernameFragment = if (opts.usernameFragment) |v| try copy(arena.allocator(), v) else null,
++        } };
++        self.parse();
++        return self;
++    }
++    fn parse(self: *Candidate) void {
++        const line = self._input.candidate;
++        if (!std.mem.startsWith(u8, line, "candidate:")) return;
++        var it = std.mem.tokenizeAny(u8, line[10..], " \t");
++        const foundation = it.next() orelse return;
++        const component = it.next() orelse return;
++        const protocol = it.next() orelse return;
++        const priority = std.fmt.parseUnsigned(u32, it.next() orelse return, 10) catch return;
++        const address = it.next() orelse return;
++        const port = std.fmt.parseUnsigned(u16, it.next() orelse return, 10) catch return;
++        if (!std.mem.eql(u8, it.next() orelse return, "typ")) return;
++        const kind = it.next() orelse return;
++        if (!std.mem.eql(u8, kind, "host") and !std.mem.eql(u8, kind, "srflx") and !std.mem.eql(u8, kind, "prflx") and !std.mem.eql(u8, kind, "relay")) return;
++        if (!std.ascii.eqlIgnoreCase(protocol, "udp") and !std.ascii.eqlIgnoreCase(protocol, "tcp")) return;
++        self._foundation = foundation;
++        self._component = if (std.mem.eql(u8, component, "1")) "rtp" else if (std.mem.eql(u8, component, "2")) "rtcp" else null;
++        self._protocol = if (std.ascii.eqlIgnoreCase(protocol, "udp")) "udp" else "tcp";
++        self._priority = priority;
++        self._address = address;
++        self._port = port;
++        self._type = kind;
++        while (it.next()) |key| {
++            const v = it.next() orelse break;
++            if (std.mem.eql(u8, key, "raddr")) self._related_address = v;
++            if (std.mem.eql(u8, key, "rport")) self._related_port = std.fmt.parseUnsigned(u16, v, 10) catch null;
++            if (std.mem.eql(u8, key, "tcptype")) self._tcp = v;
++        }
++    }
++    pub fn acquireRef(self: *Candidate) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *Candidate, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *Candidate, _: *Page) void {
++        self._arena.release();
++    }
++    fn candidate(self: *const Candidate) []const u8 {
++        return self._input.candidate;
++    }
++    fn mid(self: *const Candidate) ?[]const u8 {
++        return self._input.sdpMid;
++    }
++    fn index(self: *const Candidate) ?u16 {
++        return self._input.sdpMLineIndex;
++    }
++    fn username(self: *const Candidate) ?[]const u8 {
++        return self._input.usernameFragment;
++    }
++    fn getFoundation(self: *const Candidate) ?[]const u8 {
++        return self._foundation;
++    }
++    fn getComponent(self: *const Candidate) ?[]const u8 {
++        return self._component;
++    }
++    fn getPriority(self: *const Candidate) ?u32 {
++        return self._priority;
++    }
++    fn getAddress(self: *const Candidate) ?[]const u8 {
++        return self._address;
++    }
++    fn getProtocol(self: *const Candidate) ?[]const u8 {
++        return self._protocol;
++    }
++    fn getPort(self: *const Candidate) ?u16 {
++        return self._port;
++    }
++    fn typ(self: *const Candidate) ?[]const u8 {
++        return self._type;
++    }
++    fn tcp(self: *const Candidate) ?[]const u8 {
++        return self._tcp;
++    }
++    fn relatedAddress(self: *const Candidate) ?[]const u8 {
++        return self._related_address;
++    }
++    fn relatedPort(self: *const Candidate) ?u16 {
++        return self._related_port;
++    }
++    fn noString(_: *const Candidate) ?[]const u8 {
++        return null;
++    }
++    fn toJSON(self: *const Candidate) Init {
++        return self._input;
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Candidate);
++        pub const Meta = struct {
++            pub const name = "RTCIceCandidate";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const constructor = bridge.constructor(Candidate.init, .{});
++        pub const candidate = bridge.accessor(Candidate.candidate, null, .{});
++        pub const sdpMid = bridge.accessor(Candidate.mid, null, .{});
++        pub const sdpMLineIndex = bridge.accessor(Candidate.index, null, .{});
++        pub const usernameFragment = bridge.accessor(Candidate.username, null, .{});
++        pub const foundation = bridge.accessor(Candidate.getFoundation, null, .{});
++        pub const component = bridge.accessor(Candidate.getComponent, null, .{});
++        pub const priority = bridge.accessor(Candidate.getPriority, null, .{});
++        pub const address = bridge.accessor(Candidate.getAddress, null, .{});
++        pub const protocol = bridge.accessor(Candidate.getProtocol, null, .{});
++        pub const port = bridge.accessor(Candidate.getPort, null, .{});
++        pub const @"type" = bridge.accessor(Candidate.typ, null, .{});
++        pub const tcpType = bridge.accessor(Candidate.tcp, null, .{});
++        pub const relatedAddress = bridge.accessor(Candidate.relatedAddress, null, .{});
++        pub const relatedPort = bridge.accessor(Candidate.relatedPort, null, .{});
++        pub const relayProtocol = bridge.accessor(Candidate.noString, null, .{});
++        pub const url = bridge.accessor(Candidate.noString, null, .{});
++        pub const toJSON = bridge.function(Candidate.toJSON, .{});
++    };
++};
++
++pub const IceEvent = struct {
++    pub const Proto = Event;
++    _proto: *Event,
++    _candidate: ?*Candidate,
++    const Options = Event.inheritOptions(IceEvent, struct { candidate: ?*Candidate = null });
++    fn init(typ: []const u8, options: ?Options, exec: *js.Execution) !*IceEvent {
++        const opts = options orelse Options{};
++        const arena = try exec.getArena(.tiny, "RTCPeerConnectionIceEvent");
++        var wrapped = false;
++        errdefer if (!wrapped) arena.release();
++        var scope: js.Local.Scope = undefined;
++        exec.js.localScope(&scope);
++        defer scope.deinit();
++        const self = try exec._factory.event(arena, try lp.String.init(arena.allocator(), typ, .{}), IceEvent{
++            ._proto = undefined,
++            ._candidate = opts.candidate,
++        });
++        Event.populatePrototypes(self, opts, false);
++        _ = try scope.local.zigValueToJs(self, .{});
++        wrapped = true;
++        try edge(self, "candidate", opts.candidate, &scope.local);
++        return self;
++    }
++    fn candidate(self: *const IceEvent) ?*Candidate {
++        return self._candidate;
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(IceEvent);
++        pub const Meta = struct {
++            pub const name = "RTCPeerConnectionIceEvent";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const constructor = bridge.constructor(IceEvent.init, .{});
++        pub const candidate = bridge.accessor(IceEvent.candidate, null, .{});
++    };
++};

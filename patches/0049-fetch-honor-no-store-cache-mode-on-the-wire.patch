@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Fri, 30 Oct 2026 18:57:18 -0300
+Subject: [PATCH] fetch: honor no-store cache mode on the wire
+
+Bypass the HTTP cache for no-store fetches. Add Pragma: no-cache and Cache-Control: no-cache only when absent, preserving explicit headers and source precedence. Generated directives use the user-agent source to avoid spurious CORS preflights. Match the fingerprint recorder fetch behavior observed in Chrome; leave other cache modes and header ordering unchanged.
+---
+ src/browser/webapi/net/Fetch.zig | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/browser/webapi/net/Fetch.zig b/src/browser/webapi/net/Fetch.zig
+index 685adac..305d8ac 100644
+--- a/src/browser/webapi/net/Fetch.zig
++++ b/src/browser/webapi/net/Fetch.zig
+@@ -143,6 +143,7 @@ fn submit(request: *Request, body: ?[]const u8, sink: Sink, exec: *const Executi
+         .method = request._method,
+         .body = body,
+         .resource_type = .fetch,
++        .skip_cache = request._cache == .@"no-store",
+         .credentials_mode = switch (request._credentials) {
+             .omit => .omit,
+             .@"same-origin" => .same_origin,
+@@ -177,6 +178,15 @@ fn submit(request: *Request, body: ?[]const u8, sink: Sink, exec: *const Executi
+         // request._referrer_policy, so skip the default one here.
+         try exec.headersForRequest(transfer, .{ .referer = false });
+ 
++        if (request._cache == .@"no-store") {
++            if (transfer.findRequestHeader("Pragma") == null) {
++                try transfer.setHeader("Pragma", "no-cache", .{});
++            }
++            if (transfer.findRequestHeader("Cache-Control") == null) {
++                try transfer.setHeader("Cache-Control", "no-cache", .{});
++            }
++        }
++
+         const source: ?[:0]const u8 = switch (request._referrer) {
+             .none => null,
+             .client => exec.referrerSource(),

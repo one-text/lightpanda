@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 20 Oct 2026 18:34:32 -0300
+Subject: [PATCH] http: send upgrade-insecure-requests on document navigation
+
+Three cold Chrome fingerprint captures sent Upgrade-Insecure-Requests: 1 on document navigations; patched Lightpanda omitted it. Both omitted it on fetch follow-ups.
+
+Set the navigation default beside Accept, before caller overrides. Leave shared baseline headers and fetch/XHR unchanged.
+---
+ src/browser/Frame.zig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index d403c7f..d4517c6 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -937,6 +937,7 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
+         // Ours until submit; clean up if header setup fails.
+         errdefer transfer.deinit();
+         try transfer.setHeader("Accept", lp.Config.HttpHeaders.navigation_accept, .{});
++        try transfer.setHeader("Upgrade-Insecure-Requests", "1", .{});
+         if (opts.header) |hdr| {
+             // Arrives pre-joined ("Name: Value"), e.g. from the CLI.
+             if (HttpClient.Header.parse(hdr)) |parsed| {

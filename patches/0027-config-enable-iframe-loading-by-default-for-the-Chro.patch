@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Fri, 16 Oct 2026 02:58:15 -0300
+Subject: [PATCH] config: enable iframe loading by default for the Chrome
+ persona
+
+Default LoadResources.iframe to true so connected iframes create browsing
+contexts and execute their documents without requiring --load-resources
+iframe. Keep image, worker and external stylesheet loading opt-in.
+
+Reuse Lightpanda's native iframe implementation and the existing identity
+patches in each realm rather than injecting a synthetic contentWindow.
+Update CLI help and the deprecated --disable-subframes warning to describe
+the new default; LP.configureLoading can still disable subframes explicitly.
+
+This exposes the existing iframe CSP enforcement gap instead of masking it
+by preventing all iframe execution. The benchmark realm-consistency probe
+should pass by default; csp-enforced must remain a visible failure until
+CSP is addressed separately. Do not change the benchmark or add tests.
+---
+ src/Config.zig | 4 ++--
+ src/help.zon   | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/Config.zig b/src/Config.zig
+index 8c8529b..cf762c5 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -234,7 +234,7 @@ pub const HttpVersion = enum {
+ 
+ pub const LoadResources = packed struct(u4) {
+     image: bool = false,
+-    iframe: bool = false,
++    iframe: bool = true,
+     worker: bool = false,
+     stylesheet: bool = false,
+ };
+@@ -285,7 +285,7 @@ const CommonOptions = .{
+     .{ .name = "adblock_lists", .type = ?[]const u8, .validator = accumulateValidator },
+     .{ .name = "cookie", .type = ?[]const u8 },
+     .{ .name = "cookie_jar", .type = ?[]const u8 },
+-    .{ .name = "disable_subframes", .type = bool, .deprecated = "subframes are now disabled by default, use \"--load-resources iframe\" to enable" },
++    .{ .name = "disable_subframes", .type = bool, .deprecated = "iframes are enabled by default; use LP.configureLoading with subFrame=false to disable" },
+     .{ .name = "disable_workers", .type = bool, .deprecated = "workers are now disabled by default, use \"--load-resources worker\" to enable" },
+     .{ .name = "enable_external_stylesheets", .type = bool, .deprecated = "use \"--load-resources stylesheet\" to enable" },
+     .{ .name = "disable_features", .type = DisabledFeatures, .default = DisabledFeatures{} },
+diff --git a/src/help.zon b/src/help.zon
+index 8489a6d..dcbc783 100644
+--- a/src/help.zon
++++ b/src/help.zon
+@@ -422,7 +422,7 @@
+     \\          Defaults to none enabled.
+     \\  --load-resources <RESOURCE>
+     \\          Sub-resource to actually request. Can be passed multiple times.
+-    \\          Defaults to requesting none of them.
++    \\          Defaults to loading iframes; other resource types are disabled.
+     \\          Allowed values:
+     \\             iframe      When enabled, <iframe> elements are fully loaded.
+     \\

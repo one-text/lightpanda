@@ -1,0 +1,614 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 14 Oct 2026 17:21:32 -0300
+Subject: [PATCH] webapi: mock desktop Chrome Web Share with native validation
+
+Expose secure-context, Window-only Navigator.canShare and Navigator.share
+through native V8 bindings for the existing desktop Mac Chrome persona.
+No OS dialog, native application, recipient, file write or real sharing is
+implemented: permitted valid requests asynchronously reject with AbortError
+as a cancelled share, never as successful delivery.
+
+Convert ShareData in WebIDL member order, retaining getter/coercion/iterator
+exceptions as share promise rejections and closing failed File iterables.
+Validate recognized fields and relative URLs against the receiver document.
+Follow Chromium's distinction between basic canShare validation and share's
+activation-gated title/text/URL, file-count, byte-budget and file-safety checks.
+
+Apply the web-share Permissions-Policy subset (self/origin lists, wildcard,
+iframe allow self/src/none and delegation), active receiver checks, five-second
+trusted-input activation and whole-tree consumption. Compatibility mousedown
+must not restore activation consumed by its preceding pointerdown. Keep
+per-Navigator pending state and finalize queued cancellations on teardown.
+Store rejection exceptions in the page factory so retained cross-realm errors
+outlive their original context. Hide/restore both native methods during
+secure-context transitions without exposing them on WorkerNavigator.
+
+Existing upstream tests: 1658/1658 passed. Temporary ignored CDP diagnostics
+cover conversion, security, policy, keyboard/pointer activation, cancellation,
+retained errors/navigation, File iterators, worker absence and descriptors;
+88/88 passed. No upstream tests or benchmark predicates were added/changed.
+
+References:
+https://w3c.github.io/web-share/
+https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/modules/webshare/navigator_share.idl
+https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/modules/webshare/navigator_share.cc
+https://raw.githubusercontent.com/chromium/chromium/main/chrome/browser/webshare/share_service_impl.cc
+---
+ src/browser/EventManager.zig     |   3 +
+ src/browser/frame/user_input.zig |   7 +-
+ src/browser/js/Context.zig       |   5 +
+ src/browser/js/Env.zig           |  29 +++
+ src/browser/webapi/Event.zig     |   3 +
+ src/browser/webapi/Navigator.zig |   6 +
+ src/browser/webapi/WebDriver.zig |   2 +
+ src/browser/webapi/WebShare.zig  | 330 +++++++++++++++++++++++++++++++
+ 8 files changed, 384 insertions(+), 1 deletion(-)
+ create mode 100644 src/browser/webapi/WebShare.zig
+
+diff --git a/src/browser/EventManager.zig b/src/browser/EventManager.zig
+index f392b9d..bbf4c90 100644
+--- a/src/browser/EventManager.zig
++++ b/src/browser/EventManager.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -135,6 +136,7 @@ pub const DispatchDirectOptions = EventManagerBase.DispatchDirectOptions;
+ // Handler can be: null, ?js.Function.Global or js.Function
+ pub fn dispatchDirect(self: *EventManager, target: *EventTarget, event: *Event, handler: anytype, comptime opts: DispatchDirectOptions) !void {
+     const frame = self.frame;
++    @import("webapi/WebShare.zig").notifyActivation(frame, event);
+ 
+     // Set window.event to the currently dispatching event (WHATWG spec)
+     const window = frame.window;
+@@ -174,6 +176,7 @@ fn dispatchNode(self: *EventManager, target: *Node, event: *Event) !void {
+     }
+ 
+     const frame = self.frame;
++    @import("webapi/WebShare.zig").notifyActivation(frame, event);
+ 
+     // Set window.event to the currently dispatching event (WHATWG spec)
+     const window = frame.window;
+diff --git a/src/browser/frame/user_input.zig b/src/browser/frame/user_input.zig
+index e56bd00..2a24a0e 100644
+--- a/src/browser/frame/user_input.zig
++++ b/src/browser/frame/user_input.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -189,6 +190,7 @@ const PointerInput = struct {
+     buttons: u16 = 0,
+     detail: u32 = 0,
+     modifiers: Modifiers = .{},
++    activation_notified: bool = false,
+ };
+ 
+ /// Dispatch a trusted mouse event; returns whether preventDefault() cancelled it.
+@@ -207,6 +209,7 @@ fn dispatchMouseEventOn(frame: *Frame, target: *Element, comptime typ: []const u
+         .altKey = in.modifiers.alt,
+         .metaKey = in.modifiers.meta,
+     }, frame);
++    event.asEvent()._activation_notification_suppressed = in.activation_notified;
+     return frame._event_manager.dispatchCancelable(target.asEventTarget(), event.asEvent());
+ }
+ 
+@@ -299,7 +302,9 @@ fn dispatchPointerPress(frame: *Frame, target: *Element, in: PointerInput) !Pres
+     if (suppress_mouse) {
+         return .{ .suppress_mouse = true, .suppress_focus = true };
+     }
+-    const suppress_focus = try dispatchMouseEventOn(frame, target, "mousedown", in);
++    var mouse = in;
++    mouse.activation_notified = true;
++    const suppress_focus = try dispatchMouseEventOn(frame, target, "mousedown", mouse);
+     return .{ .suppress_mouse = false, .suppress_focus = suppress_focus };
+ }
+ 
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index eef8eeb..e18d9dc 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -65,6 +65,7 @@ object_freeze: v8.Global,
+ 
+ // Native entries saved only while [SecureContext] battery APIs are hidden.
+ battery_bindings: ?struct { method: v8.Global, interface: v8.Global } = null,
++web_share_bindings: ?[2]v8.Global = null,
+ 
+ cpu_profiler: ?*v8.CpuProfiler = null,
+ 
+@@ -236,6 +237,9 @@ pub fn deinit(self: *Context) void {
+         v8.v8__Global__Reset(&bindings.method);
+         v8.v8__Global__Reset(&bindings.interface);
+     }
++    if (self.web_share_bindings) |*bindings| {
++        for (bindings) |*binding| v8.v8__Global__Reset(binding);
++    }
+     v8.v8__Global__Reset(&self.object_freeze);
+     v8.v8__Global__Reset(&self.handle);
+     env.isolate.notifyContextDisposed();
+@@ -269,6 +273,7 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
+             const global_obj = v8.v8__Context__Global(ls.local.handle).?;
+             const secure = self.execution.isSecureContext();
+             env.setBatteryExposure(self, ls.local.handle, global_obj, secure);
++            env.setWebShareExposure(self, ls.local.handle, global_obj, secure);
+             // With the feature disabled, Env.createContext already hid this API.
+             if (!secure and self.page.session.experimental_features.serviceworker) {
+                 env.hideServiceWorker(true, ls.local.handle, global_obj);
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 082563d..97b98ee 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -497,6 +497,31 @@ pub fn setBatteryExposure(self: *const Env, ctx: *Context, v8_context: *const v8
+     }
+ }
+ 
++pub fn setWebShareExposure(self: *const Env, ctx: *Context, v8_context: *const v8.Context, global_obj: *const v8.Object, secure: bool) void {
++    if (secure == (ctx.web_share_bindings == null)) return;
++    const isolate = self.isolate.handle;
++    const names = &self.disabled_api_names;
++    const constructor = v8.v8__Object__Get(global_obj, v8_context, @ptrCast(names.get(isolate, "navigator"))) orelse return;
++    const prototype = v8.v8__Object__Get(@ptrCast(constructor), v8_context, @ptrCast(names.get(isolate, "prototype"))) orelse return;
++    const keys = [_]*const v8.String{ names.get(isolate, "can_share"), names.get(isolate, "share") };
++    var result: v8.MaybeBool = undefined;
++    if (secure) {
++        for (keys, &ctx.web_share_bindings.?) |key, *binding| {
++            v8.v8__Object__DefineOwnProperty(@ptrCast(prototype), v8_context, @ptrCast(key), v8.v8__Global__Get(binding, isolate), v8.None, &result);
++            v8.v8__Global__Reset(binding);
++        }
++        ctx.web_share_bindings = null;
++    } else {
++        var bindings: [2]v8.Global = undefined;
++        for (keys, &bindings) |key, *binding| {
++            const method = v8.v8__Object__Get(@ptrCast(prototype), v8_context, @ptrCast(key)) orelse return;
++            v8.v8__Global__New(isolate, method, binding);
++            v8.v8__Object__Delete(@ptrCast(prototype), v8_context, @ptrCast(key), &result);
++        }
++        ctx.web_share_bindings = bindings;
++    }
++}
++
+ fn deletePrototypeMember(self: *const Env, v8_context: *const v8.Context, global_obj: *const v8.Object, comptime interface: []const u8, comptime member: []const u8) void {
+     const isolate = self.isolate.handle;
+     const names = &self.disabled_api_names;
+@@ -907,6 +932,8 @@ const DisabledApiNames = struct {
+     caches: v8.Eternal,
+     get_battery: v8.Eternal,
+     battery_manager: v8.Eternal,
++    can_share: v8.Eternal,
++    share: v8.Eternal,
+ 
+     fn init(isolate: *v8.Isolate) DisabledApiNames {
+         var self: DisabledApiNames = undefined;
+@@ -918,6 +945,8 @@ const DisabledApiNames = struct {
+         intern(isolate, &self.caches, "caches");
+         intern(isolate, &self.get_battery, "getBattery");
+         intern(isolate, &self.battery_manager, "BatteryManager");
++        intern(isolate, &self.can_share, "canShare");
++        intern(isolate, &self.share, "share");
+         return self;
+     }
+ 
+diff --git a/src/browser/webapi/Event.zig b/src/browser/webapi/Event.zig
+index 732469e..05dedea 100644
+--- a/src/browser/webapi/Event.zig
++++ b/src/browser/webapi/Event.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -52,6 +53,8 @@ _event_phase: EventPhase = .none,
+ _time_stamp: u64,
+ _needs_retargeting: bool = false,
+ _is_trusted: bool = false,
++// Compatibility mousedown must not re-arm activation consumed by pointerdown.
++_activation_notification_suppressed: bool = false,
+ _in_passive_listener: bool = false,
+ _listeners_did_throw: bool = false, // IndexedDB needs to abort on callback throw
+ // Per spec, events created via document.createEvent are not initialized
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index 54c28f0..009c1b6 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -34,6 +34,7 @@ const Geolocation = @import("geolocation/Geolocation.zig");
+ const ServiceWorkerContainer = @import("ServiceWorkerContainer.zig");
+ const BatteryManager = @import("BatteryManager.zig");
+ const NetworkInformation = @import("NetworkInformation.zig");
++const WebShare = @import("WebShare.zig");
+ 
+ const Navigator = @This();
+ 
+@@ -55,6 +56,8 @@ _geolocation: ?*Geolocation = null,
+ _storage: StorageManager = .{},
+ _ua_data: NavigatorUAData = .{},
+ _service_worker: ?*ServiceWorkerContainer = null,
++_share_pending: bool = false,
++_share_activation_ms: ?u64 = null,
+ 
+ pub const init: Navigator = .{};
+ 
+@@ -190,6 +193,7 @@ fn getPdfViewerEnabled(_: *const Navigator) bool {
+ 
+ pub fn detachPdf(self: *Navigator) void {
+     self._pdf_detached = true;
++    self._share_activation_ms = null;
+     if (self._plugins) |plugins| plugins._frame = null;
+ }
+ 
+@@ -348,6 +352,8 @@ pub const JsApi = struct {
+     pub const globalPrivacyControl = bridge.accessor(Navigator.getGlobalPrivacyControl, null, .{});
+ 
+     pub const getBattery = bridge.function(Navigator.getBattery, .{ .exposed = .window, .cache = .{ .private = "get_battery" } });
++    pub const canShare = bridge.function(WebShare.canShare, .{ .exposed = .window });
++    pub const share = bridge.function(WebShare.share, .{ .exposed = .window });
+     pub const javaEnabled = bridge.function(Navigator.javaEnabled, .{});
+     pub const sendBeacon = bridge.function(Navigator.sendBeacon, .{});
+     pub const permissions = bridge.accessor(Navigator.getPermissions, null, .{});
+diff --git a/src/browser/webapi/WebDriver.zig b/src/browser/webapi/WebDriver.zig
+index 0e472ab..af6adbd 100644
+--- a/src/browser/webapi/WebDriver.zig
++++ b/src/browser/webapi/WebDriver.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -570,6 +571,7 @@ fn dispatchMouse(el: *Element, comptime typ: []const u8, button: i32, buttons: u
+         log.debug(.app, "webdriver mouse event", .{ .err = err, .type = typ });
+         return false;
+     };
++    event.asEvent()._activation_notification_suppressed = comptime std.mem.eql(u8, typ, "mousedown");
+     return frame._event_manager.dispatchCancelable(el.asEventTarget(), event.asEvent()) catch |err| {
+         log.debug(.app, "webdriver dispatch", .{ .err = err, .type = typ });
+         return false;
+diff --git a/src/browser/webapi/WebShare.zig b/src/browser/webapi/WebShare.zig
+new file mode 100644
+index 0000000..cbc1de9
+--- /dev/null
++++ b/src/browser/webapi/WebShare.zig
+@@ -0,0 +1,330 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Frame = @import("../Frame.zig");
++const URL = @import("../URL.zig");
++const Navigator = @import("Navigator.zig");
++const File = @import("File.zig");
++const Event = @import("Event.zig");
++const DOMException = @import("DOMException.zig");
++const KeyboardEvent = @import("event/KeyboardEvent.zig");
++const PointerEvent = @import("event/PointerEvent.zig");
++
++const Data = struct {
++    files: []*File = &.{},
++    text: ?js.String = null,
++    title: ?js.String = null,
++    url: ?[]const u8 = null,
++    url_length: usize = 0,
++
++    fn parse(value: ?js.Value, exec: *js.Execution) !Data {
++        const input = value orelse return .{};
++        if (input.isNullOrUndefined()) return .{};
++        if (!input.isObject()) return error.TypeError;
++        const object = input.toObject();
++        var data: Data = .{};
++        // Web IDL reads dictionary members in lexicographic order, without Has.
++        const files = try object.get("files");
++        if (!files.isUndefined()) {
++            const iterator = try files.iterator() orelse return error.TypeError;
++            var list: std.ArrayList(*File) = .empty;
++            while (try iterator.next()) |item| {
++                const file = item.toZig(*File) catch |err| {
++                    if (err == error.ExecutionTerminated) return err;
++                    closeIterator(iterator, exec.js.local.?);
++                    return error.TypeError;
++                };
++                try list.append(exec.call_arena, file);
++            }
++            data.files = list.items;
++        }
++        inline for (.{ "text", "title", "url" }) |name| {
++            const member = try object.get(name);
++            if (!member.isUndefined()) {
++                if (member.isSymbol()) return error.TypeError;
++                const string = try member.toString();
++                if (comptime std.mem.eql(u8, name, "url")) {
++                    data.url = try string.toSlice();
++                    data.url_length = @intCast(js.v8.v8__String__Length(string.handle));
++                } else {
++                    @field(data, name) = string;
++                }
++            }
++        }
++        return data;
++    }
++
++    fn valid(self: Data, frame: *Frame, exec: *js.Execution) !bool {
++        if (self.text == null and self.title == null and self.url == null and self.files.len == 0) return false;
++        if (self.url) |url| {
++            const resolved = URL.resolve(exec.call_arena, frame.base(), url, .{}) catch |err| {
++                if (err == error.TypeError) return false;
++                return err;
++            };
++            const scheme = URL.getProtocol(resolved);
++            if (!std.mem.eql(u8, scheme, "https:") and !std.mem.eql(u8, scheme, "http:") and
++                !std.mem.eql(u8, scheme, URL.getProtocol(frame.origin orelse ""))) return false;
++        }
++        return true;
++    }
++
++    fn safeToShare(self: Data) bool {
++        if (self.title) |title| if (js.v8.v8__String__Length(title.handle) > 16 * 1024) return false;
++        if (self.text) |text| if (js.v8.v8__String__Length(text.handle) > 1024 * 1024) return false;
++        if (self.url_length > 16 * 1024 or self.files.len > 10) return false;
++        var bytes: u64 = 0;
++        for (self.files) |file| {
++            bytes +|= file._proto._slice.len;
++            if (bytes > 50 * 1024 * 1024 or !safeFile(file)) return false;
++        }
++        return true;
++    }
++};
++
++pub fn canShare(self: *Navigator, value: ?js.Value, exec: *js.Execution) !bool {
++    const data = try Data.parse(value, exec);
++    if (!active(self)) return false;
++    const frame = self._frame.?;
++    return frame.isSecureContext() and allowed(frame) and try data.valid(frame, exec);
++}
++
++pub fn share(self: *Navigator, value: ?js.Value, exec: *js.Execution) !js.Promise {
++    const local = exec.js.local.?;
++    var caught: js.TryCatch = undefined;
++    caught.init(local);
++    defer caught.deinit();
++    return shareInternal(self, value, exec) catch |err| {
++        if (err == error.ExecutionTerminated or exec.js.env.terminatePending()) return error.ExecutionTerminated;
++        const resolver = local.createPromiseResolver();
++        if (caught.exceptionValue()) |exception| {
++            try resolver.rejectValue(exception);
++        } else if (err == error.TypeError) {
++            resolver.rejectError("navigator.share", .{ .type_error = "Invalid share data" });
++        } else {
++            const exception = switch (err) {
++                error.NotAllowedError => DOMException.init("Permission denied", "NotAllowedError"),
++                error.InvalidStateError => DOMException.init("The document is not active or a share is pending", "InvalidStateError"),
++                else => return err,
++            };
++            // Rejections may be retained by another realm after this context dies.
++            resolver.reject("navigator.share", try exec._factory.create(exception));
++        }
++        return resolver.promise();
++    };
++}
++
++fn shareInternal(self: *Navigator, value: ?js.Value, exec: *js.Execution) !js.Promise {
++    const data = try Data.parse(value, exec);
++    if (!active(self)) return error.InvalidStateError;
++    const frame = self._frame.?;
++    if (!frame.isSecureContext() or !allowed(frame)) return error.NotAllowedError;
++    if (self._share_pending) return error.InvalidStateError;
++    const activation = self._share_activation_ms orelse return error.NotAllowedError;
++    if (lp.datetime.milliTimestamp(.boot) - activation >= 5000) return error.NotAllowedError;
++    consumeActivation(root(frame));
++    if (!try data.valid(frame, exec)) return error.TypeError;
++    if (!data.safeToShare()) return error.NotAllowedError;
++
++    const resolver = exec.js.local.?.createPromiseResolver();
++    const arena = try exec.getArena(.tiny, "navigator.share");
++    errdefer arena.release();
++    const task = try arena.create(ShareTask);
++    const exception = try exec._factory.create(DOMException.init("Share canceled", "AbortError"));
++    task.* = .{
++        .navigator = self,
++        .exec = &frame.js.execution,
++        .resolver = try resolver.persist(),
++        .arena = arena,
++        .exception = exception,
++    };
++    errdefer task.resolver.release();
++    try frame.js.scheduler.add(task, ShareTask.run, 0, .{
++        .name = "navigator.share",
++        .finalizer = ShareTask.finalize,
++    });
++    self._share_pending = true;
++    return resolver.promise();
++}
++
++fn active(navigator: *Navigator) bool {
++    if (navigator._pdf_detached) return false;
++    const frame = navigator._frame orelse return false;
++    return frame.document._frame == frame;
++}
++
++const ShareTask = struct {
++    navigator: *Navigator,
++    exec: *js.Execution,
++    resolver: js.PromiseResolver.Global,
++    arena: *lp.Arena,
++    exception: *DOMException,
++    settled: bool = false,
++
++    fn finalize(ctx: *anyopaque) void {
++        const self: *ShareTask = @ptrCast(@alignCast(ctx));
++        if (!self.settled) self.navigator._share_pending = false;
++        self.resolver.release();
++        self.arena.release();
++    }
++
++    fn run(ctx: *anyopaque) !?u32 {
++        const self: *ShareTask = @ptrCast(@alignCast(ctx));
++        defer finalize(ctx);
++        var scope: js.Local.Scope = undefined;
++        self.exec.js.localScope(&scope);
++        defer scope.deinit();
++        // No OS sheet or delivery: model the user cancelling on a later task.
++        self.navigator._share_pending = false;
++        self.settled = true;
++        scope.toLocal(self.resolver).reject("navigator.share", self.exception);
++        return null;
++    }
++};
++
++fn closeIterator(iterator: js.Value.Iterator, local: *const js.Local) void {
++    // IteratorClose with a throwing completion preserves the original TypeError,
++    // even if getting/calling return() throws or returns a non-object.
++    var caught: js.TryCatch = undefined;
++    caught.init(local);
++    defer caught.deinit();
++    const method = iterator.object.getFunction("return") catch return;
++    const function = method orelse return;
++    _ = function.callWithThisRethrow(js.Value, iterator.object, .{}) catch {};
++}
++
++fn safeFile(file: *File) bool {
++    const extensions = [_][]const u8{
++        ".avif", ".bmp",  ".css",  ".csv",  ".ehtml", ".flac", ".gif",   ".htm",  ".html", ".ico",
++        ".jfif", ".jpeg", ".jpg",  ".m4a",  ".m4v",   ".mp3",  ".mp4",   ".mpeg", ".mpg",  ".oga",
++        ".ogg",  ".ogm",  ".ogv",  ".opus", ".pdf",   ".pjp",  ".pjpeg", ".png",  ".shtm", ".shtml",
++        ".svg",  ".svgz", ".text", ".tif",  ".tiff",  ".txt",  ".wav",   ".weba", ".webm", ".webp",
++        ".xbm",
++    };
++    const types = std.StaticStringMap(void).initComptime(.{
++        .{ "application/pdf", {} }, .{ "audio/flac", {} },     .{ "audio/mp3", {} },       .{ "audio/mpeg", {} },
++        .{ "audio/ogg", {} },       .{ "audio/wav", {} },      .{ "audio/webm", {} },      .{ "audio/x-m4a", {} },
++        .{ "image/avif", {} },      .{ "image/bmp", {} },      .{ "image/gif", {} },       .{ "image/jpeg", {} },
++        .{ "image/png", {} },       .{ "image/svg+xml", {} },  .{ "image/tiff", {} },      .{ "image/webp", {} },
++        .{ "image/x-icon", {} },    .{ "image/x-ms-bmp", {} }, .{ "image/x-xbitmap", {} }, .{ "text/comma-separated-values", {} },
++        .{ "text/css", {} },        .{ "text/csv", {} },       .{ "text/html", {} },       .{ "text/plain", {} },
++        .{ "video/mp4", {} },       .{ "video/mpeg", {} },     .{ "video/ogg", {} },       .{ "video/webm", {} },
++    });
++    if (!types.has(file._proto._mime)) return false;
++    const name = file.getName();
++    if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\x00") != null) return false;
++    for (extensions) |extension| {
++        if (std.ascii.endsWithIgnoreCase(name, extension)) return true;
++    }
++    return false;
++}
++
++fn sameOrigin(a: *Frame, b: *Frame) bool {
++    return URL.isSameOrigin(a.origin orelse return false, b.origin orelse return false);
++}
++
++// Only the web-share directive is interpreted; this is not a general policy API.
++fn allowed(frame: *Frame) bool {
++    if (!headerAllows(frame, frame)) return false;
++    const parent = frame.parent orelse return true;
++    if (!allowed(parent) or !headerAllows(parent, frame)) return false;
++    const iframe = frame.iframe orelse return sameOrigin(parent, frame);
++    const allow = iframe.asElement().getAttributeSafe(.wrap("allow")) orelse return sameOrigin(parent, frame);
++    var directives = std.mem.splitScalar(u8, allow, ';');
++    while (directives.next()) |directive| {
++        var tokens = std.mem.tokenizeAny(u8, directive, " \t\r\n");
++        if (!std.mem.eql(u8, tokens.next() orelse continue, "web-share")) continue;
++        var token = tokens.next();
++        if (token == null) return sourceMatches(frame, parent, iframe.asElement().getAttributeSafe(.wrap("src")) orelse "");
++        var matches = false;
++        while (token) |item| : (token = tokens.next()) {
++            if (std.mem.eql(u8, item, "'none'")) return false;
++            if (std.mem.eql(u8, item, "*") or
++                (std.mem.eql(u8, item, "'self'") and sameOrigin(parent, frame)) or
++                (std.mem.eql(u8, item, "'src'") and sourceMatches(frame, parent, iframe.asElement().getAttributeSafe(.wrap("src")) orelse "")) or
++                URL.isSameOrigin(item, frame.origin orelse "")) matches = true;
++        }
++        return matches;
++    }
++    return sameOrigin(parent, frame);
++}
++
++fn sourceMatches(frame: *Frame, parent: *Frame, source: []const u8) bool {
++    if (source.len == 0) return sameOrigin(frame, parent);
++    const resolved = URL.resolve(parent.call_arena, parent.base(), source, .{}) catch return false;
++    return frame.isSameOrigin(resolved);
++}
++
++fn headerAllows(owner: *Frame, target: *Frame) bool {
++    for (owner._http_headers.items) |header| {
++        if (!std.ascii.eqlIgnoreCase(header.name, "permissions-policy")) continue;
++        var directives = std.mem.splitScalar(u8, header.value, ',');
++        while (directives.next()) |directive| {
++            const equal = std.mem.indexOfScalar(u8, directive, '=') orelse continue;
++            if (!std.mem.eql(u8, std.mem.trim(u8, directive[0..equal], " \t"), "web-share")) continue;
++            const list = std.mem.trim(u8, directive[equal + 1 ..], " \t");
++            if (std.mem.eql(u8, list, "*")) continue;
++            if (list.len < 2 or list[0] != '(' or list[list.len - 1] != ')') continue;
++            var tokens = std.mem.tokenizeAny(u8, list[1 .. list.len - 1], " \t");
++            var matches = false;
++            while (tokens.next()) |token| {
++                if (std.mem.eql(u8, token, "self") and sameOrigin(owner, target)) matches = true;
++                if (token.len >= 2 and token[0] == '"' and token[token.len - 1] == '"' and
++                    URL.isSameOrigin(token[1 .. token.len - 1], target.origin orelse "")) matches = true;
++            }
++            if (!matches) return false;
++        }
++    }
++    return true;
++}
++
++pub fn notifyActivation(frame: *Frame, event: *Event) void {
++    if (!event._is_trusted or event._activation_notification_suppressed) return;
++    const typ = event._type_string;
++    if (typ.eql(.wrap("keydown"))) {
++        const key = event.is(KeyboardEvent) orelse return;
++        if (key._key == .Escape or key._ctrl_key or key._alt_key or key._meta_key) return;
++    } else if (typ.eql(.wrap("pointerdown")) or typ.eql(.wrap("pointerup"))) {
++        const pointer = event.is(PointerEvent) orelse return;
++        if (typ.eql(.wrap("pointerdown")) != (pointer._pointer_type == .mouse)) return;
++    } else if (!typ.eql(.wrap("mousedown")) and !typ.eql(.wrap("touchend"))) return;
++
++    const now = lp.datetime.milliTimestamp(.boot);
++    var ancestor: ?*Frame = frame;
++    while (ancestor) |current| : (ancestor = current.parent) {
++        current.window._navigator._share_activation_ms = now;
++    }
++    activateSameOrigin(root(frame), frame, now);
++}
++
++fn activateSameOrigin(frame: *Frame, source: *Frame, now: u64) void {
++    if (sameOrigin(frame, source)) frame.window._navigator._share_activation_ms = now;
++    for (frame.child_frames.items) |child| activateSameOrigin(child, source, now);
++}
++
++fn root(frame: *Frame) *Frame {
++    var current = frame;
++    while (current.parent) |parent| current = parent;
++    return current;
++}
++
++fn consumeActivation(frame: *Frame) void {
++    frame.window._navigator._share_activation_ms = null;
++    for (frame.child_frames.items) |child| consumeActivation(child);
++}

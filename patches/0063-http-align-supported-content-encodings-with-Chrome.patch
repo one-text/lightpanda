@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 2 Nov 2026 18:47:51 -0300
+Subject: [PATCH] http: align supported content encodings with Chrome
+
+Fresh local Chrome 154 fingerprint captures send gzip, deflate, br, zstd
+on navigation and Accept-CH fetch follow-ups; Lightpanda sent deflate,
+gzip, br. Enable actual zstd decoding rather than advertising a token
+which curl cannot handle.
+
+Pin zstd 1.5.7 by its Zig content hash. Build only its modern decoder and
+common sources as a target-aware static library, with portable C decoding
+and no legacy formats or compressor. Export its public headers and enable
+curl's existing native streaming zstd decoder through HAVE_ZSTD.
+
+Order browser-default Accept-Encoding as gzip, deflate, br, zstd for
+potentially trustworthy URLs, and gzip, deflate for ordinary insecure
+HTTP, matching the measured Chrome policy (including trusted loopback).
+Apply this to navigation, fetch, XHR and other non-internal subresources;
+recompute on redirects and preserve explicit headers, including empty
+values. Keep CURLOPT_ACCEPT_ENCODING decoding enabled and leave internal
+requests on curl's defaults.
+
+Validation: release build and 1658 existing tests passed. Ignored local
+fixtures passed 228 assertions across both browsers for HTTPS HTTP/2,
+HTTPS HTTP/1.1, loopback/private HTTP, supported codec decoding, chunked
+zstd, malformed zstd, XHR/scripts/styles, redirects and explicit overrides.
+The unmodified fingerprint page matched this header in three fresh
+processes per browser for both navigation and follow-up. The full TLS
+gate retained all eight passes with 20 samples per side per scenario.
+No new committed tests. Linux Chrome remains the practical transport
+reference, not proof of macOS identity or complete HTTP stack parity.
+---
+ build.zig                  | 25 +++++++++++++++++++++++++
+ build.zig.zon              |  4 ++++
+ src/network/HttpClient.zig |  5 ++++-
+ src/network/http.zig       |  6 ++----
+ 4 files changed, 35 insertions(+), 5 deletions(-)
+
+diff --git a/build.zig b/build.zig
+index 45d9dd1..0acb209 100644
+--- a/build.zig
++++ b/build.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -537,6 +538,9 @@ fn linkCurl(b: *Build, mod: *Build.Module, deps: Deps, is_tsan: bool, section: b
+     const brotli = buildBrotli(b, deps.target, deps.optimize, is_tsan, section);
+     for (brotli) |lib| curl.root_module.linkLibrary(lib);
+ 
++    const zstd = buildZstd(b, deps.target, deps.optimize, is_tsan, section);
++    curl.root_module.linkLibrary(zstd);
++
+     const nghttp2 = buildNghttp2(b, deps.target, deps.optimize, is_tsan, section);
+     curl.root_module.linkLibrary(nghttp2);
+ 
+@@ -592,6 +596,26 @@ fn buildZlib(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Opti
+     return lib;
+ }
+ 
++fn buildZstd(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, is_tsan: bool, section: bool) *Build.Step.Compile {
++    const dep = b.dependency("zstd", .{});
++    const mod = cLibModule(b, target, optimize, is_tsan);
++    const lib = sectionize(b.addLibrary(.{ .name = "zstd", .root_module = mod }), section);
++    lib.installHeader(dep.path("lib/zstd.h"), "zstd.h");
++    lib.installHeader(dep.path("lib/zstd_errors.h"), "zstd_errors.h");
++    mod.addCSourceFiles(.{
++        .root = dep.path("lib"),
++        .flags = &.{ "-DZSTD_DISABLE_ASM", "-DZSTD_LEGACY_SUPPORT=0", "-DXXH_NAMESPACE=ZSTD_" },
++        .files = &.{
++            "common/debug.c",               "common/entropy_common.c",
++            "common/error_private.c",       "common/fse_decompress.c",
++            "common/xxhash.c",              "common/zstd_common.c",
++            "decompress/huf_decompress.c",  "decompress/zstd_ddict.c",
++            "decompress/zstd_decompress.c", "decompress/zstd_decompress_block.c",
++        },
++    });
++    return lib;
++}
++
+ fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, is_tsan: bool, section: bool) [3]*Build.Step.Compile {
+     const dep = b.dependency("brotli", .{});
+ 
+@@ -776,6 +800,7 @@ fn buildCurl(
+     const config = .{
+         .HAVE_LIBZ = true,
+         .HAVE_BROTLI = true,
++        .HAVE_ZSTD = true,
+         .USE_NGHTTP2 = true,
+ 
+         .USE_OPENSSL = true,
+diff --git a/build.zig.zon b/build.zig.zon
+index 8fa11a2..abd2fe9 100644
+--- a/build.zig.zon
++++ b/build.zig.zon
+@@ -18,6 +18,10 @@
+             .url = "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz",
+             .hash = "N-V-__8AAJ2cNgAgfBtAw33Bxfu1IWISDeKKSr3DAqoAysIJ",
+         },
++        .zstd = .{
++            .url = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
++            .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
++        },
+         .nghttp2 = .{
+             .url = "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.gz",
+             .hash = "N-V-__8AACay2gDbHrByjNGWvyH8G9Gp30uRgZqobYOF1nhb",
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index 4caf9b5..bb1a82a 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -3735,7 +3735,7 @@ pub const Transfer = struct {
+                 // A custom header suppresses curl's earlier automatic emission,
+                 // while CURLOPT_ACCEPT_ENCODING still enables native decoding.
+                 if (std.ascii.eqlIgnoreCase(name, "accept-encoding") and self.findRequestHeader(name) == null) {
+-                    try conn.addDefaultAcceptEncoding(arena);
++                    try conn.addDefaultAcceptEncoding(arena, URL.isPotentiallyTrustworthy(req.url));
+                 }
+                 for (self.req_headers.items) |hdr| {
+                     if (std.ascii.eqlIgnoreCase(hdr.name, name)) {
+@@ -3750,6 +3750,9 @@ pub const Transfer = struct {
+                 try conn.addHeader(arena, hdr.name, hdr.value);
+             }
+         } else {
++            if (!req.internal and self.findRequestHeader("accept-encoding") == null) {
++                try conn.addDefaultAcceptEncoding(arena, URL.isPotentiallyTrustworthy(req.url));
++            }
+             for (self.req_headers.items) |hdr| {
+                 try conn.addHeader(arena, hdr.name, hdr.value);
+             }
+diff --git a/src/network/http.zig b/src/network/http.zig
+index 6a6d121..2475efa 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -385,10 +385,8 @@ pub const Connection = struct {
+         self._header_list = updated;
+     }
+ 
+-    pub fn addDefaultAcceptEncoding(self: *Connection, allocator: std.mem.Allocator) !void {
+-        const encodings = libcurl.Curl_get_content_encodings() orelse return error.OutOfMemory;
+-        defer libcurl.curl_free(encodings);
+-        try self.addHeader(allocator, "Accept-Encoding", std.mem.span(encodings));
++    pub fn addDefaultAcceptEncoding(self: *Connection, allocator: std.mem.Allocator, trustworthy: bool) !void {
++        try self.addHeader(allocator, "Accept-Encoding", if (trustworthy) "gzip, deflate, br, zstd" else "gzip, deflate");
+     }
+ 
+     pub fn commitHeaders(self: *const Connection) !void {

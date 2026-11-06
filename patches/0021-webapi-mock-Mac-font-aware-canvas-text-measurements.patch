@@ -1,0 +1,456 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 14 Oct 2026 20:00:04 -0300
+Subject: [PATCH] webapi: mock Mac font-aware canvas text measurements
+
+Resolve the canvas font shorthand into a fixed Mac desktop font profile
+and select the first available family. Handle quoted/multiword names,
+case, CSS escapes, generic families, unknown fallbacks and line-height.
+Reject malformed assignments without changing the current font state.
+
+Use representative Helvetica/Times-Roman ASCII glyph advances and a
+fixed-pitch model, retaining the Unicode combining/wide-glyph fallback.
+Regular and offscreen canvases share the same native implementation and
+TextMetrics bridge. Leave DOM/SVG measurement and canvas rasterisation
+unchanged. Update only existing upstream numeric assertions; add no tests.
+
+This is a deterministic MacBook Neo measurement mock: families alias
+three representative faces, vertical bounds remain synthetic, and no
+kerning, style-specific shaping or exact CoreText fidelity is claimed.
+No macOS-version-specific font/metric claim is made.
+
+Metric sources and retained Adobe permission/copyright:
+https://github.com/matplotlib/matplotlib/tree/v3.10.7/lib/matplotlib/mpl-data/fonts/pdfcorefonts
+Extract only ASCII WX values from Helvetica.afm and Times-Roman.afm.
+Supplemental desktop Chrome parsing checks verify zero sizes, unknown
+fallbacks, quoted/escaped families, invalid assignments and line-height;
+these are not claimed as a macOS metric calibration.
+
+Temporary diagnostics validate 31 checks plus native shape/receiver,
+regular/offscreen/iframe parity, isolation, retained metrics and
+navigation reset. Reviewer-discovered opposite-quote handling is fixed.
+Full upstream tests pass (1658/1658). Benchmark validation is recorded in
+ignored .build artifacts after export; no benchmark predicates change.
+---
+ .../canvas/canvas_rendering_context_2d.html   |  11 +-
+ .../tests/canvas/offscreen_canvas.html        |   3 +-
+ src/browser/webapi/canvas/TextMetrics.zig     |   5 +-
+ src/browser/webapi/canvas/context2d.zig       | 274 ++++++++++++++++--
+ 4 files changed, 259 insertions(+), 34 deletions(-)
+
+diff --git a/src/browser/tests/canvas/canvas_rendering_context_2d.html b/src/browser/tests/canvas/canvas_rendering_context_2d.html
+index ff06264..00d5ba9 100644
+--- a/src/browser/tests/canvas/canvas_rendering_context_2d.html
++++ b/src/browser/tests/canvas/canvas_rendering_context_2d.html
+@@ -1,4 +1,5 @@
+ <!DOCTYPE html>
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
+ <script src="../testing.js"></script>
+ 
+ <script id=CanvasRenderingContext2D>
+@@ -178,15 +179,15 @@
+   testing.expectEqual("10px sans-serif", ctx.font);
+   let m = ctx.measureText("ab");
+   testing.expectEqual(true, m instanceof TextMetrics);
+-  testing.expectEqual(12, m.width);
++  testing.expectEqual(11.12, m.width);
+ 
+   ctx.font = "bold 20px Arial";
+   testing.expectEqual("bold 20px Arial", ctx.font);
+   m = ctx.measureText("hello");
+-  testing.expectEqual(60, m.width);
++  testing.expectEqual(42.24, m.width);
+   testing.expectEqual(16, m.actualBoundingBoxAscent);
+   testing.expectEqual(4, m.actualBoundingBoxDescent);
+-  testing.expectEqual(60, m.actualBoundingBoxRight);
++  testing.expectEqual(42.24, m.actualBoundingBoxRight);
+   testing.expectEqual(0, m.actualBoundingBoxLeft);
+   testing.expectEqual(0, ctx.measureText("").width);
+ 
+@@ -194,13 +195,13 @@
+   ctx.font = "bold";
+   testing.expectEqual("bold 20px Arial", ctx.font);
+   ctx.font = "12pt serif";
+-  testing.expectEqual(16 * 0.6 * 3, ctx.measureText("abc").width);
++  testing.expectEqual(22.208, ctx.measureText("abc").width);
+ 
+   // Longer than the inline buffer.
+   const long = "8px " + Array.from({length: 40}, (_, i) => "'Family Number " + i + "'").join(", ");
+   ctx.font = long;
+   testing.expectEqual(long, ctx.font);
+-  testing.expectEqual(8 * 0.6, ctx.measureText("a").width);
++  testing.expectEqual(3.552, ctx.measureText("a").width);
+   ctx.font = "10px serif";
+   testing.expectEqual("10px serif", ctx.font);
+ }
+diff --git a/src/browser/tests/canvas/offscreen_canvas.html b/src/browser/tests/canvas/offscreen_canvas.html
+index 0591793..c0264e5 100644
+--- a/src/browser/tests/canvas/offscreen_canvas.html
++++ b/src/browser/tests/canvas/offscreen_canvas.html
+@@ -1,4 +1,5 @@
+ <!DOCTYPE html>
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
+ <script src="../testing.js"></script>
+ 
+ <script id=OffscreenCanvas>
+@@ -106,7 +107,7 @@
+ {
+   const ctx = new OffscreenCanvas(10, 10).getContext("2d");
+   ctx.font = "16px sans-serif";
+-  testing.expectEqual(48, ctx.measureText("hello").width);
++  testing.expectEqual(33.792, ctx.measureText("hello").width);
+   ctx.setLineDash([1, 2]);
+   testing.expectEqual("1,2", ctx.getLineDash().join());
+   testing.expectEqual(true, ctx.createLinearGradient(0, 0, 1, 1) instanceof CanvasGradient);
+diff --git a/src/browser/webapi/canvas/TextMetrics.zig b/src/browser/webapi/canvas/TextMetrics.zig
+index 528ebee..6cae803 100644
+--- a/src/browser/webapi/canvas/TextMetrics.zig
++++ b/src/browser/webapi/canvas/TextMetrics.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -23,8 +24,8 @@ const Page = @import("../../Page.zig");
+ 
+ const Execution = js.Execution;
+ 
+-/// Metrics from the deterministic text model in text_measure.zig: ascent is
+-/// 0.8em and descent 0.2em, as in a generic sans-serif face.
++/// Metrics from the canvas font model: widths vary by face; vertical bounds
++/// remain a synthetic 0.8em ascent and 0.2em descent, not rasterised ink bounds.
+ const TextMetrics = @This();
+ 
+ _rc: lp.RC = .{},
+diff --git a/src/browser/webapi/canvas/context2d.zig b/src/browser/webapi/canvas/context2d.zig
+index 6ae6de1..32e0c1e 100644
+--- a/src/browser/webapi/canvas/context2d.zig
++++ b/src/browser/webapi/canvas/context2d.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -39,6 +40,188 @@ const default_font = "10px sans-serif";
+ const font_capacity = 256;
+ const dash_capacity = 8;
+ 
++const FontFace = enum { sans, serif, mono };
++
++// Representative ASCII advances in 1/1000 em from Adobe's Helvetica and
++// Times-Roman AFM metrics (matplotlib v3.10.7, mpl-data/fonts/pdfcorefonts).
++// Modification: only ASCII WX values are retained, without other AFM data.
++// Copyright (c) 1985, 1987, 1989, 1990, 1997 Adobe Systems Incorporated. All Rights Reserved.
++// Copyright (c) 1985, 1987, 1989, 1990, 1993, 1997 Adobe Systems Incorporated. All Rights Reserved.
++//
++// This file and the 14 PostScript(R) AFM files it accompanies may be used, copied,
++// and distributed for any purpose and without charge, with or without modification,
++// provided that all copyright notices are retained; that the AFM files are not
++// distributed without this file; that all modifications to this file or any of
++// the AFM files are prominently noted in the modified file(s); and that this
++// paragraph is not modified. Adobe Systems has no responsibility or obligation
++// to support the use of the AFM files.
++//
++// The Mac families below alias these three models, not installed font files.
++// No kerning, style-specific shaping, or pixel-identical CoreText is claimed.
++const sans_advances = [95]u16{
++    278,  278, 355, 556, 556, 889, 667, 222, 333, 333, 389, 584, 278, 333, 278, 278,
++    556,  556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
++    1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
++    667,  778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
++    222,  556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
++    556,  556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
++};
++const serif_advances = [95]u16{
++    250, 333, 408, 500, 500, 833, 778, 333, 333, 333, 500, 564, 250, 333, 250, 278,
++    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444,
++    921, 722, 667, 667, 722, 611, 556, 722, 722, 333, 389, 722, 611, 889, 722, 722,
++    556, 722, 667, 556, 611, 722, 722, 944, 722, 722, 611, 333, 278, 333, 469, 500,
++    333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278, 500, 278, 778, 500, 500,
++    500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541,
++};
++
++fn fontFace(name: []const u8, quoted: bool) ?FontFace {
++    const families = .{
++        .{ "Arial", FontFace.sans },               .{ "Helvetica", FontFace.sans },
++        .{ "Helvetica Neue", FontFace.sans },      .{ "Verdana", FontFace.sans },
++        .{ "Tahoma", FontFace.sans },              .{ "Trebuchet MS", FontFace.sans },
++        .{ "Impact", FontFace.sans },              .{ "Comic Sans MS", FontFace.sans },
++        .{ "Optima", FontFace.sans },              .{ "Geneva", FontFace.sans },
++        .{ "Lucida Grande", FontFace.sans },       .{ "Avenir Next", FontFace.sans },
++        .{ "PingFang SC", FontFace.sans },         .{ "Hiragino Sans", FontFace.sans },
++        .{ "Apple SD Gothic Neo", FontFace.sans }, .{ "Times", FontFace.serif },
++        .{ "Times New Roman", FontFace.serif },    .{ "Georgia", FontFace.serif },
++        .{ "Palatino", FontFace.serif },           .{ "Garamond", FontFace.serif },
++        .{ "Courier", FontFace.mono },             .{ "Courier New", FontFace.mono },
++        .{ "Menlo", FontFace.mono },               .{ "Monaco", FontFace.mono },
++    };
++    inline for (families) |family| {
++        if (std.ascii.eqlIgnoreCase(name, family[0])) return family[1];
++    }
++    if (!quoted) {
++        if (std.ascii.eqlIgnoreCase(name, "serif") or
++            std.ascii.eqlIgnoreCase(name, "ui-serif")) return .serif;
++        if (std.ascii.eqlIgnoreCase(name, "monospace") or
++            std.ascii.eqlIgnoreCase(name, "ui-monospace")) return .mono;
++        inline for (.{ "sans-serif", "system-ui", "ui-sans-serif", "cursive", "fantasy" }) |generic| {
++            if (std.ascii.eqlIgnoreCase(name, generic)) return .sans;
++        }
++    }
++    return null;
++}
++
++const Family = struct { face: ?FontFace };
++
++// Decode CSS escapes and collapse whitespace between unquoted identifiers.
++// A name too long to match the fixed profile is still a valid unknown family.
++fn parseFamily(raw: []const u8) ?Family {
++    const quoted = raw[0] == '"' or raw[0] == '\'';
++    var name = raw;
++    if (quoted) {
++        if (raw.len < 2 or raw[raw.len - 1] != raw[0]) return null;
++        name = raw[1 .. raw.len - 1];
++    }
++    var buf: [256]u8 = undefined;
++    var len: usize = 0;
++    var i: usize = 0;
++    var space = false;
++    while (i < name.len) {
++        var c: u21 = name[i];
++        var encoded: [4]u8 = undefined;
++        encoded[0] = name[i];
++        var n: usize = 1;
++        i += 1;
++        if (c == '\\') {
++            if (i == name.len) return null;
++            const start = i;
++            while (i < name.len and i - start < 6 and std.ascii.isHex(name[i])) : (i += 1) {}
++            if (i > start) {
++                c = std.fmt.parseInt(u21, name[start..i], 16) catch return null;
++                if (c == 0 or c > 0x10ffff or (c >= 0xd800 and c <= 0xdfff)) c = 0xfffd;
++                if (i < name.len and std.ascii.isWhitespace(name[i])) {
++                    const cr = name[i] == '\r';
++                    i += 1;
++                    if (cr and i < name.len and name[i] == '\n') i += 1;
++                }
++            } else {
++                c = name[i];
++                i += 1;
++                if (c == '\n' or c == '\r' or c == 0x0c) return null;
++            }
++            n = std.unicode.utf8Encode(c, &encoded) catch return null;
++        } else if (!quoted and len == 0 and std.ascii.isDigit(@intCast(c))) {
++            return null;
++        } else if (quoted and (c == '\n' or c == '\r' or c == 0x0c)) {
++            return null;
++        } else if (!quoted and std.ascii.isWhitespace(@intCast(c))) {
++            space = len > 0;
++            continue;
++        } else if ((quoted and c == raw[0]) or (!quoted and
++            !(std.ascii.isAlphanumeric(@intCast(c)) or c == '-' or c == '_' or c >= 0x80)))
++        {
++            return null;
++        }
++        if (space) {
++            if (len < buf.len) buf[len] = ' ';
++            len += 1;
++            space = false;
++        }
++        if (len + n <= buf.len) @memcpy(buf[len..][0..n], encoded[0..n]);
++        len += n;
++    }
++    if (len == 0 and !quoted) return null;
++    if (!quoted and len <= buf.len) {
++        inline for (.{ "inherit", "initial", "unset", "revert", "revert-layer", "default" }) |keyword| {
++            if (std.ascii.eqlIgnoreCase(buf[0..len], keyword)) return null;
++        }
++    }
++    return .{ .face = if (len <= buf.len) fontFace(buf[0..len], quoted) else null };
++}
++
++fn resolveFamilies(list: []const u8) ?FontFace {
++    var selected: ?FontFace = null;
++    var start: usize = 0;
++    var quote: u8 = 0;
++    var i: usize = 0;
++    while (i <= list.len) : (i += 1) {
++        if (i == list.len or (list[i] == ',' and quote == 0)) {
++            if (quote != 0) return null;
++            const raw = std.mem.trim(u8, list[start..i], &std.ascii.whitespace);
++            if (raw.len == 0) return null;
++            const family = parseFamily(raw) orelse return null;
++            if (selected == null) selected = family.face;
++            start = i + 1;
++        } else if (list[i] == '\\') {
++            i += 1;
++            if (i == list.len) return null;
++        } else if (list[i] == quote) {
++            quote = 0;
++        } else if (quote == 0 and (list[i] == '"' or list[i] == '\'')) {
++            quote = list[i];
++        }
++    }
++    // An entirely unknown stack falls back to the browser's default serif.
++    return selected orelse .serif;
++}
++
++fn measureWidth(text: []const u8, size: f64, face: FontFace) f64 {
++    var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
++    var width: f64 = 0;
++    var start: usize = 0;
++    while (it.nextCodepoint()) |cp| {
++        // Canvas replaces ASCII whitespace with spaces before measuring.
++        const c = if (cp == '\t' or cp == '\n' or cp == '\r' or cp == 0x0c) ' ' else cp;
++        if (c >= 32 and c <= 126) {
++            const advance: u16 = switch (face) {
++                .sans => sans_advances[c - 32],
++                .serif => serif_advances[c - 32],
++                .mono => 600,
++            };
++            width += @as(f64, @floatFromInt(advance));
++        } else {
++            // Retain the Unicode fallback's combining/zero-width handling.
++            width += text_measure.width(text[start..it.i], 1000);
++        }
++        start = it.i;
++    }
++    return width * size / 1000;
++}
++
+ /// What fillStyle/strokeStyle hold. Gradients and patterns are never painted,
+ /// but they round-trip so a script that assigns one reads it back.
+ pub const Style = union(enum) {
+@@ -66,6 +249,7 @@ pub const State = struct {
+     stroke_style: Style = .{ .color = color.RGBA.Named.black },
+ 
+     font_size: f64 = 10,
++    font_face: FontFace = .sans,
+     font_buf: [font_capacity]u8 = default_font.* ++ [_]u8{0} ** (font_capacity - default_font.len),
+     font_len: u16 = default_font.len,
+     font_overflow: ?[]const u8 = null,
+@@ -81,7 +265,7 @@ pub const State = struct {
+     /// Invalid font strings are ignored, per the spec.
+     pub fn setFont(self: *State, value: []const u8, exec: *const Execution) !void {
+         if (std.mem.eql(u8, value, self.font())) return;
+-        const size = parseFontSize(value) orelse return;
++        const parsed = parseFont(value) orelse return;
+         if (value.len <= font_capacity) {
+             @memcpy(self.font_buf[0..value.len], value);
+             self.font_len = @intCast(value.len);
+@@ -89,11 +273,12 @@ pub const State = struct {
+         } else {
+             self.font_overflow = try exec.arena.dupe(u8, value);
+         }
+-        self.font_size = size;
++        self.font_size = parsed.size;
++        self.font_face = parsed.face;
+     }
+ 
+     pub fn measureText(self: *const State, text: []const u8, exec: *const Execution) !*TextMetrics {
+-        return TextMetrics.init(text_measure.width(text, self.font_size), self.font_size, exec);
++        return TextMetrics.init(measureWidth(text, self.font_size, self.font_face), self.font_size, exec);
+     }
+ 
+     pub fn lineDash(self: *const State) []const f64 {
+@@ -151,35 +336,72 @@ pub const State = struct {
+     }
+ };
+ 
+-/// The size in px out of a CSS font shorthand, or null when there is none.
+-fn parseFontSize(font: []const u8) ?f64 {
+-    var it = std.mem.tokenizeAny(u8, font, " \t\n\r");
++const ParsedFont = struct { size: f64, face: FontFace };
++
++fn parseSize(token: []const u8) ?f64 {
++    const units = [_]struct { suffix: []const u8, px: f64 }{
++        .{ .suffix = "px", .px = 1 },
++        .{ .suffix = "pt", .px = 4.0 / 3.0 },
++        .{ .suffix = "rem", .px = 16 },
++        .{ .suffix = "em", .px = 16 },
++        .{ .suffix = "%", .px = 0.16 },
++    };
++    for (units) |unit| {
++        if (!std.ascii.endsWithIgnoreCase(token, unit.suffix)) continue;
++        const number = std.fmt.parseFloat(f64, token[0 .. token.len - unit.suffix.len]) catch continue;
++        const size = number * unit.px;
++        if (size < 0 or !std.math.isFinite(size)) return null;
++        return size;
++    }
++    return null;
++}
++
++/// Retain the supported size units and styles, then resolve the family stack.
++fn parseFont(font: []const u8) ?ParsedFont {
++    var it = std.mem.tokenizeAny(u8, font, &std.ascii.whitespace);
+     while (it.next()) |raw| {
+-        // "16px/1.5" carries a line-height.
+-        const token = raw[0 .. std.mem.indexOfScalar(u8, raw, '/') orelse raw.len];
+-        const units = [_]struct { suffix: []const u8, px: f64 }{
+-            .{ .suffix = "px", .px = 1 },
+-            .{ .suffix = "pt", .px = 4.0 / 3.0 },
+-            .{ .suffix = "rem", .px = 16 },
+-            .{ .suffix = "em", .px = 16 },
+-            .{ .suffix = "%", .px = 0.16 },
++        const slash = std.mem.indexOfScalar(u8, raw, '/');
++        const token = raw[0 .. slash orelse raw.len];
++        const size = parseSize(token) orelse {
++            const weight = std.fmt.parseInt(u16, raw, 10) catch 0;
++            var style = weight >= 1 and weight <= 1000;
++            inline for (.{ "normal", "italic", "oblique", "small-caps", "bold", "bolder", "lighter", "ultra-condensed", "extra-condensed", "condensed", "semi-condensed", "semi-expanded", "expanded", "extra-expanded", "ultra-expanded" }) |keyword| {
++                if (std.ascii.eqlIgnoreCase(raw, keyword)) style = true;
++            }
++            if (!style) return null;
++            continue;
+         };
+-        for (units) |unit| {
+-            if (!std.ascii.endsWithIgnoreCase(token, unit.suffix)) continue;
+-            const number = std.fmt.parseFloat(f64, token[0 .. token.len - unit.suffix.len]) catch continue;
+-            if (number < 0 or std.math.isInf(number) or std.math.isNan(number)) return null;
+-            return number * unit.px;
++        var families = std.mem.trim(u8, font[it.index..], &std.ascii.whitespace);
++        var height: ?[]const u8 = null;
++        if (slash) |pos| {
++            height = raw[pos + 1 ..];
++        } else if (std.mem.startsWith(u8, families, "/")) {
++            height = "";
++            families = std.mem.trimStart(u8, families[1..], &std.ascii.whitespace);
++        }
++        if (height) |value| {
++            var h = value;
++            if (h.len == 0) {
++                const end = std.mem.indexOfAny(u8, families, &std.ascii.whitespace) orelse return null;
++                h = families[0..end];
++                families = std.mem.trimStart(u8, families[end..], &std.ascii.whitespace);
++            }
++            if (!std.ascii.eqlIgnoreCase(h, "normal") and parseSize(h) == null) {
++                const number = std.fmt.parseFloat(f64, h) catch return null;
++                if (number < 0 or !std.math.isFinite(number)) return null;
++            }
+         }
++        return .{ .size = size, .face = resolveFamilies(families) orelse return null };
+     }
+     return null;
+ }
+ 
+ const testing = std.testing;
+-test "context2d: parseFontSize" {
+-    try testing.expectEqual(10, parseFontSize("10px sans-serif").?);
+-    try testing.expectEqual(20, parseFontSize("italic bold 20px/1.5 Arial, sans-serif").?);
+-    try testing.expectEqual(16, parseFontSize("12pt serif").?);
+-    try testing.expectEqual(24, parseFontSize("1.5em serif").?);
+-    try testing.expectEqual(null, parseFontSize("bold serif"));
+-    try testing.expectEqual(null, parseFontSize(""));
++test "context2d: parseFont" {
++    try testing.expectEqual(10, (parseFont("10px sans-serif").?).size);
++    try testing.expectEqual(20, (parseFont("italic bold 20px/1.5 Arial, sans-serif").?).size);
++    try testing.expectEqual(16, (parseFont("12pt serif").?).size);
++    try testing.expectEqual(24, (parseFont("1.5em serif").?).size);
++    try testing.expectEqual(null, parseFont("bold serif"));
++    try testing.expectEqual(null, parseFont(""));
+ }

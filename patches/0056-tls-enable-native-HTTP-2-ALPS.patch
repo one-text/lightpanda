@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Sun, 1 Nov 2026 09:47:37 -0300
+Subject: [PATCH] tls: enable native HTTP/2 ALPS
+
+Enable BoringSSL's modern ALPS extension (17613) for origin connections
+whose actual ALPN offer includes h2, with empty client settings as in
+Chrome. Configure the per-SSL object after curl's session/ALPN filtering;
+propagate native setup failures and preserve certificate verification.
+Exclude proxy TLS because its separate HTTP/2 tunnel filter does not
+consume negotiated ALPS settings.
+
+Apply peer ALPS SETTINGS to the new origin nghttp2 session before sending
+requests. Use pinned nghttp2's existing no-ACK receiver so flow control,
+HPACK and settings validation stay native, without acknowledging TLS
+settings or consuming the real server preface. Reject truncated/forbidden
+frames, SETTINGS ACKs and invalid SETTINGS shapes. Unknown extensions,
+including ALPS ACCEPT_CH, remain ignored; this is not full Chrome ALPS
+client-hint or arbitrary negotiated-setting behavior parity.
+
+Transform only generated copies of pinned curl's openssl.c and http2.c,
+with exact unique source anchors. Leave dependency caches untouched and
+keep the existing HTTP/2 profile transform composed ahead of ALPS setup.
+No new dependencies or unit tests.
+
+This closes the missing nine-byte ALPS ClientHello offer found by the
+fingerprint matrix against installed Linux Chrome 154.0.8037.97. That
+matrix does not prove macOS identity or full HTTP/2/ALPS parity; negotiated
+SETTINGS continue using nghttp2's validation, which is stricter than
+Chrome for some numeric values.
+
+References: fingerprint/README.md; Chromium 155.0.8059.40
+net/socket/ssl_client_socket_impl.cc, net/spdy/alps_decoder.cc and
+net/spdy/spdy_session.cc; pinned BoringSSL include/openssl/ssl.h.
+---
+ build.zig                   |  27 +++++-
+ tools/curl_alps_profile.zig | 163 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 186 insertions(+), 4 deletions(-)
+ create mode 100644 tools/curl_alps_profile.zig
+
+diff --git a/build.zig b/build.zig
+index 236cd7c..344f98e 100644
+--- a/build.zig
++++ b/build.zig
+@@ -712,6 +712,20 @@ fn http2ProfileSource(b: *Build, source: Build.LazyPath, output: []const u8) Bui
+     return run.addOutputFileArg(output);
+ }
+ 
++fn alpsProfileSource(b: *Build, source: Build.LazyPath, output: []const u8) Build.LazyPath {
++    const tool = b.addExecutable(.{
++        .name = "curl_alps_profile",
++        .root_module = b.createModule(.{
++            .root_source_file = b.path("tools/curl_alps_profile.zig"),
++            .target = b.graph.host,
++            .optimize = .ReleaseSafe,
++        }),
++    });
++    const run = b.addRunArtifact(tool);
++    run.addFileArg(source);
++    return run.addOutputFileArg(output);
++}
++
+ fn buildCurl(
+     b: *Build,
+     target: Build.ResolvedTarget,
+@@ -723,6 +737,7 @@ fn buildCurl(
+ 
+     const mod = cLibModule(b, target, optimize, is_tsan);
+     mod.addIncludePath(dep.path("lib"));
++    mod.addIncludePath(dep.path("lib/vtls"));
+     mod.addIncludePath(dep.path("include"));
+ 
+     const os = target.result.os.tag;
+@@ -967,7 +982,11 @@ fn buildCurl(
+     mod.addConfigHeader(curl_config);
+     lib.installHeadersDirectory(dep.path("include/curl"), "curl", .{});
+     mod.addCSourceFile(.{
+-        .file = http2ProfileSource(b, dep.path("lib/http2.c"), "http2.c"),
++        .file = alpsProfileSource(b, http2ProfileSource(b, dep.path("lib/http2.c"), "http2.c"), "http2.c"),
++        .flags = &.{ "-D_GNU_SOURCE", "-DHAVE_CONFIG_H", "-DCURL_STATICLIB", "-DBUILDING_LIBCURL" },
++    });
++    mod.addCSourceFile(.{
++        .file = alpsProfileSource(b, dep.path("lib/vtls/openssl.c"), "openssl.c"),
+         .flags = &.{ "-D_GNU_SOURCE", "-DHAVE_CONFIG_H", "-DCURL_STATICLIB", "-DBUILDING_LIBCURL" },
+     });
+     mod.addCSourceFiles(.{
+@@ -1026,9 +1045,9 @@ fn buildCurl(
+             "vquic/cf-ngtcp2-proxy.c", "vquic/cf-ngtcp2.c",      "vquic/cf-quiche.c",   "vquic/vquic-tls.c",
+             "vquic/vquic.c",           "vssh/libssh.c",          "vssh/libssh2.c",      "vssh/vssh.c",
+             "vtls/apple.c",            "vtls/cipher_suite.c",    "vtls/gtls.c",         "vtls/hostcheck.c",
+-            "vtls/keylog.c",           "vtls/mbedtls.c",         "vtls/openssl.c",      "vtls/rustls.c",
+-            "vtls/schannel.c",         "vtls/schannel_verify.c", "vtls/vtls.c",         "vtls/vtls_config.c",
+-            "vtls/vtls_scache.c",      "vtls/vtls_spack.c",      "vtls/wolfssl.c",      "vtls/x509asn1.c",
++            "vtls/keylog.c",           "vtls/mbedtls.c",         "vtls/rustls.c",       "vtls/schannel.c",
++            "vtls/vtls.c",             "vtls/schannel_verify.c", "vtls/vtls_config.c",  "vtls/vtls_scache.c",
++            "vtls/vtls_spack.c",       "vtls/wolfssl.c",         "vtls/x509asn1.c",
+         },
+     });
+ 
+diff --git a/tools/curl_alps_profile.zig b/tools/curl_alps_profile.zig
+new file mode 100644
+index 0000000..68b454f
+--- /dev/null
++++ b/tools/curl_alps_profile.zig
+@@ -0,0 +1,163 @@
++// Copyright (C) 2026 Brenno Flávio
++// Brenno Flávio <contato@brennoflavio.com.br>
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++//! Enable native HTTP/2 ALPS in pinned curl sources without editing dependencies.
++const std = @import("std");
++
++pub fn main(init: std.process.Init) !void {
++    const allocator = init.arena.allocator();
++    var args = std.process.Args.Iterator.init(init.minimal.args);
++    _ = args.next();
++    const input = args.next() orelse return error.Usage;
++    const output = args.next() orelse return error.Usage;
++    if (args.next() != null) return error.Usage;
++    const cwd = std.Io.Dir.cwd();
++    var source = try cwd.readFileAlloc(init.io, input, allocator, .unlimited);
++    const edits: []const Edit = if (std.mem.endsWith(u8, input, "openssl.c")) &tls_edits else if (std.mem.endsWith(u8, input, "http2.c")) &h2_edits else return error.Usage;
++    for (edits) |edit| {
++        if (std.mem.count(u8, source, edit.before) != 1) {
++            std.debug.print("Pinned ALPS source changed ({s}); expected one match for:\n{s}\n", .{ input, edit.before });
++            return error.CurlSourceMismatch;
++        }
++        source = try std.mem.replaceOwned(u8, allocator, source, edit.before, edit.after);
++    }
++    try cwd.writeFile(init.io, .{ .sub_path = output, .data = source });
++}
++
++const Edit = struct { before: []const u8, after: []const u8 };
++const tls_edits = [_]Edit{.{
++    .before =
++    \\    if(SSL_set_alpn_protos(octx->ssl, proto.data, proto.len)) {
++    \\      failf(data, "Error setting ALPN");
++    \\      return CURLE_SSL_CONNECT_ERROR;
++    \\    }
++    ,
++    .after =
++    \\    if(SSL_set_alpn_protos(octx->ssl, proto.data, proto.len)) {
++    \\      failf(data, "Error setting ALPN");
++    \\      return CURLE_SSL_CONNECT_ERROR;
++    \\    }
++    \\    /* Only the origin HTTP/2 filter consumes peer ALPS settings. */
++    \\    if(!Curl_ssl_cf_is_proxy(cf) && Curl_alpn_contains_proto(&alpns, "h2")) {
++    \\      SSL_set_alps_use_new_codepoint(octx->ssl, 1);
++    \\      if(!SSL_add_application_settings(octx->ssl,
++    \\                                       (const uint8_t *)"h2", 2,
++    \\                                       (const uint8_t *)"", 0)) {
++    \\        failf(data, "Error setting HTTP/2 ALPS");
++    \\        return CURLE_SSL_CONNECT_ERROR;
++    \\      }
++    \\    }
++    ,
++}};
++
++const h2_edits = [_]Edit{
++    .{
++        .before = "#include <nghttp2/nghttp2.h>",
++        .after =
++        \\#include <nghttp2/nghttp2.h>
++        \\#include <openssl/ssl.h>
++        \\
++        \\/* Pinned nghttp2's native SETTINGS receiver, also used by h2c upgrade.
++        \\ * Its noack path applies peer settings without acknowledging TLS data. */
++        \\extern int nghttp2_session_on_settings_received(nghttp2_session *session,
++        \\                                                nghttp2_frame *frame,
++        \\                                                int noack);
++        ,
++    },
++    .{
++        .before =
++        \\static CURLcode cf_h2_ctx_open(struct Curl_cfilter *cf,
++        \\                               struct Curl_easy *data)
++        ,
++        .after = peer_settings ++
++            \\
++            \\static CURLcode cf_h2_ctx_open(struct Curl_cfilter *cf,
++            \\                               struct Curl_easy *data)
++        ,
++    },
++    .{
++        .before = "  /* all set, traffic will be send on connect */",
++        .after =
++        \\  result = cf_h2_apply_alps(cf, data);
++        \\  if(result)
++        \\    goto out;
++        \\
++        \\  /* all set, traffic will be send on connect */
++        ,
++    },
++};
++
++const peer_settings =
++    \\/* ALPS carries HTTP/2 frames, not a bare SETTINGS payload. Keep the real
++    \\ * server preface separate: TLS-delivered SETTINGS never generate an ACK.
++    \\ * Unknown extension frames (including ACCEPT_CH) are not acted upon here. */
++    \\static CURLcode cf_h2_apply_alps(struct Curl_cfilter *cf,
++    \\                                   struct Curl_easy *data)
++    \\{
++    \\  struct cf_h2_ctx *ctx = cf->ctx;
++    \\  struct curl_tlssessioninfo info;
++    \\  const uint8_t *alps;
++    \\  size_t remaining;
++    \\  SSL *ssl;
++    \\
++    \\  memset(&info, 0, sizeof(info));
++    \\  if(cf->next->cft->query(cf->next, data, CF_QUERY_SSL_INFO, NULL, &info) ||
++    \\     !info.internals)
++    \\    return CURLE_OK;
++    \\  ssl = info.internals;
++    \\  if(!SSL_has_application_settings(ssl))
++    \\    return CURLE_OK;
++    \\  SSL_get0_peer_application_settings(ssl, &alps, &remaining);
++    \\  while(remaining) {
++    \\    size_t length, i, count;
++    \\    uint8_t type, flags;
++    \\    uint32_t stream;
++    \\    nghttp2_frame frame;
++    \\    nghttp2_settings_entry *entries;
++    \\    int rc;
++    \\
++    \\    if(remaining < 9)
++    \\      return CURLE_HTTP2;
++    \\    length = ((size_t)alps[0] << 16) | ((size_t)alps[1] << 8) | alps[2];
++    \\    type = alps[3];
++    \\    flags = alps[4];
++    \\    stream = ((uint32_t)(alps[5] & 0x7f) << 24) |
++    \\             ((uint32_t)alps[6] << 16) | ((uint32_t)alps[7] << 8) | alps[8];
++    \\    alps += 9;
++    \\    remaining -= 9;
++    \\    if(length > remaining || length > 16384)
++    \\      return CURLE_HTTP2;
++    \\    if(type <= NGHTTP2_CONTINUATION && type != NGHTTP2_SETTINGS)
++    \\      return CURLE_HTTP2;
++    \\    if(type == NGHTTP2_SETTINGS) {
++    \\      if(stream || (flags & NGHTTP2_FLAG_ACK) || length % 6)
++    \\        return CURLE_HTTP2;
++    \\      count = length / 6;
++    \\      entries = count ? calloc(count, sizeof(*entries)) : NULL;
++    \\      if(count && !entries)
++    \\        return CURLE_OUT_OF_MEMORY;
++    \\      for(i = 0; i < count; ++i) {
++    \\        const uint8_t *entry = alps + i * 6;
++    \\        entries[i].settings_id = ((uint16_t)entry[0] << 8) | entry[1];
++    \\        entries[i].value = ((uint32_t)entry[2] << 24) |
++    \\                           ((uint32_t)entry[3] << 16) |
++    \\                           ((uint32_t)entry[4] << 8) | entry[5];
++    \\      }
++    \\      memset(&frame, 0, sizeof(frame));
++    \\      frame.hd.type = NGHTTP2_SETTINGS;
++    \\      frame.hd.length = length;
++    \\      frame.settings.iv = entries;
++    \\      frame.settings.niv = count;
++    \\      rc = nghttp2_session_on_settings_received(ctx->h2, &frame, 1);
++    \\      free(entries);
++    \\      if(rc || !nghttp2_session_check_request_allowed(ctx->h2))
++    \\        return rc == NGHTTP2_ERR_NOMEM ? CURLE_OUT_OF_MEMORY : CURLE_HTTP2;
++    \\    }
++    \\    alps += length;
++    \\    remaining -= length;
++    \\  }
++    \\  return CURLE_OK;
++    \\}
++    \\
++;

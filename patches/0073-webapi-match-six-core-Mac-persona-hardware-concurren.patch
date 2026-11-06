@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 4 Nov 2026 21:26:18 -0300
+Subject: [PATCH] webapi: match six-core Mac persona hardware concurrency
+
+Use 6 for the base MacBook Neo / A18 Pro profile in AGENTS.md (https://www.apple.com/macbook-neo/specs/). Preserve the native read-only accessor and existing WorkerNavigator delegation; update the existing upstream assertion.
+
+Validation: release build passed; 1658/1658 upstream tests passed; benchmark improved from 118/130 to 119/130 with all four scopes reporting 6 and no regressions. Reviewer found no issues.
+---
+ src/browser/tests/navigator/navigator.html | 2 +-
+ src/browser/webapi/Navigator.zig           | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/browser/tests/navigator/navigator.html b/src/browser/tests/navigator/navigator.html
+index 54cc22c..1a622bf 100644
+--- a/src/browser/tests/navigator/navigator.html
++++ b/src/browser/tests/navigator/navigator.html
+@@ -22,7 +22,7 @@
+   testing.expectEqual(true, navigator.onLine);
+   testing.expectEqual(true, navigator.cookieEnabled);
+   testing.expectEqual(true, navigator.hardwareConcurrency > 0);
+-  testing.expectEqual(4, navigator.hardwareConcurrency);
++  testing.expectEqual(6, navigator.hardwareConcurrency);
+   testing.expectEqual(0, navigator.maxTouchPoints);
+   testing.expectEqual('Google Inc.', navigator.vendor);
+   testing.expectEqual('Gecko', navigator.product);
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index dc740fa..3506178 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -105,7 +105,7 @@ fn getCookieEnabled(_: *const Navigator) bool {
+ }
+ 
+ pub fn getHardwareConcurrency(_: *const Navigator) u32 {
+-    return 4;
++    return 6;
+ }
+ 
+ pub fn getDeviceMemory(_: *const Navigator) f64 {
