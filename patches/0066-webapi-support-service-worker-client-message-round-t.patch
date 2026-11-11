@@ -1,0 +1,760 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 4 Nov 2026 02:47:31 -0300
+Subject: [PATCH] webapi: support service-worker client message round trips
+
+Implement the document-client messaging subset from step 3 of the downstream
+service-worker client API plan. Expose Client and minimal WindowClient only in
+the service-worker realm, with read-only id/url/type/frameType and inherited
+postMessage. Unsupported WindowClient operations are absent.
+
+Capture the incumbent document, not the worker wrapper's realm or creator, and
+retain its document-lifetime identity and origin through pre-load queues and
+ExtendableMessageEvent dispatch. Reference-count Client snapshots independently
+of frames, events and worker arenas; event/source wrappers remain valid during
+waitUntil work without retaining the destination document.
+
+Clone replies synchronously into the destination context and enqueue trusted
+MessageEvents on its ServiceWorkerContainer with that realm's ServiceWorker
+wrapper and sender origin. Resolve client IDs again at delivery to drop stale
+navigation/closure work. Use existing scheduler cancellation, structured-clone,
+registration wrapper and JS-finalizer mechanisms. Keep typed event ownership
+through dispatch even without listeners so cloned payloads are released.
+
+Enable container delivery at DOMContentLoaded, on the first onmessage setter,
+or through startMessages(). Plain addEventListener does not enable a loading
+document's queue. Reject nonempty transfer arguments, including iterable
+sequences and options.transfer, rather than pretending to transfer. Preserve
+DataCloneError and getter-thrown JS exceptions in both messaging directions.
+
+Validation:
+- ./scripts/build.sh and ./scripts/build.sh build-dev succeeded.
+- ./scripts/build.sh test: all 1658 existing upstream tests passed; no new tests
+  or assertion changes were needed.
+- npm --prefix benchmark ci and npm --prefix benchmark run build succeeded
+  (130 browser assertions); benchmark source/checks remain unchanged.
+- Ignored localhost CDP fixtures with serviceworker explicitly enabled passed
+  queued-before-load string replies; Client/WindowClient prototypes and metadata;
+  borrowed worker wrappers and uncontrolled senders; overlapping delayed replies
+  to separate pages (popup) and frames sharing a worker; FIFO snapshots; clone
+  errors, iterable transfer rejection and getter exception identity; loading
+  queues enabled via DOMContentLoaded/startMessages/onmessage; retained Client
+  wrappers after navigation; and pending reply/waitUntil teardown and cancellation.
+  Diagnostics ran successfully against debug and release builds.
+- Real worker readings: UA Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)
+  AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36;
+  hardwareConcurrency 4; platformVersion empty string; no collection errors.
+- One reviewer pass; addressed listener-free payload retention, iterable transfer
+  overload rejection, getter exception propagation and missing diagnostic paths.
+
+Limits: document clients only; no transferables, worker-client reply sources,
+fetch interception, persistent workers, extra Clients discovery/WindowClient
+operations, persona changes or experimental-feature default changes. Existing
+page-owned worker teardown remains unchanged. Delivery uses existing scheduler
+checkpoints (a blocking script can delay enabled messages until parsing resumes).
+Cloning is synchronous using the existing transport subset, not a separate
+asynchronous deserialization/messageerror transport. No full benchmark run or
+external network probe was performed.
+
+Spec references:
+https://w3c.github.io/ServiceWorker/#client-interface
+https://w3c.github.io/ServiceWorker/#service-worker-postmessage-options
+https://w3c.github.io/ServiceWorker/#serviceworkercontainer-interface
+---
+ src/browser/Factory.zig                       |  10 ++
+ src/browser/Frame.zig                         |   1 +
+ src/browser/js/Context.zig                    |   4 +
+ src/browser/js/bridge.zig                     |   4 +
+ src/browser/webapi/Client.zig                 | 147 ++++++++++++++++++
+ src/browser/webapi/ServiceWorker.zig          |  16 +-
+ src/browser/webapi/ServiceWorkerContainer.zig | 106 ++++++++++++-
+ .../webapi/ServiceWorkerGlobalScope.zig       |  88 ++++++-----
+ src/browser/webapi/WindowClient.zig           |  33 ++++
+ .../webapi/event/ExtendableMessageEvent.zig   |  10 +-
+ src/browser/webapi/event/MessageEvent.zig     |   3 +
+ 11 files changed, 374 insertions(+), 48 deletions(-)
+ create mode 100644 src/browser/webapi/Client.zig
+ create mode 100644 src/browser/webapi/WindowClient.zig
+
+diff --git a/src/browser/Factory.zig b/src/browser/Factory.zig
+index 21f0671..3aa1bd9 100644
+--- a/src/browser/Factory.zig
++++ b/src/browser/Factory.zig
+@@ -114,6 +114,16 @@ pub fn event(_: *const Factory, arena: *lp.Arena, typ: String, child: anytype) !
+     return chain.get(1);
+ }
+ 
++pub fn windowClient(_: *const Factory, arena: *lp.Arena, client: @import("webapi/Client.zig")) !*@import("webapi/Client.zig") {
++    const Client = @import("webapi/Client.zig");
++    const WindowClient = @import("webapi/WindowClient.zig");
++    const chain = try PrototypeChain(&.{ Client, WindowClient }).allocate(arena.allocator());
++    chain.get(0).* = client;
++    chain.get(0)._type = .{ .window = chain.get(1) };
++    chain.setLeaf(1, WindowClient{ ._proto = undefined });
++    return chain.get(0);
++}
++
+ pub fn extendableEvent(_: *const Factory, arena: *lp.Arena, typ: String, child: anytype) !*@TypeOf(child) {
+     const chain = try PrototypeChain(
+         &.{ Event, @import("webapi/event/ExtendableEvent.zig"), @TypeOf(child) },
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index d77fd9f..195adf4 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -1367,6 +1367,7 @@ fn _documentIsLoaded(self: *Frame) !void {
+         event,
+     );
+ 
++    if (self.window._navigator._service_worker) |container| container.startMessages();
+     self._chrome_timing.dom_loaded = self._chrome_timing.epochNow();
+     self._session.notification.dispatch(.frame_dom_content_loaded, &.{
+         .req_id = self._req_id,
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index 0c0c953..20e8b2a 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -374,6 +374,10 @@ pub fn globalObject(self: *Context, local: *const js.Local) js.Object {
+     };
+ }
+ 
++pub fn getIncumbentContext(self: *Context) ?*Context {
++    return fromC(v8.v8__Isolate__GetIncumbentContext(self.env.isolate.handle) orelse return null);
++}
++
+ pub fn getIncumbent(self: *Context) *Frame {
+     const ctx = fromC(v8.v8__Isolate__GetIncumbentContext(self.env.isolate.handle).?).?;
+     return switch (ctx.global) {
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index d4a3e7b..f2068a8 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1451,6 +1451,8 @@ pub const SharedWorkerJsApis = flattenTypes(&([_]type{@import("../webapi/SharedW
+ pub const ServiceWorkerJsApis = flattenTypes(&([_]type{
+     @import("../webapi/ServiceWorkerGlobalScope.zig"),
+     @import("../webapi/Clients.zig"),
++    @import("../webapi/Client.zig"),
++    @import("../webapi/WindowClient.zig"),
+     @import("../webapi/ServiceWorker.zig"),
+     @import("../webapi/ServiceWorkerRegistration.zig"),
+     @import("../webapi/event/ExtendableEvent.zig"),
+@@ -1471,6 +1473,8 @@ pub const JsApis = blk: {
+         @import("../webapi/ServiceWorkerGlobalScope.zig").JsApi,
+         //ServiceWorker-only, so it isn't in PageJsApis either.
+         @import("../webapi/Clients.zig").JsApi,
++        @import("../webapi/Client.zig").JsApi,
++        @import("../webapi/WindowClient.zig").JsApi,
+         @import("../webapi/event/ExtendableEvent.zig").JsApi,
+         @import("../webapi/event/ExtendableMessageEvent.zig").JsApi,
+         @import("../webapi/WorkerGlobalScope.zig").JsApi,
+diff --git a/src/browser/webapi/Client.zig b/src/browser/webapi/Client.zig
+new file mode 100644
+index 0000000..25004f5
+--- /dev/null
++++ b/src/browser/webapi/Client.zig
+@@ -0,0 +1,147 @@
++// Copyright (C) 2026  Lightpanda (Selecy SAS)
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Frame = @import("../Frame.zig");
++const Page = @import("../Page.zig");
++const ServiceWorkerGlobalScope = @import("ServiceWorkerGlobalScope.zig");
++const ServiceWorkerContainer = @import("ServiceWorkerContainer.zig");
++const WindowClient = @import("WindowClient.zig");
++
++const Client = @This();
++pub const _prototype_root = true;
++
++_type: union(enum) { window: *WindowClient },
++_arena: *lp.Arena,
++_rc: lp.RC = .{},
++_scope: *ServiceWorkerGlobalScope,
++_client_id: u64,
++_id: []const u8,
++_url: []const u8,
++_origin: []const u8,
++_frame_type: []const u8,
++
++pub fn checkTransfer(options: ?js.Value) !void {
++    const opts = options orelse return;
++    if (opts.isNullOrUndefined()) return;
++    if (!opts.isObject()) return error.TypeError;
++    // Web IDL selects the sequence overload for iterable objects, not just
++    // arrays. Do not accidentally treat a Set as an empty options dictionary.
++    if (try opts.iterator()) |iterator| {
++        if (try iterator.next() != null) return error.DataClone;
++        return;
++    }
++    const transfer = try opts.toObject().get("transfer");
++    if (transfer.isUndefined()) return;
++    const iterator = try transfer.iterator() orelse return error.TypeError;
++    // This subset does not implement transferring ownership of any objects.
++    if (try iterator.next() != null) return error.DataClone;
++}
++
++pub fn init(scope: *ServiceWorkerGlobalScope, frame: *Frame) !*Client {
++    const arena = try scope._proto._session.getArena(.small, "Client");
++    errdefer arena.release();
++    return scope._proto._factory.windowClient(arena, .{
++        ._type = undefined,
++        ._arena = arena,
++        ._scope = scope,
++        ._client_id = frame._service_worker_client_id,
++        ._id = try std.fmt.allocPrint(arena.allocator(), "{d}", .{frame._service_worker_client_id}),
++        ._url = try arena.dupe(u8, frame._service_worker_creation_url orelse frame.url),
++        ._origin = try arena.dupe(u8, frame.origin orelse "null"),
++        ._frame_type = if (frame.parent != null) "nested" else if (frame.window._opener != null) "auxiliary" else "top-level",
++    });
++}
++
++pub fn acquireRef(self: *Client) void {
++    self._rc.acquire();
++}
++
++pub fn releaseRef(self: *Client, page: *Page) void {
++    self._rc.release(self, page);
++}
++
++pub fn deinit(self: *Client, _: *Page) void {
++    self._arena.release();
++}
++
++fn getId(self: *const Client) []const u8 {
++    return self._id;
++}
++
++fn getUrl(self: *const Client) []const u8 {
++    return self._url;
++}
++
++fn getType(_: *const Client) []const u8 {
++    return "window";
++}
++
++fn getFrameType(self: *const Client) []const u8 {
++    return self._frame_type;
++}
++
++pub fn postMessage(self: *Client, data: js.Value, options: ?js.Value) !void {
++    try checkTransfer(options);
++    const scope = self._scope;
++    const session = scope._proto._session;
++    const frame = session.service_worker_clients.get(self._client_id);
++    // Even a discarded destination must synchronously reject uncloneable data.
++    const destination = if (frame) |f| f.js else scope._proto.js;
++    const cloned = blk: {
++        var ls: js.Local.Scope = undefined;
++        destination.localScope(&ls);
++        defer ls.deinit();
++        var try_catch: js.TryCatch = undefined;
++        try_catch.init(&ls.local);
++        defer try_catch.deinit();
++        const value = data.structuredCloneTo(&ls.local) catch |err| {
++            if (try_catch.hasCaught()) try_catch.rethrow();
++            return err;
++        };
++        break :blk try value.persist();
++    };
++    var owned = true;
++    defer if (owned) cloned.release();
++
++    const live = session.service_worker_clients.get(self._client_id) orelse return;
++    if (live.page.destroying or live.window._closed or live.isSameOrigin(scope._proto.url) == false) return;
++    const navigator = live.window._navigator;
++    const container = navigator._service_worker orelse blk: {
++        const container = try ServiceWorkerContainer.init(live);
++        navigator._service_worker = container;
++        break :blk container;
++    };
++    try container.receiveMessage(scope, cloned);
++    owned = false;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Client);
++    pub const Meta = struct {
++        pub const name = "Client";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const id = bridge.accessor(Client.getId, null, .{});
++    pub const url = bridge.accessor(Client.getUrl, null, .{});
++    pub const @"type" = bridge.accessor(Client.getType, null, .{});
++    pub const frameType = bridge.accessor(Client.getFrameType, null, .{});
++    pub const postMessage = bridge.function(Client.postMessage, .{});
++};
+diff --git a/src/browser/webapi/ServiceWorker.zig b/src/browser/webapi/ServiceWorker.zig
+index 601cac3..0e36b5e 100644
+--- a/src/browser/webapi/ServiceWorker.zig
++++ b/src/browser/webapi/ServiceWorker.zig
+@@ -89,9 +89,19 @@ pub fn getState(self: *const ServiceWorker) State {
+     return scope._state;
+ }
+ 
+-pub fn postMessage(self: *ServiceWorker, data: js.Value) !void {
+-    const scope = self._scope orelse return;
+-    return scope.receiveMessage(data);
++pub fn postMessage(self: *ServiceWorker, data: js.Value, options: ?js.Value, exec: *js.Execution) !void {
++    try @import("Client.zig").checkTransfer(options);
++    const scope = self._scope orelse return error.InvalidStateError;
++    // The incumbent may differ from the wrapper's realm (a same-origin page
++    // can legitimately hold another page's worker object).
++    const context = exec.js.getIncumbentContext() orelse return error.InvalidStateError;
++    const frame = switch (context.global) {
++        .frame => |frame| frame,
++        .worker => return error.NotSupported,
++    };
++    if (frame._session != scope._proto._session or frame.isSameOrigin(scope._proto.url) == false) return error.SecurityError;
++    if (frame._service_worker_client_id == 0) return error.InvalidStateError;
++    return scope.receiveMessage(data, frame);
+ }
+ 
+ pub fn stateChanged(self: *ServiceWorker) void {
+diff --git a/src/browser/webapi/ServiceWorkerContainer.zig b/src/browser/webapi/ServiceWorkerContainer.zig
+index fa576d3..3a02fb5 100644
+--- a/src/browser/webapi/ServiceWorkerContainer.zig
++++ b/src/browser/webapi/ServiceWorkerContainer.zig
+@@ -28,6 +28,7 @@ const Frame = @import("../Frame.zig");
+ const Worker = @import("Worker.zig");
+ const WorkerGlobalScope = @import("WorkerGlobalScope.zig");
+ const Event = @import("Event.zig");
++const MessageEvent = @import("event/MessageEvent.zig");
+ const Clients = @import("Clients.zig");
+ const EventTarget = @import("EventTarget.zig");
+ const ServiceWorker = @import("ServiceWorker.zig");
+@@ -44,6 +45,10 @@ _proto: *EventTarget,
+ _frame: *Frame,
+ _controller: ?*ServiceWorkerRegistration = null,
+ _on_controller_change: ?js.Function.Global = null,
++_on_message: ?js.Function.Global = null,
++_on_message_error: ?js.Function.Global = null,
++_messages_enabled: bool = false,
++_pending_messages: std.ArrayList(*MessageCallback) = .empty,
+ 
+ // One per scope this document has registered or been claimed by
+ _registrations: std.ArrayList(*ServiceWorkerRegistration) = .empty,
+@@ -61,12 +66,15 @@ pub fn init(frame: *Frame) !*ServiceWorkerContainer {
+     const self = try frame._factory.eventTargetWithAllocator(frame.arena, ServiceWorkerContainer{
+         ._proto = undefined,
+         ._frame = frame,
++        ._messages_enabled = frame._chrome_timing.dom_loaded != 0,
+     });
+     return self;
+ }
+ 
+ // Called from Frame.deinit
+ pub fn detach(self: *ServiceWorkerContainer) void {
++    for (self._pending_messages.items) |message| MessageCallback.cancelled(message);
++    self._pending_messages.clearRetainingCapacity();
+     self._controller = null;
+     for (self._registrations.items) |registration| {
+         registration.detach();
+@@ -313,8 +321,98 @@ fn matchScope(self: *ServiceWorkerContainer, only_active: bool, client_url: []co
+     return best;
+ }
+ 
+-// Messages from a worker are delivered as soon as they're posted
+-pub fn startMessages(_: *ServiceWorkerContainer) void {}
++pub fn startMessages(self: *ServiceWorkerContainer) void {
++    if (self._messages_enabled) return;
++    self._messages_enabled = true;
++    for (self._pending_messages.items) |message| {
++        self.scheduleMessage(message) catch |err| {
++            log.debug(.browser, "SWC startMessages", .{ .err = err });
++            MessageCallback.cancelled(message);
++        };
++    }
++    self._pending_messages.clearRetainingCapacity();
++}
++
++pub fn getOnMessage(self: *const ServiceWorkerContainer) ?js.Function.Global {
++    return self._on_message;
++}
++
++pub fn setOnMessage(self: *ServiceWorkerContainer, setter: ?WorkerGlobalScope.FunctionSetter) void {
++    self._on_message = WorkerGlobalScope.getFunctionFromSetter(setter);
++    self.startMessages();
++}
++
++pub fn getOnMessageError(self: *const ServiceWorkerContainer) ?js.Function.Global {
++    return self._on_message_error;
++}
++
++pub fn setOnMessageError(self: *ServiceWorkerContainer, setter: ?WorkerGlobalScope.FunctionSetter) void {
++    self._on_message_error = WorkerGlobalScope.getFunctionFromSetter(setter);
++}
++
++// Takes ownership only on success, like MessagePort.scheduleDelivery.
++pub fn receiveMessage(self: *ServiceWorkerContainer, scope: *ServiceWorkerGlobalScope, data: js.Value.Global) !void {
++    const frame = self._frame;
++    const registration = try self.track(scope);
++    const worker = try registration.worker(scope);
++    const arena = try frame._session.getArena(.tiny, "ServiceWorkerContainer.message");
++    errdefer arena.release();
++    const message = try arena.create(MessageCallback);
++    message.* = .{
++        .arena = arena,
++        .session = frame._session,
++        .client_id = frame._service_worker_client_id,
++        .data = data,
++        .worker = worker,
++        .origin = try arena.dupe(u8, scope._proto.origin orelse "null"),
++    };
++    if (!self._messages_enabled) {
++        try self._pending_messages.append(frame.arena, message);
++        return;
++    }
++    try self.scheduleMessage(message);
++}
++
++fn scheduleMessage(self: *ServiceWorkerContainer, message: *MessageCallback) !void {
++    try self._frame.js.scheduler.add(message, MessageCallback.run, 0, .{
++        .name = "ServiceWorkerContainer.message",
++        .finalizer = MessageCallback.cancelled,
++    });
++}
++
++const MessageCallback = struct {
++    arena: *lp.Arena,
++    session: *@import("../Session.zig"),
++    client_id: u64,
++    data: ?js.Value.Global,
++    worker: *ServiceWorker,
++    origin: []const u8,
++
++    fn cancelled(ctx: *anyopaque) void {
++        const self: *MessageCallback = @ptrCast(@alignCast(ctx));
++        if (self.data) |data| data.release();
++        self.arena.release();
++    }
++
++    fn run(ctx: *anyopaque) !?u32 {
++        const self: *MessageCallback = @ptrCast(@alignCast(ctx));
++        defer cancelled(ctx);
++        const frame = self.session.service_worker_clients.get(self.client_id) orelse return null;
++        if (frame.page.destroying or frame.window._closed) return null;
++        const container = frame.window._navigator._service_worker orelse return null;
++        const exec = &frame.js.execution;
++        const event = try MessageEvent.initTrusted(.wrap("message"), .{
++            .data = .{ .value = self.data.? },
++            .origin = self.origin,
++            .source = .{ .worker = self.worker },
++        }, frame.page);
++        self.data = null;
++        event.acquireRef();
++        defer event.releaseRef(frame.page);
++        try exec.dispatch(container._proto, event.asEvent(), container._on_message, .{ .context = "SWC message" });
++        return null;
++    }
++};
+ 
+ const ControllerChangeCallback = struct {
+     arena: *lp.Arena,
+@@ -390,8 +488,8 @@ pub const JsApi = struct {
+     pub const getRegistrations = bridge.function(ServiceWorkerContainer.getRegistrations, .{});
+     pub const startMessages = bridge.function(ServiceWorkerContainer.startMessages, .{});
+ 
+-    // A worker has no way to reach a client yet, so the API is missing things
+-    // like onmessage for now
++    pub const onmessage = bridge.accessor(ServiceWorkerContainer.getOnMessage, ServiceWorkerContainer.setOnMessage, .{});
++    pub const onmessageerror = bridge.accessor(ServiceWorkerContainer.getOnMessageError, ServiceWorkerContainer.setOnMessageError, .{});
+ };
+ 
+ const testing = @import("../../testing.zig");
+diff --git a/src/browser/webapi/ServiceWorkerGlobalScope.zig b/src/browser/webapi/ServiceWorkerGlobalScope.zig
+index 5881f34..fdc5ba1 100644
+--- a/src/browser/webapi/ServiceWorkerGlobalScope.zig
++++ b/src/browser/webapi/ServiceWorkerGlobalScope.zig
+@@ -39,6 +39,7 @@ const log = lp.log;
+ const String = lp.String;
+ 
+ const Clients = @import("Clients.zig");
++const Client = @import("Client.zig");
+ 
+ const ServiceWorkerGlobalScope = @This();
+ 
+@@ -85,7 +86,17 @@ _registrations: std.DoublyLinkedList = .{},
+ // Messages posted before the script finished evaluating. Same reasoning as
+ // DedicatedWorkerGlobalScope: a message that arrives before the script has had
+ // a chance to register onmessage would otherwise be dropped silently.
+-_pending_messages: std.ArrayList(?js.Value.Global) = .empty,
++_pending_messages: std.ArrayList(Message) = .empty,
++
++const Message = struct {
++    data: js.Value.Global,
++    source: *Client,
++
++    fn release(self: Message, page: *@import("../Page.zig")) void {
++        self.data.release();
++        self.source.releaseRef(page);
++    }
++};
+ 
+ // Never created directly, always via the getOrCreate factory
+ fn init(
+@@ -156,11 +167,7 @@ pub fn deinit(self: *ServiceWorkerGlobalScope) void {
+             transfer.cancel(); // re-enters httpErrorCallback -> releaseScriptLoad
+         }
+     }
+-    for (self._pending_messages.items) |data_| {
+-        if (data_) |d| {
+-            d.release();
+-        }
+-    }
++    for (self._pending_messages.items) |message| message.release(self._proto.page);
+ 
+     self.detachRegistrations();
+     if (self._pending_event) |event| event.cancel();
+@@ -291,9 +298,7 @@ fn httpErrorCallback(ctx: *anyopaque, err: anyerror) void {
+     _ = self.unregister();
+ 
+     // The script will never run, so nothing can ever handle these.
+-    for (self._pending_messages.items) |cloned_data| {
+-        if (cloned_data) |d| d.release();
+-    }
++    for (self._pending_messages.items) |message| message.release(self._proto.page);
+     self._pending_messages.clearRetainingCapacity();
+ }
+ 
+@@ -452,31 +457,39 @@ fn setState(self: *ServiceWorkerGlobalScope, state: ServiceWorker.State) void {
+     }
+ }
+ 
+-pub fn receiveMessage(self: *ServiceWorkerGlobalScope, data: js.Value) !void {
+-    if (self._state == .redundant) {
+-        return;
+-    }
++pub fn receiveMessage(self: *ServiceWorkerGlobalScope, data: js.Value, frame: *Frame) !void {
++    if (self._state == .redundant) return error.InvalidStateError;
++    const source = try Client.init(self, frame);
++    source.acquireRef();
++    errdefer source.releaseRef(self._proto.page);
+ 
+-    const cloned_data: ?js.Value.Global = blk: {
++    const cloned_data = blk: {
+         var ls: js.Local.Scope = undefined;
+         self._proto.js.localScope(&ls);
+         defer ls.deinit();
+ 
+-        const cloned = data.structuredCloneTo(&ls.local) catch break :blk null;
+-        break :blk cloned.persist() catch break :blk null;
++        var try_catch: js.TryCatch = undefined;
++        try_catch.init(&ls.local);
++        defer try_catch.deinit();
++        const cloned = data.structuredCloneTo(&ls.local) catch |err| {
++            if (try_catch.hasCaught()) try_catch.rethrow();
++            return err;
++        };
++        break :blk try cloned.persist();
+     };
+ 
+-    errdefer if (cloned_data) |data_| data_.release();
++    errdefer cloned_data.release();
++    const message = Message{ .data = cloned_data, .source = source };
+     if (self._state == .parsed) {
+-        // script hasn't loaded yet
+-        try self._pending_messages.append(self._proto.arena, cloned_data);
++        // Script hasn't loaded yet; retain the actual sender, too.
++        try self._pending_messages.append(self._proto.arena, message);
+         return;
+     }
+ 
+-    try self.scheduleMessage(cloned_data);
++    try self.scheduleMessage(message);
+ }
+ 
+-fn scheduleMessage(self: *ServiceWorkerGlobalScope, cloned_data: ?js.Value.Global) !void {
++fn scheduleMessage(self: *ServiceWorkerGlobalScope, message: Message) !void {
+     const wgs = self._proto;
+     const session = wgs._session;
+ 
+@@ -485,7 +498,7 @@ fn scheduleMessage(self: *ServiceWorkerGlobalScope, cloned_data: ?js.Value.Globa
+ 
+     const callback = try message_arena.create(ReceiveMessageCallback);
+     callback.* = .{
+-        .data = cloned_data,
++        .message = message,
+         .worker_scope = self,
+         .arena = message_arena,
+     };
+@@ -497,12 +510,10 @@ fn scheduleMessage(self: *ServiceWorkerGlobalScope, cloned_data: ?js.Value.Globa
+ }
+ 
+ fn drainPendingMessages(self: *ServiceWorkerGlobalScope) void {
+-    for (self._pending_messages.items) |cloned_data| {
+-        self.scheduleMessage(cloned_data) catch |err| {
++    for (self._pending_messages.items) |message| {
++        self.scheduleMessage(message) catch |err| {
+             log.debug(.browser, "SWGS drain msg failed", .{ .err = err });
+-            if (cloned_data) |d| {
+-                d.release();
+-            }
++            message.release(self._proto.page);
+         };
+     }
+     self._pending_messages.clearRetainingCapacity();
+@@ -547,15 +558,13 @@ fn dispatchMessage(self: *ServiceWorkerGlobalScope, event: *ExtendableMessageEve
+ }
+ 
+ const ReceiveMessageCallback = struct {
+-    data: ?js.Value.Global,
++    message: ?Message,
+     arena: *lp.Arena,
+     worker_scope: *ServiceWorkerGlobalScope,
+ 
+     fn cancelled(ctx: *anyopaque) void {
+         const self: *ReceiveMessageCallback = @ptrCast(@alignCast(ctx));
+-        if (self.data) |d| {
+-            d.release();
+-        }
++        if (self.message) |message| message.release(self.worker_scope._proto.page);
+         self.deinit();
+     }
+ 
+@@ -570,21 +579,20 @@ const ReceiveMessageCallback = struct {
+         const wgs = self.worker_scope._proto;
+         const target = wgs.asEventTarget();
+ 
+-        _ = self.data orelse {
+-            if (wgs._event_manager.hasDirectListeners(target, "messageerror", null)) {
+-                const event = try ExtendableMessageEvent.initTrusted(comptime .wrap("messageerror"), null, wgs.page);
+-                try self.worker_scope.dispatchMessage(event, null);
+-            }
+-            return null;
+-        };
++        const message = self.message orelse return null;
+ 
+         const on_message = self.worker_scope._on_message;
+         if (wgs._event_manager.hasDirectListeners(target, "message", on_message) == false) {
+             return null;
+         }
+ 
+-        const event = try ExtendableMessageEvent.initTrusted(comptime .wrap("message"), self.data, wgs.page);
+-        self.data = null; // the event now owns the structured-cloned payload
++        const event = try ExtendableMessageEvent.initTrusted(comptime .wrap("message"), null, wgs.page);
++        event.acquireRef();
++        defer event.releaseRef(wgs.page);
++        event._origin = try event.asEvent()._arena.dupe(u8, message.source._origin);
++        event._data = message.data;
++        event._source = .{ .client = message.source };
++        self.message = null; // the event now owns both payload and source
+         try self.worker_scope.dispatchMessage(event, on_message);
+         return null;
+     }
+diff --git a/src/browser/webapi/WindowClient.zig b/src/browser/webapi/WindowClient.zig
+new file mode 100644
+index 0000000..1a258b3
+--- /dev/null
++++ b/src/browser/webapi/WindowClient.zig
+@@ -0,0 +1,33 @@
++// Copyright (C) 2026  Lightpanda (Selecy SAS)
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const js = @import("../js/js.zig");
++const Client = @import("Client.zig");
++
++const WindowClient = @This();
++pub const Proto = Client;
++
++_proto: *Client,
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(WindowClient);
++    pub const Meta = struct {
++        pub const name = "WindowClient";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++};
+diff --git a/src/browser/webapi/event/ExtendableMessageEvent.zig b/src/browser/webapi/event/ExtendableMessageEvent.zig
+index b684d0a..e730d2e 100644
+--- a/src/browser/webapi/event/ExtendableMessageEvent.zig
++++ b/src/browser/webapi/event/ExtendableMessageEvent.zig
+@@ -33,8 +33,8 @@ _last_event_id: []const u8 = "",
+ _source: ?Source = null,
+ _ports: []const *MessagePort = &.{},
+ 
+-// Client sources are added with the client reply path, not inferred here.
+ pub const Source = union(enum) {
++    client: *@import("../Client.zig"),
+     worker: *ServiceWorker,
+     port: *MessagePort,
+ };
+@@ -75,11 +75,19 @@ fn initWithTrusted(arena: *lp.Arena, typ: lp.String, opts_: ?Options, trusted: b
+     // Dictionary conversion and native allocation have both succeeded. Until
+     // here constructor data stays local, including on invalid later fields.
+     if (opts.data) |data| event._data = try data.persist();
++    if (opts.source) |source| switch (source) {
++        .client => |client| client.acquireRef(),
++        else => {},
++    };
+     return event;
+ }
+ 
+ pub fn deinit(self: *ExtendableMessageEvent, page: *Page) void {
+     if (self._data) |data| data.release();
++    if (self._source) |source| switch (source) {
++        .client => |client| client.releaseRef(page),
++        else => {},
++    };
+     self._proto.deinit(page);
+ }
+ 
+diff --git a/src/browser/webapi/event/MessageEvent.zig b/src/browser/webapi/event/MessageEvent.zig
+index 749917d..2a6817f 100644
+--- a/src/browser/webapi/event/MessageEvent.zig
++++ b/src/browser/webapi/event/MessageEvent.zig
+@@ -40,6 +40,7 @@ _source: ?Source = null,
+ _ports: []const *MessagePort = &.{},
+ 
+ pub const Source = union(enum) {
++    worker: *@import("../ServiceWorker.zig"),
+     window: *Window,
+     port: *MessagePort,
+ };
+@@ -130,6 +131,7 @@ fn getLastEventId(self: *const MessageEvent) []const u8 {
+ }
+ 
+ const SourceAccess = union(enum) {
++    worker: *@import("../ServiceWorker.zig"),
+     window: Window.Access,
+     port: *MessagePort,
+ };
+@@ -138,6 +140,7 @@ fn getSource(self: *const MessageEvent, exec: *js.Execution) ?SourceAccess {
+     const source = self._source orelse return null;
+     switch (source) {
+         .port => |port| return .{ .port = port },
++        .worker => |worker| return .{ .worker = worker },
+         .window => |window| switch (exec.js.global) {
+             .frame => |frame| return .{ .window = Window.Access.init(frame.window, window) },
+             .worker => {

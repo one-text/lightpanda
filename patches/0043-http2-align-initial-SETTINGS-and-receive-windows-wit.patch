@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 29 Oct 2026 15:39:17 -0300
+Subject: [PATCH] http2: align initial SETTINGS and receive windows with
+ Chromium
+
+Use the fingerprint recorder's measured ordered SETTINGS profile:
+HEADER_TABLE_SIZE=65536, ENABLE_PUSH=0, INITIAL_WINDOW_SIZE=6291456,
+MAX_HEADER_LIST_SIZE=262144. Keep curl's explicit push callback capability
+and rate-limit policy, while removing its client MAX_CONCURRENT_STREAMS
+offer (the peer's stream limit is still honored).
+
+Set the connection receive window to 15 MiB, producing the initial
+WINDOW_UPDATE increment 15663105. Use 6 MiB for both initial and normal
+stream credit, avoiding curl's immediate enlargement to 10 MiB. Leave
+nghttp2 consumption, replenishment, pause and rate-limit handling intact.
+
+The pinned curl 8.22.0 exposes no public settings/window profile controls.
+Generate only its modified http2.c in Zig's build cache with a native host
+tool. Require exact unique source matches so dependency drift fails the
+build. Do not mutate fetched packages or upgrade dependencies. Preserve
+all curl C compilation flags and normal build input/cache tracking.
+
+The practical reference is fresh Linux Chrome 154.0.8037.97, not an actual
+MacBook Neo capture. Header serialization and priority are a separate patch;
+TLS offers, resumption, HPACK identity and scheduler parity remain out of
+scope. No upstream unit tests are added or expectations weakened.
+
+References: fingerprint/README.md; docs/tls-patch-group-plan.md, group 4.
+---
+ build.zig                    | 21 ++++++++-
+ tools/curl_http2_profile.zig | 89 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 108 insertions(+), 2 deletions(-)
+ create mode 100644 tools/curl_http2_profile.zig
+
+diff --git a/build.zig b/build.zig
+index 4eb495f..133cab0 100644
+--- a/build.zig
++++ b/build.zig
+@@ -693,6 +693,20 @@ fn buildNghttp2(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.O
+     return lib;
+ }
+ 
++fn http2ProfileSource(b: *Build, source: Build.LazyPath, output: []const u8) Build.LazyPath {
++    const tool = b.addExecutable(.{
++        .name = "curl_http2_profile",
++        .root_module = b.createModule(.{
++            .root_source_file = b.path("tools/curl_http2_profile.zig"),
++            .target = b.graph.host,
++            .optimize = .ReleaseSafe,
++        }),
++    });
++    const run = b.addRunArtifact(tool);
++    run.addFileArg(source);
++    return run.addOutputFileArg(output);
++}
++
+ fn buildCurl(
+     b: *Build,
+     target: Build.ResolvedTarget,
+@@ -944,6 +958,10 @@ fn buildCurl(
+     const lib = sectionize(b.addLibrary(.{ .name = "curl", .root_module = mod }), section);
+     mod.addConfigHeader(curl_config);
+     lib.installHeadersDirectory(dep.path("include/curl"), "curl", .{});
++    mod.addCSourceFile(.{
++        .file = http2ProfileSource(b, dep.path("lib/http2.c"), "http2.c"),
++        .flags = &.{ "-D_GNU_SOURCE", "-DHAVE_CONFIG_H", "-DCURL_STATICLIB", "-DBUILDING_LIBCURL" },
++    });
+     mod.addCSourceFiles(.{
+         .root = dep.path("lib"),
+         .flags = &.{
+@@ -974,7 +992,7 @@ fn buildCurl(
+             "formdata.c",              "ftp.c",                  "ftplistparser.c",     "getenv.c",
+             "getinfo.c",               "gopher.c",               "hash.c",              "headers.c",
+             "hmac.c",                  "hsts.c",                 "http.c",              "http1.c",
+-            "http2.c",                 "http_aws_sigv4.c",       "http_chunks.c",       "http_digest.c",
++            "ws.c",                    "http_aws_sigv4.c",       "http_chunks.c",       "http_digest.c",
+             "http_httpsig.c",          "http_negotiate.c",       "http_ntlm.c",         "http_proxy.c",
+             "idn.c",                   "if2ip.c",                "imap.c",              "ldap.c",
+             "llist.c",                 "macos.c",                "md4.c",               "md5.c",
+@@ -1003,7 +1021,6 @@ fn buildCurl(
+             "vtls/keylog.c",           "vtls/mbedtls.c",         "vtls/openssl.c",      "vtls/rustls.c",
+             "vtls/schannel.c",         "vtls/schannel_verify.c", "vtls/vtls.c",         "vtls/vtls_config.c",
+             "vtls/vtls_scache.c",      "vtls/vtls_spack.c",      "vtls/wolfssl.c",      "vtls/x509asn1.c",
+-            "ws.c",
+         },
+     });
+ 
+diff --git a/tools/curl_http2_profile.zig b/tools/curl_http2_profile.zig
+new file mode 100644
+index 0000000..8834e26
+--- /dev/null
++++ b/tools/curl_http2_profile.zig
+@@ -0,0 +1,89 @@
++// Copyright (C) 2026 Brenno Flávio
++// Brenno Flávio <contato@brennoflavio.com.br>
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++//! Apply the bounded HTTP/2 profile to the pinned curl source in the build cache.
++//! Exact, unique matches make dependency drift a build failure, not a silent fallback.
++const std = @import("std");
++
++pub fn main(init: std.process.Init) !void {
++    const allocator = init.arena.allocator();
++    var args = std.process.Args.Iterator.init(init.minimal.args);
++    _ = args.next();
++    const input = args.next() orelse return error.Usage;
++    const output = args.next() orelse return error.Usage;
++    if (args.next() != null) return error.Usage;
++    const cwd = std.Io.Dir.cwd();
++    var source = try cwd.readFileAlloc(init.io, input, allocator, .unlimited);
++    for (edits) |edit| {
++        if (std.mem.count(u8, source, edit.before) != 1) {
++            std.debug.print("Pinned curl HTTP/2 source changed; expected one match for:\n{s}\n", .{edit.before});
++            return error.CurlSourceMismatch;
++        }
++        source = try std.mem.replaceOwned(u8, allocator, source, edit.before, edit.after);
++    }
++    try cwd.writeFile(init.io, .{ .sub_path = output, .data = source });
++}
++
++const Edit = struct { before: []const u8, after: []const u8 };
++const edits = [_]Edit{
++    .{
++        .before = "#define H2_CONN_WINDOW_SIZE     (10 * 1024 * 1024)",
++        .after = "#define H2_CONN_WINDOW_SIZE     (15 * 1024 * 1024)",
++    },
++    .{
++        .before = "#define H2_STREAM_WINDOW_SIZE_MAX   (10 * 1024 * 1024)",
++        .after = "#define H2_STREAM_WINDOW_SIZE_MAX   (6 * 1024 * 1024)",
++    },
++    .{
++        .before = "#define H2_STREAM_WINDOW_SIZE_INITIAL  (64 * 1024)",
++        .after = "#define H2_STREAM_WINDOW_SIZE_INITIAL  H2_STREAM_WINDOW_SIZE_MAX",
++    },
++    .{
++        .before =
++        \\/* We need to accommodate the max number of streams with their window sizes on
++        \\ * the overall connection. Streams might become PAUSED which will block their
++        \\ * received QUOTA in the connection window. If we run out of space, the server
++        \\ * is blocked from sending us any data. See #10988 for an issue with this. */
++        \\#define HTTP2_HUGE_WINDOW_SIZE (100 * H2_STREAM_WINDOW_SIZE_MAX)
++        ,
++        .after =
++        \\/* Chromium's connection receive window. Keep nghttp2's consumption and
++        \\ * curl's pause/rate-limit handling responsible for replenishing credit. */
++        \\#define HTTP2_HUGE_WINDOW_SIZE H2_CONN_WINDOW_SIZE
++        ,
++    },
++    .{
++        .before = "#define H2_SETTINGS_IV_LEN 3",
++        .after = "#define H2_SETTINGS_IV_LEN 4",
++    },
++    .{
++        .before =
++        \\  iv[0].settings_id = NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
++        \\  iv[0].value = Curl_multi_max_concurrent_streams(data->multi);
++        \\
++        \\  iv[1].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE;
++        \\  iv[1].value = cf_h2_initial_win_size(data);
++        \\  if(ctx)
++        \\    ctx->initial_win_size = iv[1].value;
++        \\  iv[2].settings_id = NGHTTP2_SETTINGS_ENABLE_PUSH;
++        \\  iv[2].value = !!data->multi->push_cb;
++        \\
++        \\  return 3;
++        ,
++        .after =
++        \\  iv[0].settings_id = NGHTTP2_SETTINGS_HEADER_TABLE_SIZE;
++        \\  iv[0].value = 65536;
++        \\  iv[1].settings_id = NGHTTP2_SETTINGS_ENABLE_PUSH;
++        \\  iv[1].value = !!data->multi->push_cb;
++        \\  iv[2].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE;
++        \\  iv[2].value = cf_h2_initial_win_size(data);
++        \\  if(ctx)
++        \\    ctx->initial_win_size = iv[2].value;
++        \\  iv[3].settings_id = NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE;
++        \\  iv[3].value = 262144;
++        \\
++        \\  return 4;
++        ,
++    },
++};

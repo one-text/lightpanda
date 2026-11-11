@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 14 Oct 2026 00:51:14 -0300
+Subject: [PATCH] webapi: spoof macOS Client Hint platform natively
+
+Use one macOS platform token for NavigatorUAData's native platform getter,
+toJSON and getHighEntropyValues, and derive the quoted Sec-Ch-Ua-Platform
+request header from that same token. This fixes the absent HTTP hint while
+removing the host-Linux value exposed by the existing JavaScript interface.
+
+The fixed persona is desktop Google Chrome on the base 13-inch MacBook Neo
+with Apple A18 Pro, 8GB unified memory and a 256GB SSD. macOS here is an
+OS-family hint, not an exact OS version or an Intel hardware claim. Preserve
+legacy navigator.platform=MacIntel and existing native accessor/method shape,
+WorkerNavigator forwarding, brand/version data and fixed header precedence.
+
+Send the low-entropy platform hint through the existing baseline header path.
+This intentionally inherits current unconditional hint emission, including
+WebSocket consumers; secure-context/permission policy and high-entropy hint
+negotiation are separate stack work. Architecture and bitness remain host-
+derived and platformVersion remains unpinned. No page-script injection or
+new configuration, interface types, unit tests or benchmark changes.
+
+References:
+https://wicg.github.io/ua-client-hints/#sec-ch-ua-platform
+https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-CH-UA-Platform
+https://www.apple.com/macbook-neo/specs/
+
+Validation: native API-shape and page/worker/frame/fresh-page diagnostics,
+actual document/fetch/XHR/redirect headers, fixed author/CDP precedence and
+no duplicate platform headers; release build and 1658 existing tests pass.
+---
+ src/Config.zig                         | 2 ++
+ src/browser/webapi/NavigatorUAData.zig | 8 +-------
+ src/network/HttpClient.zig             | 4 +++-
+ 3 files changed, 6 insertions(+), 8 deletions(-)
+
+diff --git a/src/Config.zig b/src/Config.zig
+index 6b74c25..775239a 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -997,6 +997,8 @@ pub const HttpHeaders = struct {
+     /// list, so the two sides cannot drift.
+     pub const chrome_major_version = "155";
+     pub const chrome_full_version = "155.0.8059.40";
++    pub const ua_platform = "macOS";
++    pub const sec_ch_ua_platform: [:0]const u8 = "\"" ++ ua_platform ++ "\"";
+ 
+     pub const brands = [_]Brand{
+         .{ .brand = "Google Chrome", .version = chrome_major_version, .full_version = chrome_full_version },
+diff --git a/src/browser/webapi/NavigatorUAData.zig b/src/browser/webapi/NavigatorUAData.zig
+index 23d6535..1543a16 100644
+--- a/src/browser/webapi/NavigatorUAData.zig
++++ b/src/browser/webapi/NavigatorUAData.zig
+@@ -103,13 +103,7 @@ fn brandList(comptime full: bool) []const Brand {
+ }
+ 
+ fn uaPlatform() []const u8 {
+-    return switch (builtin.os.tag) {
+-        .macos => "macOS",
+-        .windows => "Windows",
+-        .linux => "Linux",
+-        .freebsd => "FreeBSD",
+-        else => "Unknown",
+-    };
++    return Config.HttpHeaders.ua_platform;
+ }
+ 
+ fn uaArchitecture() []const u8 {
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index 760f482..d7932b1 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -465,11 +466,12 @@ pub fn getLanguages(self: *const Client) []const []const u8 {
+ }
+ 
+ // Headers _all_ requests include.
+-pub fn baselineHeaders(self: *const Client) [4]Transfer.RequestHeader {
++pub fn baselineHeaders(self: *const Client) [5]Transfer.RequestHeader {
+     return .{
+         .{ .name = "User-Agent", .value = self.getUserAgent() },
+         .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua, .source = .fixed },
+         .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .source = .fixed },
++        .{ .name = "Sec-Ch-Ua-Platform", .value = lp.Config.HttpHeaders.sec_ch_ua_platform, .source = .fixed },
+         // Omitting Accept-Language triggers bot-protection on some CDNs
+         // (Akamai) when Accept-Encoding is present.
+         .{ .name = "Accept-Language", .value = self.getAcceptLanguage() },

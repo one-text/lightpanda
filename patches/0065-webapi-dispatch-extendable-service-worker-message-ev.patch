@@ -1,0 +1,512 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 4 Nov 2026 00:46:12 -0300
+Subject: [PATCH] webapi: dispatch extendable service-worker message events
+
+Add a native service-worker-only ExtendableMessageEvent derived from
+ExtendableEvent, including factory/subtype/bridge plumbing, constructor
+message fields and defaults, and frozen ports arrays. Preserve ordinary
+MessageEvents and interface exposure in dedicated/shared workers and pages.
+Constructor data remains local until all dictionary conversion and native
+allocation succeed, so invalid later fields cannot root a failed payload.
+
+Dispatch service-worker message and messageerror with the new interface and
+existing structured-cloned payloads. Each dispatched message has an independent
+intrusive retained owner for its native event and JS wrapper, separate from the
+single lifecycle slot. Seal even interrupted dispatch, release only after every
+accepted lifetime promise settles, and keep other overlapping messages alive
+when one promise fulfills or rejects. Release cloned data on scheduling and
+event-creation failures as well as queued-task cancellation.
+
+Reuse ExtendableEvent promise tracking with Promise<any> conversion for values
+and thenables. Check trust and active state after conversion, including a
+reentrant then getter that settles the last old promise during a nested
+microtask checkpoint. Synthetic events and first late calls without pending
+promises reject with InvalidStateError; additional calls while promises remain
+pending can extend the event. Preserve existing install/activate ordering and
+lifecycle rejection behavior.
+
+On worker teardown cancel lifecycle/message completion callbacks before
+context disposal, retain native pointers until callbacks/tasks have been
+disabled, then release all independent owners exactly once.
+
+Validation:
+- scripts/build.sh: release build passed after review fixes.
+- scripts/build.sh build-dev: debug build passed after review fixes.
+- scripts/build.sh test: all 1658 existing tests passed unchanged.
+- Ignored localhost HTTP/CDP fixtures with serviceworker explicitly enabled:
+  constructor defaults/options, Event/ExtendableEvent prototype chain, frozen
+  ports, synthetic waitUntil restrictions, MessagePort constructor source,
+  interface absence in Window/dedicated/shared workers and unchanged ordinary
+  worker MessageEvents passed.
+- Queued-before-load cloned object snapshots and string delivery, overlapping
+  message lifetimes with multiple promises, rejection isolation, GC retention,
+  adding promises while pending, late-call rejection (including first microtask
+  calls), thenable/primitive conversion, install/activate/claim all passed.
+- Reentrant thenable conversion rejects after the previous lifetime ends;
+  failed constructor payloads are collectible across GC. Both review findings
+  addressed and covered by temporary diagnostics, with no new upstream tests.
+- Release and debug runs passed unresolved-promise teardown, 12 repeated pending
+  message closures, queued-message cancellation and navigation; no browser
+  errors, assertions or crashes. Diagnostics remain ignored and uncommitted.
+- One reviewer pass completed, both findings fixed, builds/tests and affected
+  diagnostics rerun. No benchmark changes or persona/default-feature changes.
+
+Boundary: sender source stays null and origin stays empty for delivered
+messages until the separate Client/reply patch. No transferable transport,
+client replies, fetch interception, persistence or background restart. Existing
+creating-Page worker ownership and simplified lifecycle behavior remain. No
+benchmark success or complete service-worker API conformance is claimed.
+
+Specification references:
+https://w3c.github.io/ServiceWorker/#extendablemessageevent-interface
+https://w3c.github.io/ServiceWorker/#wait-until-method
+https://w3c.github.io/ServiceWorker/#service-worker-postmessage
+---
+ src/browser/Factory.zig                       |  11 ++
+ src/browser/js/bridge.zig                     |   2 +
+ src/browser/webapi/Event.zig                  |   2 +-
+ .../webapi/ServiceWorkerGlobalScope.zig       |  78 +++++++---
+ src/browser/webapi/event/ExtendableEvent.zig  |  52 +++++--
+ .../webapi/event/ExtendableMessageEvent.zig   | 134 ++++++++++++++++++
+ 6 files changed, 248 insertions(+), 31 deletions(-)
+ create mode 100644 src/browser/webapi/event/ExtendableMessageEvent.zig
+
+diff --git a/src/browser/Factory.zig b/src/browser/Factory.zig
+index dd3280c..21f0671 100644
+--- a/src/browser/Factory.zig
++++ b/src/browser/Factory.zig
+@@ -114,6 +114,17 @@ pub fn event(_: *const Factory, arena: *lp.Arena, typ: String, child: anytype) !
+     return chain.get(1);
+ }
+ 
++pub fn extendableEvent(_: *const Factory, arena: *lp.Arena, typ: String, child: anytype) !*@TypeOf(child) {
++    const chain = try PrototypeChain(
++        &.{ Event, @import("webapi/event/ExtendableEvent.zig"), @TypeOf(child) },
++    ).allocate(arena.allocator());
++
++    chain.get(0).* = try eventInit(arena, typ, chain.get(1));
++    chain.setMiddle(1);
++    chain.setLeaf(2, child);
++    return chain.get(2);
++}
++
+ pub fn uiEvent(_: *const Factory, arena: *lp.Arena, typ: String, child: anytype) !*@TypeOf(child) {
+     const chain = try PrototypeChain(
+         &.{ Event, UIEvent, @TypeOf(child) },
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index a88f5bd..d4a3e7b 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1454,6 +1454,7 @@ pub const ServiceWorkerJsApis = flattenTypes(&([_]type{
+     @import("../webapi/ServiceWorker.zig"),
+     @import("../webapi/ServiceWorkerRegistration.zig"),
+     @import("../webapi/event/ExtendableEvent.zig"),
++    @import("../webapi/event/ExtendableMessageEvent.zig"),
+     @import("../webapi/storage/CookieStore.zig"),
+ } ++ worker_common_apis));
+ 
+@@ -1471,6 +1472,7 @@ pub const JsApis = blk: {
+         //ServiceWorker-only, so it isn't in PageJsApis either.
+         @import("../webapi/Clients.zig").JsApi,
+         @import("../webapi/event/ExtendableEvent.zig").JsApi,
++        @import("../webapi/event/ExtendableMessageEvent.zig").JsApi,
+         @import("../webapi/WorkerGlobalScope.zig").JsApi,
+         @import("../webapi/WorkerLocation.zig").JsApi,
+         @import("../webapi/WorkerNavigator.zig").JsApi,
+diff --git a/src/browser/webapi/Event.zig b/src/browser/webapi/Event.zig
+index 5dff46c..b81107e 100644
+--- a/src/browser/webapi/Event.zig
++++ b/src/browser/webapi/Event.zig
+@@ -223,7 +223,7 @@ pub fn is(self: *Event, comptime T: type) ?*T {
+         .gamepad_event => |e| return if (T == @import("event/GamepadEvent.zig")) e else null,
+         .device_orientation_event => |e| return if (T == @import("event/DeviceOrientationEvent.zig")) e else null,
+         .promise_rejection_event => |e| return if (T == @import("event/PromiseRejectionEvent.zig")) e else null,
+-        .extendable_event => |e| return if (T == @import("event/ExtendableEvent.zig")) e else null,
++        .extendable_event => |e| return e.is(T),
+         .submit_event => |e| return if (T == @import("event/SubmitEvent.zig")) e else null,
+         .form_data_event => |e| return if (T == @import("event/FormDataEvent.zig")) e else null,
+         .close_event => |e| return if (T == @import("event/CloseEvent.zig")) e else null,
+diff --git a/src/browser/webapi/ServiceWorkerGlobalScope.zig b/src/browser/webapi/ServiceWorkerGlobalScope.zig
+index 64251e4..5881f34 100644
+--- a/src/browser/webapi/ServiceWorkerGlobalScope.zig
++++ b/src/browser/webapi/ServiceWorkerGlobalScope.zig
+@@ -32,7 +32,7 @@ const WorkerGlobalScope = @import("WorkerGlobalScope.zig");
+ const ServiceWorkerRegistration = @import("ServiceWorkerRegistration.zig");
+ 
+ const CookieStore = @import("storage/CookieStore.zig");
+-const MessageEvent = @import("event/MessageEvent.zig");
++const ExtendableMessageEvent = @import("event/ExtendableMessageEvent.zig");
+ const ExtendableEvent = @import("event/ExtendableEvent.zig");
+ 
+ const log = lp.log;
+@@ -73,6 +73,8 @@ _on_message: ?js.Function.Global = null,
+ // (aka acquireRef() it), dispatch it when the promise resolve, and then
+ // releaseRef().
+ _pending_event: ?*ExtendableEvent = null,
++// Message lifetimes overlap each other and the install/activate lifecycle.
++_message_events: std.DoublyLinkedList = .{},
+ 
+ // Every SWR related to us. If 2 frames register the same URL, that's 2 SWR
+ // minimum (on the page-side, they are immediately created since that's what
+@@ -161,11 +163,23 @@ pub fn deinit(self: *ServiceWorkerGlobalScope) void {
+     }
+ 
+     self.detachRegistrations();
+-    self.releasePendingEvent();
++    if (self._pending_event) |event| event.cancel();
++    var node = self._message_events.first;
++    while (node) |n| : (node = n.next) {
++        const pending: *PendingMessageEvent = @fieldParentPtr("node", n);
++        pending.event._proto.cancel();
++    }
+ 
+     self.releaseScriptLoad();
+     _ = self.unregister();
++    // Promise reactions carry native pointers. Cancel first, but retain those
++    // pointers until context disposal has disabled callbacks and queued tasks.
+     self._proto.deinit();
++    self.releasePendingEvent();
++    while (self._message_events.first) |n| {
++        const pending: *PendingMessageEvent = @fieldParentPtr("node", n);
++        pending.release();
++    }
+     self._arena.release();
+ }
+ 
+@@ -452,6 +466,7 @@ pub fn receiveMessage(self: *ServiceWorkerGlobalScope, data: js.Value) !void {
+         break :blk cloned.persist() catch break :blk null;
+     };
+ 
++    errdefer if (cloned_data) |data_| data_.release();
+     if (self._state == .parsed) {
+         // script hasn't loaded yet
+         try self._pending_messages.append(self._proto.arena, cloned_data);
+@@ -493,6 +508,44 @@ fn drainPendingMessages(self: *ServiceWorkerGlobalScope) void {
+     self._pending_messages.clearRetainingCapacity();
+ }
+ 
++const PendingMessageEvent = struct {
++    node: std.DoublyLinkedList.Node = .{},
++    scope: *ServiceWorkerGlobalScope,
++    event: *ExtendableMessageEvent,
++    wrapper: js.Value.Global,
++
++    fn done(ctx: *anyopaque) void {
++        const self: *PendingMessageEvent = @ptrCast(@alignCast(ctx));
++        self.release();
++    }
++
++    fn release(self: *PendingMessageEvent) void {
++        self.scope._message_events.remove(&self.node);
++        self.wrapper.release();
++        // This can also free self, allocated in the event's arena.
++        self.event.releaseRef(self.scope._proto.page);
++    }
++};
++
++fn dispatchMessage(self: *ServiceWorkerGlobalScope, event: *ExtendableMessageEvent, handler: ?js.Function.Global) !void {
++    const wgs = self._proto;
++    event.acquireRef();
++    const pending = blk: {
++        errdefer event.releaseRef(wgs.page);
++        const pending = try event.asEvent()._arena.create(PendingMessageEvent);
++        var ls: js.Local.Scope = undefined;
++        wgs.js.localScope(&ls);
++        defer ls.deinit();
++        const wrapper = try ls.local.zigValueToJs(event, .{});
++        pending.* = .{ .scope = self, .event = event, .wrapper = try wrapper.persist() };
++        self._message_events.append(&pending.node);
++        break :blk pending;
++    };
++    // Even an interrupted dispatch may already have accepted lifetime promises.
++    defer event._proto.seal(.{ .ctx = pending, .func = PendingMessageEvent.done });
++    try wgs.dispatch(wgs.asEventTarget(), event.asEvent(), handler, .{});
++}
++
+ const ReceiveMessageCallback = struct {
+     data: ?js.Value.Global,
+     arena: *lp.Arena,
+@@ -512,34 +565,27 @@ const ReceiveMessageCallback = struct {
+ 
+     fn run(ctx: *anyopaque) !?u32 {
+         const self: *ReceiveMessageCallback = @ptrCast(@alignCast(ctx));
+-        defer self.deinit();
++        defer cancelled(ctx);
+ 
+         const wgs = self.worker_scope._proto;
+         const target = wgs.asEventTarget();
+ 
+-        const data = self.data orelse {
++        _ = self.data orelse {
+             if (wgs._event_manager.hasDirectListeners(target, "messageerror", null)) {
+-                const event = (try MessageEvent.initTrusted(comptime .wrap("messageerror"), .{
+-                    .bubbles = false,
+-                    .cancelable = false,
+-                }, wgs.page)).asEvent();
+-                try wgs.dispatch(target, event, null, .{});
++                const event = try ExtendableMessageEvent.initTrusted(comptime .wrap("messageerror"), null, wgs.page);
++                try self.worker_scope.dispatchMessage(event, null);
+             }
+             return null;
+         };
+ 
+         const on_message = self.worker_scope._on_message;
+         if (wgs._event_manager.hasDirectListeners(target, "message", on_message) == false) {
+-            data.release();
+             return null;
+         }
+ 
+-        const event = (try MessageEvent.initTrusted(comptime .wrap("message"), .{
+-            .data = .{ .value = self.data.? },
+-            .bubbles = false,
+-            .cancelable = false,
+-        }, wgs.page)).asEvent();
+-        try wgs.dispatch(target, event, on_message, .{});
++        const event = try ExtendableMessageEvent.initTrusted(comptime .wrap("message"), self.data, wgs.page);
++        self.data = null; // the event now owns the structured-cloned payload
++        try self.worker_scope.dispatchMessage(event, on_message);
+         return null;
+     }
+ };
+diff --git a/src/browser/webapi/event/ExtendableEvent.zig b/src/browser/webapi/event/ExtendableEvent.zig
+index 2a09a33..f5cf51e 100644
+--- a/src/browser/webapi/event/ExtendableEvent.zig
++++ b/src/browser/webapi/event/ExtendableEvent.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -30,17 +31,32 @@ const ExtendableEvent = @This();
+ pub const Proto = Event;
+ 
+ _proto: *Event,
++_type: Type = .generic,
++_cancelled: bool = false,
+ 
+ _pending: usize = 0, // Number of waitUntil promises that haven't settled yet.
+ _sealed: bool = false, // once sealed, _pending reaching 0 fires on_done
+ _on_done: ?Callback = null,
+ 
++pub const Type = union(enum) {
++    generic,
++    message: *@import("ExtendableMessageEvent.zig"),
++};
++
++pub fn is(self: *ExtendableEvent, comptime T: type) ?*T {
++    if (T == ExtendableEvent) return self;
++    return switch (self._type) {
++        .generic => null,
++        .message => |event| if (T == @import("ExtendableMessageEvent.zig")) event else null,
++    };
++}
++
+ pub const Callback = struct {
+     ctx: *anyopaque,
+     func: *const fn (ctx: *anyopaque) void,
+ };
+ 
+-const Options = Event.inheritOptions(ExtendableEvent, struct {});
++pub const Options = Event.inheritOptions(ExtendableEvent, struct {});
+ 
+ pub fn init(typ: []const u8, opts_: ?Options, page: *Page) !*ExtendableEvent {
+     const arena = try page.getArena(.tiny, "ExtendableEvent");
+@@ -86,33 +102,41 @@ pub fn asEvent(self: *ExtendableEvent) *Event {
+ }
+ 
+ pub fn waitUntil(self: *ExtendableEvent, value: js.Value) !void {
+-    // Only a lifecycle event we're holding a ref on may register a promise: the
+-    // settle callback below keeps a raw pointer to us, and a page-constructed
+-    // event would be freed by GC before that promise settles.
+-    if (self._proto._is_trusted == false) {
+-        return error.InvalidStateError;
+-    }
++    // Web IDL converts Promise<any> before running the method's steps. A
++    // then getter may reenter JS and settle the last existing lifetime promise.
++    const local = value.local;
++    const promise = if (value.isPromise()) value.toPromise() else blk: {
++        const resolver = local.createPromiseResolver();
++        try resolver.resolveValue(value);
++        break :blk resolver.promise();
++    };
+ 
+-    // Spec: no longer "active" once dispatch is over and nothing is pending.
+-    if (self._sealed and self._pending == 0) {
++    // Recheck after conversion: never attach a raw-pointer reaction once the
++    // dispatcher's retained lifetime has ended.
++    if (self._cancelled or self._proto._is_trusted == false) {
+         return error.InvalidStateError;
+     }
+ 
+-    if (value.isPromise() == false) {
+-        return;
++    // Direct dispatch clears currentTarget before its microtask checkpoint.
++    if (self._pending == 0 and self._proto._current_target == null) {
++        return error.InvalidStateError;
+     }
+ 
+     self._pending += 1;
+-
+-    const promise = value.toPromise();
+-    const local = promise.local;
+     const settled = local.newCallback(onSettled, self);
+     _ = promise.thenAndCatch(settled, settled) catch {
+         self.settle();
+     };
+ }
+ 
++// Keep the native owner alive until the context is destroyed after cancellation.
++pub fn cancel(self: *ExtendableEvent) void {
++    self._cancelled = true;
++    self._on_done = null;
++}
++
+ fn onSettled(self: *ExtendableEvent, _: ?js.Value) void {
++    if (self._cancelled) return;
+     self.settle();
+ }
+ 
+diff --git a/src/browser/webapi/event/ExtendableMessageEvent.zig b/src/browser/webapi/event/ExtendableMessageEvent.zig
+new file mode 100644
+index 0000000..b684d0a
+--- /dev/null
++++ b/src/browser/webapi/event/ExtendableMessageEvent.zig
+@@ -0,0 +1,134 @@
++// Copyright (C) 2026  Lightpanda (Selecy SAS)
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const lp = @import("lightpanda");
++const js = @import("../../js/js.zig");
++const Page = @import("../../Page.zig");
++const Event = @import("../Event.zig");
++const ExtendableEvent = @import("ExtendableEvent.zig");
++const MessagePort = @import("../MessagePort.zig");
++const ServiceWorker = @import("../ServiceWorker.zig");
++
++const ExtendableMessageEvent = @This();
++pub const Proto = ExtendableEvent;
++
++_proto: *ExtendableEvent,
++_data: ?js.Value.Global = null,
++_origin: []const u8 = "",
++_last_event_id: []const u8 = "",
++_source: ?Source = null,
++_ports: []const *MessagePort = &.{},
++
++// Client sources are added with the client reply path, not inferred here.
++pub const Source = union(enum) {
++    worker: *ServiceWorker,
++    port: *MessagePort,
++};
++
++const Options = Event.inheritOptions(ExtendableMessageEvent, struct {
++    data: ?js.Value = null,
++    lastEventId: []const u8 = "",
++    origin: []const u8 = "",
++    ports: []const *MessagePort = &.{},
++    source: ?Source = null,
++});
++
++pub fn init(typ: []const u8, opts: ?Options, page: *Page) !*ExtendableMessageEvent {
++    const arena = try page.getArena(.small, "ExtendableMessageEvent");
++    errdefer arena.release();
++    return initWithTrusted(arena, try lp.String.init(arena.allocator(), typ, .{}), opts, false, page);
++}
++
++// On success the event takes ownership of the already-cloned payload.
++pub fn initTrusted(typ: lp.String, data: ?js.Value.Global, page: *Page) !*ExtendableMessageEvent {
++    const arena = try page.getArena(.small, "ExtendableMessageEvent.trusted");
++    errdefer arena.release();
++    const event = try initWithTrusted(arena, typ, null, true, page);
++    event._data = data;
++    return event;
++}
++
++fn initWithTrusted(arena: *lp.Arena, typ: lp.String, opts_: ?Options, trusted: bool, page: *Page) !*ExtendableMessageEvent {
++    const opts = opts_ orelse Options{};
++    const event = try page.factory.extendableEvent(arena, typ, ExtendableMessageEvent{
++        ._proto = undefined,
++        ._origin = try arena.dupe(u8, opts.origin),
++        ._last_event_id = try arena.dupe(u8, opts.lastEventId),
++        ._source = opts.source,
++        ._ports = try arena.dupe(*MessagePort, opts.ports),
++    });
++    Event.populatePrototypes(event, opts, trusted);
++    // Dictionary conversion and native allocation have both succeeded. Until
++    // here constructor data stays local, including on invalid later fields.
++    if (opts.data) |data| event._data = try data.persist();
++    return event;
++}
++
++pub fn deinit(self: *ExtendableMessageEvent, page: *Page) void {
++    if (self._data) |data| data.release();
++    self._proto.deinit(page);
++}
++
++pub fn acquireRef(self: *ExtendableMessageEvent) void {
++    self._proto.acquireRef();
++}
++
++pub fn releaseRef(self: *ExtendableMessageEvent, page: *Page) void {
++    self.asEvent()._rc.release(self, page);
++}
++
++pub fn asEvent(self: *ExtendableMessageEvent) *Event {
++    return self._proto.asEvent();
++}
++
++fn getData(self: *const ExtendableMessageEvent) ?js.Value.Global {
++    return self._data;
++}
++
++fn getOrigin(self: *const ExtendableMessageEvent) []const u8 {
++    return self._origin;
++}
++
++fn getLastEventId(self: *const ExtendableMessageEvent) []const u8 {
++    return self._last_event_id;
++}
++
++fn getSource(self: *const ExtendableMessageEvent) ?Source {
++    return self._source;
++}
++
++fn getPorts(self: *const ExtendableMessageEvent, exec: *js.Execution) !js.Value {
++    const local = exec.js.local.?;
++    const ports = try local.zigValueToJs(self._ports, .{});
++    const freeze = js.Function{ .local = local, .handle = @ptrCast(js.v8.v8__Global__Get(&exec.js.object_freeze, local.isolate.handle).?) };
++    return freeze.call(js.Value, .{ports});
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(ExtendableMessageEvent);
++    pub const Meta = struct {
++        pub const name = "ExtendableMessageEvent";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(ExtendableMessageEvent.init, .{});
++    pub const data = bridge.accessor(ExtendableMessageEvent.getData, null, .{});
++    pub const origin = bridge.accessor(ExtendableMessageEvent.getOrigin, null, .{});
++    pub const lastEventId = bridge.accessor(ExtendableMessageEvent.getLastEventId, null, .{});
++    pub const source = bridge.accessor(ExtendableMessageEvent.getSource, null, .{});
++    pub const ports = bridge.accessor(ExtendableMessageEvent.getPorts, null, .{});
++};

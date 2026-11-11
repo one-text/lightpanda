@@ -1,0 +1,1247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Sun, 18 Oct 2026 23:34:45 -0300
+Subject: [PATCH] webapi: mock Mac Chrome Widevine capability access natively
+
+Expose secure Window-only requestMediaKeySystemAccess and native
+MediaKeySystemAccess, MediaKeys, MediaKeySession and MediaKeyStatusMap
+interfaces following Chromium 155 IDL. Negotiate a bounded synthetic
+com.widevine.alpha profile: cenc MP4 AVC/AAC, software robustness and
+temporary sessions, with no persistent state or distinctive identifiers.
+The profile targets the MacBook Neo persona; it does not inspect host
+hardware or load a Widevine CDM.
+
+Convert all configuration candidates in WebIDL dictionary order before
+selection, preserve getter failures, close iterators on failed conversion,
+and return independently copied normalized configurations. Share existing
+media permissions-policy checks for encrypted-media delegation.
+
+Provide native branding, receiver checks, readonly empty key-status
+iteration, pending closed promises and session event handlers. Keep
+callback cycles collectible and exceptions page-backed across iframe
+teardown. No license messages, usable keys, authenticated certificates,
+HDCP protection or successful decryption are fabricated.
+
+Add asynchronous HTMLMediaElement mediaKeys/setMediaKeys integration,
+encrypted/waitingforkey handlers, concurrent-operation rejection and
+exclusive key attachment. Store authoritative state on native objects so
+CDP worlds agree; release attached references on detach and page teardown.
+Capture native exposure descriptors and prototypes before page scripts
+can replace global constructors; validate value kinds before V8 casts.
+
+No new upstream tests or benchmark changes. Upstream tests pass 1658/1658;
+temporary diagnostics pass 123/123, including constructor tampering,
+isolated-world attachment, lifecycle and configuration conversion checks.
+
+References:
+- Chromium 155.0.8053.0 third_party/blink/renderer/modules/encryptedmedia
+- https://w3c.github.io/encrypted-media/
+- https://www.apple.com/macbook-neo/specs/
+
+A macOS Chrome CDM capability matrix was not available. Support is an
+explicit bounded synthetic profile, not an observed hardware guarantee;
+real protected playback and the exact macOS version remain out of scope.
+---
+ src/browser/Page.zig                         |   9 +
+ src/browser/js/Context.zig                   |   6 +
+ src/browser/js/Env.zig                       |  57 ++
+ src/browser/js/bridge.zig                    |   1 +
+ src/browser/webapi/AbortSignal.zig           |   9 +-
+ src/browser/webapi/EncryptedMedia.zig        | 616 +++++++++++++++++++
+ src/browser/webapi/EventTarget.zig           |  12 +-
+ src/browser/webapi/MediaDevices.zig          |   4 +-
+ src/browser/webapi/Navigator.zig             |   1 +
+ src/browser/webapi/element/Html.zig          |   2 +-
+ src/browser/webapi/element/html/Media.zig    |   9 +
+ src/browser/webapi/eme_configuration.zig     | 207 +++++++
+ src/browser/webapi/global_event_handlers.zig |   2 +
+ 13 files changed, 929 insertions(+), 6 deletions(-)
+ create mode 100644 src/browser/webapi/EncryptedMedia.zig
+ create mode 100644 src/browser/webapi/eme_configuration.zig
+
+diff --git a/src/browser/Page.zig b/src/browser/Page.zig
+index 63c1654..3c45323 100644
+--- a/src/browser/Page.zig
++++ b/src/browser/Page.zig
+@@ -164,6 +164,10 @@ identity: js.Identity = .{},
+ // weak-callback safety.
+ finalizer_callbacks: std.AutoHashMapUnmanaged(usize, js.FinalizerCallback) = .empty,
+ 
++// Elements are page-owned; release their native MediaKeys references before
++// the finalizer registry and element factory are torn down.
++media_key_attachments: std.DoublyLinkedList = .{},
++
+ // Persisted v8 handles owned by this Page. Handles that outlive the Page are
+ // reset on teardown; handles that can be released early are dropped
+ // individually. See js.GlobalTracker.
+@@ -332,6 +336,11 @@ pub fn deinit(self: *Page) void {
+     session.browser.reportJsHeap();
+     defer session.browser.env.memoryPressureNotification(.moderate);
+ 
++    while (self.media_key_attachments.first) |node| {
++        const media: *@import("webapi/element/html/Media.zig") = @fieldParentPtr("_media_keys_node", node);
++        @import("webapi/EncryptedMedia.zig").clearMediaKeys(media, self);
++    }
++
+     self.identity.deinit();
+     self.identity = .{};
+ 
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index 00ce820..f2c90c9 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -72,6 +72,8 @@ media_device_bindings: ?struct {
+     interfaces: [3]v8.Global,
+ } = null,
+ 
++eme_bindings: ?[10]v8.Global = null,
++eme_hidden: bool = false,
+ video_bindings: ?[4]v8.Global = null,
+ video_decoders: std.DoublyLinkedList = .{},
+ audio_contexts: std.DoublyLinkedList = .{},
+@@ -262,6 +264,9 @@ pub fn deinit(self: *Context) void {
+         v8.v8__Global__Reset(&bindings.define_property);
+         for (&bindings.interfaces) |*binding| v8.v8__Global__Reset(binding);
+     }
++    if (self.eme_bindings) |*bindings| {
++        for (bindings) |*binding| v8.v8__Global__Reset(binding);
++    }
+     if (self.video_bindings) |*bindings| {
+         for (bindings) |*binding| v8.v8__Global__Reset(binding);
+     }
+@@ -297,6 +302,7 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
+         if (self.global == .frame) {
+             const global_obj = v8.v8__Context__Global(ls.local.handle).?;
+             const secure = self.execution.isSecureContext();
++            try env.setEncryptedMediaExposure(self, ls.local.handle, global_obj, secure);
+             env.setVideoDecoderExposure(self, ls.local.handle, global_obj, secure);
+             env.setBatteryExposure(self, ls.local.handle, global_obj, secure);
+             env.setWebShareExposure(self, ls.local.handle, global_obj, secure);
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index ce16889..d584644 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -435,6 +435,11 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+     // a v8 context, we can get our context out
+     v8.v8__Context__SetAlignedPointerInEmbedderData(v8_context, 1, @ptrCast(context));
+ 
++    if (comptime is_frame) try self.captureEncryptedMediaBindings(context, v8_context, global_obj);
++    errdefer if (context.eme_bindings) |*bindings| {
++        for (bindings) |*binding| v8.v8__Global__Reset(binding);
++    };
++
+     if (self.contexts.items.len >= MAX_CONTEXTS) {
+         return error.TooManyContexts;
+     }
+@@ -470,6 +475,58 @@ pub fn hideServiceWorker(self: *const Env, comptime is_frame: bool, v8_context:
+     }
+ }
+ 
++const eme_entries = .{ "requestMediaKeySystemAccess", "MediaKeySystemAccess", "MediaKeys", "MediaKeySession", "MediaKeyStatusMap", "mediaKeys", "setMediaKeys" };
++
++// Run before page code can replace global constructors or their properties.
++fn captureEncryptedMediaBindings(self: *const Env, ctx: *Context, v8_context: *const v8.Context, global_obj: *const v8.Object) !void {
++    const isolate = self.isolate.handle;
++    var bindings: [10]v8.Global = @splat(.{ .data_ptr = 0 });
++    errdefer for (&bindings) |*binding| v8.v8__Global__Reset(binding);
++    var prototypes: [2]*const v8.Object = undefined;
++    inline for (.{ "Navigator", "HTMLMediaElement" }, 0..) |name, i| {
++        const constructor = v8.v8__Object__Get(global_obj, v8_context, self.isolate.initStringHandle(name)) orelse return error.JsException;
++        if (!v8.v8__Value__IsFunction(constructor)) return error.JsException;
++        const prototype = v8.v8__Object__Get(@ptrCast(constructor), v8_context, self.isolate.initStringHandle("prototype")) orelse return error.JsException;
++        if (!v8.v8__Value__IsObject(prototype)) return error.JsException;
++        prototypes[i] = @ptrCast(prototype);
++        v8.v8__Global__New(isolate, prototype, &bindings[8 + i]);
++    }
++    const targets = [_]*const v8.Object{ prototypes[0], global_obj, global_obj, global_obj, global_obj, prototypes[1], prototypes[1] };
++    inline for (eme_entries, 0..) |name, i| {
++        const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(targets[i], v8_context, self.isolate.initStringHandle(name)) orelse return error.JsException;
++        if (!v8.v8__Value__IsObject(descriptor)) return error.JsException;
++        v8.v8__Global__New(isolate, descriptor, &bindings[i]);
++    }
++    const object = v8.v8__Object__Get(global_obj, v8_context, self.isolate.initStringHandle("Object")) orelse return error.JsException;
++    if (!v8.v8__Value__IsObject(object)) return error.JsException;
++    const define = v8.v8__Object__Get(@ptrCast(object), v8_context, self.isolate.initStringHandle("defineProperty")) orelse return error.JsException;
++    if (!v8.v8__Value__IsFunction(define)) return error.JsException;
++    v8.v8__Global__New(isolate, define, &bindings[7]);
++    ctx.eme_bindings = bindings;
++}
++
++pub fn setEncryptedMediaExposure(self: *const Env, ctx: *Context, v8_context: *const v8.Context, global_obj: *const v8.Object, secure: bool) !void {
++    if (secure == !ctx.eme_hidden) return;
++    const isolate = self.isolate.handle;
++    const bindings = &(ctx.eme_bindings orelse return error.JsException);
++    const navigator_prototype: *const v8.Object = @ptrCast(v8.v8__Global__Get(&bindings[8], isolate));
++    const media_prototype: *const v8.Object = @ptrCast(v8.v8__Global__Get(&bindings[9], isolate));
++    const targets = [_]*const v8.Object{ navigator_prototype, global_obj, global_obj, global_obj, global_obj, media_prototype, media_prototype };
++    inline for (eme_entries, 0..) |name, i| {
++        const key = self.isolate.initStringHandle(name);
++        if (secure) {
++            const args = [_]?*const v8.Value{ @ptrCast(targets[i]), key, v8.v8__Global__Get(&bindings[i], isolate) };
++            const define: *const v8.Function = @ptrCast(v8.v8__Global__Get(&bindings[7], isolate));
++            _ = v8.v8__Function__Call(define, v8_context, @ptrCast(global_obj), args.len, &args) orelse return error.JsException;
++        } else {
++            var result: v8.MaybeBool = undefined;
++            v8.v8__Object__Delete(targets[i], v8_context, key, &result);
++            if (!result.has_value or !result.value) return error.JsException;
++        }
++    }
++    ctx.eme_hidden = !secure;
++}
++
+ pub fn setVideoDecoderExposure(self: *const Env, ctx: *Context, v8_context: *const v8.Context, global_obj: *const v8.Object, secure: bool) void {
+     if (secure == (ctx.video_bindings == null)) return;
+     const isolate = self.isolate.handle;
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index f8c4f5b..784866b 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1029,6 +1029,7 @@ pub const SubType = enum {
+ 
+ // APIs for Page/Window contexts. Used by Snapshot.zig for Page snapshot creation.
+ pub const PageJsApis = flattenTypes(&.{
++    @import("../webapi/EncryptedMedia.zig"),
+     @import("../webapi/AudioContext.zig"),
+     @import("../webapi/SpeechSynthesis.zig"),
+     @import("../webapi/VideoDecoder.zig"),
+diff --git a/src/browser/webapi/AbortSignal.zig b/src/browser/webapi/AbortSignal.zig
+index 729978b..1b6d4b5 100644
+--- a/src/browser/webapi/AbortSignal.zig
++++ b/src/browser/webapi/AbortSignal.zig
+@@ -42,6 +42,7 @@ const Dependend = union(enum) {
+     // signals too, unlike this union's markAborted).
+     scheduler_task: *Scheduler.Task,
+     audio_listener: *@import("AudioContext.zig").ListenerRoot,
++    eme_listener: *@import("EncryptedMedia.zig").Session.ListenerRoot,
+ 
+     // Returns false if the dependent was already aborted, in which case no
+     // abort event must be dispatched for it.
+@@ -56,14 +57,14 @@ const Dependend = union(enum) {
+                 try dep.markAborted(exec);
+                 return true;
+             },
+-            .scheduler_task, .audio_listener => return false,
++            .scheduler_task, .audio_listener, .eme_listener => return false,
+         }
+     }
+ 
+     fn dispatchAbortEvent(self: Dependend, exec: *const Execution) !void {
+         switch (self) {
+             .signal => |dep| try dep.dispatchAbortEvent(exec),
+-            .model_context_tool, .scheduler_task, .audio_listener => {},
++            .model_context_tool, .scheduler_task, .audio_listener, .eme_listener => {},
+         }
+     }
+ };
+@@ -159,6 +160,10 @@ fn markAborted(self: *AbortSignal, reason_: ?Reason, exec: *const Execution) !vo
+             _ = self._dependents.swapRemove(index);
+             dep.audio_listener.signal = null;
+             dep.audio_listener.abort(exec);
++        } else if (dep == .eme_listener) {
++            _ = self._dependents.swapRemove(index);
++            dep.eme_listener.signal = null;
++            dep.eme_listener.abort(exec);
+         } else {
+             if (dep == .scheduler_task) dep.scheduler_task.onAbort(self._reason, exec);
+             index += 1;
+diff --git a/src/browser/webapi/EncryptedMedia.zig b/src/browser/webapi/EncryptedMedia.zig
+new file mode 100644
+index 0000000..50de2e0
+--- /dev/null
++++ b/src/browser/webapi/EncryptedMedia.zig
+@@ -0,0 +1,616 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const Navigator = @import("Navigator.zig");
++const Media = @import("element/html/Media.zig");
++const Event = @import("Event.zig");
++const EventTarget = @import("EventTarget.zig");
++const EventManagerBase = @import("../EventManagerBase.zig");
++const DOMException = @import("DOMException.zig");
++const Speech = @import("SpeechSynthesis.zig");
++const Conversion = @import("media_constraints.zig");
++const Config = @import("eme_configuration.zig");
++
++pub fn registerTypes() []const type {
++    return &.{ Access, Keys, Session, StatusMap, EmptyIterator };
++}
++
++fn active(navigator: *const Navigator) bool {
++    if (navigator._pdf_detached) return false;
++    const frame = navigator._frame orelse return false;
++    return frame.document._frame == frame;
++}
++
++fn reject(exec: *js.Execution, caught: ?*js.TryCatch, err: anyerror) !js.Promise {
++    if (err == error.ExecutionTerminated or exec.js.env.terminatePending()) return error.ExecutionTerminated;
++    if (err == error.OutOfMemory) return err;
++    const local = exec.js.local.?;
++    const resolver = local.createPromiseResolver();
++    const exception_value = if (caught) |value| value.exceptionValue() else null;
++    const reason = if (exception_value) |value| value else switch (err) {
++        error.TypeError, error.InvalidArgument => js.Value{ .local = local, .handle = local.isolate.createTypeError("Invalid encrypted media arguments") },
++        else => blk: {
++            const exception = DOMException.fromError(err) orelse return err;
++            const stored = try exec._factory.create(exception);
++            break :blk try local.zigValueToJs(stored, .{});
++        },
++    };
++    try resolver.rejectValue(reason);
++    return resolver.promise();
++}
++fn throwDom(exec: *js.Execution, err: anyerror) anyerror {
++    const exception = DOMException.fromError(err) orelse return err;
++    const stored = exec._factory.create(exception) catch |failure| return failure;
++    const local = exec.js.local.?;
++    const value = local.zigValueToJs(stored, .{}) catch |failure| return failure;
++    _ = local.isolate.throwException(value.handle);
++    return error.JsException;
++}
++fn resolved(exec: *js.Execution, value: anytype) !js.Promise {
++    const local = exec.js.local.?;
++    const resolver = local.createPromiseResolver();
++    try resolver.resolveValue(try local.zigValueToJs(value, .{}));
++    return resolver.promise();
++}
++
++pub fn request(navigator: *Navigator, key_system: js.Value, configurations: js.Value, exec: *js.Execution) !js.Promise {
++    var caught: js.TryCatch = undefined;
++    caught.init(exec.js.local.?);
++    defer caught.deinit();
++    const access = negotiate(navigator, key_system, configurations, exec) catch |err| return reject(exec, &caught, err);
++    defer access.releaseRef(exec.page);
++    return resolved(exec, access);
++}
++fn negotiate(navigator: *Navigator, key_system: js.Value, configurations: js.Value, exec: *js.Execution) !*Access {
++    const name = try (try Conversion.domString(key_system)).toSlice();
++    const candidates = try Config.configurations(configurations, exec.call_arena);
++    if (name.len == 0 or candidates.len == 0) return error.TypeError;
++    if (!active(navigator)) return error.InvalidStateError;
++    if (!std.mem.eql(u8, name, "com.widevine.alpha")) return error.NotSupported;
++    const frame = navigator._frame.?;
++    if (!@import("MediaDevices.zig").allowed(frame, "encrypted-media")) return error.SecurityError;
++    for (candidates) |candidate| {
++        if (try Config.select(candidate, exec.call_arena)) |selected| {
++            const arena = try exec.getArena(.small, "MediaKeySystemAccess");
++            errdefer arena.release();
++            const self = try arena.create(Access);
++            self.* = .{ ._arena = arena, ._rc = lp.RC.init(1), ._navigator = navigator, ._config = try Config.clone(selected, arena.allocator()) };
++            return self;
++        }
++    }
++    return error.NotSupported;
++}
++
++pub fn mediaKeys(media: *const Media) ?*Keys {
++    return media._media_keys;
++}
++pub fn clearMediaKeys(media: *Media, page: *Page) void {
++    const keys = media._media_keys orelse return;
++    page.media_key_attachments.remove(&media._media_keys_node);
++    media._media_keys = null;
++    keys._media = null;
++    keys.releaseRef(page);
++}
++pub fn setMediaKeys(media: *Media, keys: js.Nullable(*Keys), exec: *js.Execution) !js.Promise {
++    if (media._attaching_media_keys) return reject(exec, null, error.InvalidStateError);
++    const local = exec.js.local.?;
++    const next = try local.zigValueToJs(keys.value, .{});
++    if (media._media_keys == keys.value) return resolved(exec, js.Undefined{});
++    const owner = try local.zigValueToJs(media, .{});
++    const task = try exec._factory.create(Attachment{ .media = media, .exec = exec, .owner = undefined, .keys = undefined, .resolver = undefined });
++    errdefer exec._factory.destroy(task);
++    task.owner = try owner.persist();
++    errdefer task.owner.release();
++    task.keys = try next.persist();
++    errdefer task.keys.release();
++    const resolver = local.createPromiseResolver();
++    task.resolver = try resolver.persist();
++    errdefer task.resolver.release();
++    try exec._scheduler.add(task, Attachment.run, 0, .{ .name = "media.setMediaKeys", .finalizer = Attachment.cancelled });
++    media._attaching_media_keys = true;
++    return resolver.promise();
++}
++const Attachment = struct {
++    media: *Media,
++    exec: *js.Execution,
++    owner: js.Value.Global,
++    keys: js.Value.Global,
++    resolver: js.PromiseResolver.Global,
++
++    fn deinit(self: *Attachment) void {
++        self.owner.release();
++        self.keys.release();
++        self.resolver.release();
++        self.exec._factory.destroy(self);
++    }
++    fn cancelled(ptr: *anyopaque) void {
++        const self: *Attachment = @ptrCast(@alignCast(ptr));
++        self.media._attaching_media_keys = false;
++        self.deinit();
++    }
++    fn attach(self: *Attachment, local: *const js.Local) !void {
++        const value = self.keys.local(local);
++        const next = if (value.isNull()) null else try value.toZig(*Keys);
++        if (next) |keys| {
++            if (!active(keys._navigator)) return error.InvalidStateError;
++            if (keys._media != null and keys._media != self.media) return error.QuotaExceeded;
++        }
++        clearMediaKeys(self.media, self.exec.page);
++        if (next) |keys| {
++            keys.acquireRef();
++            keys._media = self.media;
++            self.media._media_keys = keys;
++            self.exec.page.media_key_attachments.append(&self.media._media_keys_node);
++        }
++    }
++    fn run(ptr: *anyopaque) !?u32 {
++        const self: *Attachment = @ptrCast(@alignCast(ptr));
++        defer self.deinit();
++        var scope: js.Local.Scope = undefined;
++        self.exec.js.localScope(&scope);
++        defer scope.deinit();
++        const local = &scope.local;
++        const resolver = self.resolver.local(local);
++        self.attach(local) catch |err| {
++            self.media._attaching_media_keys = false;
++            const exception = DOMException.fromError(err) orelse return err;
++            const stored = try self.exec._factory.create(exception);
++            try resolver.rejectValue(try local.zigValueToJs(stored, .{}));
++            local.runMicrotasks();
++            return null;
++        };
++        self.media._attaching_media_keys = false;
++        try resolver.resolveValue(try local.zigValueToJs(js.Undefined{}, .{}));
++        local.runMicrotasks();
++        return null;
++    }
++};
++
++pub fn MediaHandler(comptime name: @import("global_event_handlers.zig").Handler) type {
++    return struct {
++        pub fn get(media: *Media, frame: *@import("../Frame.zig")) !?js.Function.Global {
++            return @import("../Factory.zig").protoOf(media).getAttributeFunction(name, frame);
++        }
++        pub fn set(media: *Media, callback: ?js.Function.Global, frame: *@import("../Frame.zig")) !void {
++            try @import("../Factory.zig").protoOf(media).setAttributeListener(name, callback, frame);
++        }
++    };
++}
++
++pub const Access = struct {
++    _arena: *lp.Arena,
++    _rc: lp.RC = .{},
++    _navigator: *Navigator,
++    _config: Config.Configuration,
++
++    pub fn acquireRef(self: *Access) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *Access, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *Access, _: *Page) void {
++        self._arena.release();
++    }
++    pub fn creationContext(self: *const Access, local: *const js.Local) *const js.v8.Context {
++        return self._navigator.creationContext(local);
++    }
++    fn keySystem(_: *const Access) []const u8 {
++        return "com.widevine.alpha";
++    }
++    fn getConfiguration(self: *const Access, exec: *js.Execution) !js.Object {
++        return Config.serialize(self._config, exec.js.local.?);
++    }
++    fn createMediaKeys(self: *const Access, exec: *js.Execution) !js.Promise {
++        if (!active(self._navigator)) return reject(exec, null, error.InvalidStateError);
++        const arena = try exec.getArena(.tiny, "MediaKeys");
++        var owned = true;
++        errdefer if (owned) arena.release();
++        const keys = try arena.create(Keys);
++        keys.* = .{ ._arena = arena, ._rc = lp.RC.init(1), ._navigator = self._navigator };
++        owned = false;
++        defer keys.releaseRef(exec.page);
++        return resolved(exec, keys);
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Access);
++        pub const Meta = struct {
++            pub const name = "MediaKeySystemAccess";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub const creation_context = Access.creationContext;
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const keySystem = bridge.accessor(Access.keySystem, null, .{});
++        pub const getConfiguration = bridge.function(Access.getConfiguration, .{});
++        pub const createMediaKeys = bridge.function(Access.createMediaKeys, .{});
++    };
++};
++
++pub const Keys = struct {
++    _arena: *lp.Arena,
++    _rc: lp.RC = .{},
++    _navigator: *Navigator,
++    _media: ?*Media = null,
++
++    pub fn acquireRef(self: *Keys) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *Keys, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *Keys, _: *Page) void {
++        self._arena.release();
++    }
++    pub fn creationContext(self: *const Keys, local: *const js.Local) *const js.v8.Context {
++        return self._navigator.creationContext(local);
++    }
++    fn createSession(self: *Keys, session_type: ?js.Value, exec: *js.Execution) !js.Value {
++        const kind = if (session_type) |value| if (!value.isUndefined()) try (try Conversion.domString(value)).toSlice() else "temporary" else "temporary";
++        if (!std.mem.eql(u8, kind, "temporary")) {
++            if (std.mem.eql(u8, kind, "persistent-license")) return throwDom(exec, error.NotSupported);
++            return error.TypeError;
++        }
++        if (!active(self._navigator)) return throwDom(exec, error.InvalidStateError);
++        const session = try Session.init(self._navigator, exec);
++        defer session.releaseRef(exec.page);
++        return exec.js.local.?.zigValueToJs(session, .{});
++    }
++    fn setServerCertificate(self: *Keys, value: js.Value, exec: *js.Execution) !js.Promise {
++        var caught: js.TryCatch = undefined;
++        caught.init(exec.js.local.?);
++        defer caught.deinit();
++        const bytes = value.toZig(js.BufferSource) catch |err| return reject(exec, &caught, err);
++        if (bytes.bytes.len == 0) return error.TypeError;
++        if (!active(self._navigator)) return reject(exec, &caught, error.InvalidStateError);
++        // No CDM: do not accept a certificate which cannot be authenticated.
++        return reject(exec, &caught, error.NotSupported);
++    }
++    fn getStatusForPolicy(self: *Keys, value: ?js.Value, exec: *js.Execution) !js.Promise {
++        var caught: js.TryCatch = undefined;
++        caught.init(exec.js.local.?);
++        defer caught.deinit();
++        return self.policy(value, exec) catch |err| reject(exec, &caught, err);
++    }
++    fn policy(self: *Keys, value: ?js.Value, exec: *js.Execution) !js.Promise {
++        const object = try Conversion.dictionary(value) orelse return error.TypeError;
++        const member = try object.get("minHdcpVersion");
++        if (member.isUndefined()) return error.TypeError;
++        const version = try (try Conversion.domString(member)).toSlice();
++        if (!active(self._navigator)) return error.InvalidStateError;
++        if (version.len != 0) return error.NotSupported;
++        return resolved(exec, "usable");
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Keys);
++        pub const Meta = struct {
++            pub const name = "MediaKeys";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub const creation_context = Keys.creationContext;
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const createSession = bridge.function(Keys.createSession, .{});
++        pub const setServerCertificate = bridge.function(Keys.setServerCertificate, .{});
++        pub const getStatusForPolicy = bridge.function(Keys.getStatusForPolicy, .{});
++    };
++};
++
++pub const Session = struct {
++    pub const Proto = EventTarget;
++    _proto: *EventTarget,
++    _arena: *lp.Arena,
++    _rc: lp.RC = .{},
++    _navigator: *Navigator,
++    _events: EventManagerBase,
++    _handlers: [2]Speech.Handler = undefined,
++    _listener_roots: std.DoublyLinkedList = .{},
++    _listener_pool: std.heap.MemoryPool(ListenerRoot) = .empty,
++    _listener_local: ?*const js.Local = null,
++    _statuses: StatusMap = undefined,
++    _initialized: bool = false,
++    _closed_cached: bool = false,
++
++    fn init(navigator: *Navigator, exec: *js.Execution) !*Session {
++        const arena = try exec.getArena(.small, "MediaKeySession");
++        errdefer arena.release();
++        const self = try exec._factory.eventTargetWithAllocator(arena.allocator(), Session{
++            ._proto = undefined,
++            ._arena = arena,
++            ._rc = lp.RC.init(1),
++            ._navigator = navigator,
++            ._events = .init(arena.allocator()),
++        });
++        self._statuses = .{ ._session = self };
++        for ([_][]const u8{ "keystatuseschange", "message" }, &self._handlers) |name, *handler| {
++            handler.* = .{ .target = self._proto, .events = &self._events, .name = name, .weak = true };
++        }
++        return self;
++    }
++    pub fn acquireRef(self: *Session) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *Session, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *Session, _: *Page) void {
++        for (&self._handlers) |*handler| handler.deinit();
++        while (self._listener_roots.first) |node| {
++            const root: *ListenerRoot = @fieldParentPtr("node", node);
++            root.dispose(null);
++        }
++        self._arena.release();
++    }
++    pub fn creationContext(self: *const Session, local: *const js.Local) *const js.v8.Context {
++        return self._navigator.creationContext(local);
++    }
++    fn sessionId(_: *const Session) []const u8 {
++        return "";
++    }
++    fn expiration(_: *const Session) f64 {
++        return std.math.nan(f64);
++    }
++    fn closed(self: *Session, exec: *js.Execution) !js.Promise {
++        const local = exec.js.local.?;
++        const data = try Speech.callbackData(self._proto, local);
++        if (self._closed_cached) {
++            const saved = try data.get("closed");
++            return .{ .local = local, .handle = @ptrCast(saved.handle) };
++        }
++        const resolver = local.createPromiseResolver();
++        try Config.put(data, "closed", resolver.promise());
++        self._closed_cached = true;
++        // Without an established CDM session there is nothing to close.
++        return resolver.promise();
++    }
++    fn statuses(self: *Session, exec: *js.Execution) !*StatusMap {
++        const local = exec.js.local.?;
++        const map = try local.zigValueToJs(&self._statuses, .{});
++        const owner = try local.zigValueToJs(self, .{});
++        const key: *const js.v8.Private = @ptrCast(js.v8.v8__Global__Get(&local.ctx.env.private_symbols.speech_callbacks.handle, local.isolate.handle).?);
++        var result: js.v8.MaybeBool = undefined;
++        js.v8.v8__Object__SetPrivate(@ptrCast(map.handle), local.handle, key, owner.handle, &result);
++        if (!result.has_value or !result.value) return error.JsException;
++        return &self._statuses;
++    }
++    fn generateRequest(self: *Session, kind: js.Value, input: js.Value, exec: *js.Execution) !js.Promise {
++        var caught: js.TryCatch = undefined;
++        caught.init(exec.js.local.?);
++        defer caught.deinit();
++        self.validateRequest(kind, input) catch |err| return reject(exec, &caught, err);
++        // Capability negotiation is mocked; no license requests or keys are fabricated.
++        return reject(exec, &caught, error.NotSupported);
++    }
++    fn validateRequest(self: *Session, kind: js.Value, input: js.Value) !void {
++        const init_type = try (try Conversion.domString(kind)).toSlice();
++        const bytes = try input.toZig(js.BufferSource);
++        if (self._initialized or !active(self._navigator)) return error.InvalidStateError;
++        self._initialized = true;
++        if (init_type.len == 0 or bytes.bytes.len == 0) return error.TypeError;
++    }
++    fn load(self: *Session, value: js.Value, exec: *js.Execution) !js.Promise {
++        var caught: js.TryCatch = undefined;
++        caught.init(exec.js.local.?);
++        defer caught.deinit();
++        _ = Conversion.domString(value) catch |err| return reject(exec, &caught, err);
++        if (self._initialized or !active(self._navigator)) return reject(exec, &caught, error.InvalidStateError);
++        self._initialized = true;
++        // Only temporary sessions were negotiated.
++        return error.TypeError;
++    }
++    fn update(self: *Session, input: js.Value, exec: *js.Execution) !js.Promise {
++        var caught: js.TryCatch = undefined;
++        caught.init(exec.js.local.?);
++        defer caught.deinit();
++        const bytes = input.toZig(js.BufferSource) catch |err| return reject(exec, &caught, err);
++        _ = bytes;
++        _ = self;
++        return reject(exec, &caught, error.InvalidStateError); // No request has produced a callable session.
++    }
++    fn close(_: *Session, exec: *js.Execution) !js.Promise {
++        return reject(exec, null, error.InvalidStateError); // No callable CDM session.
++    }
++    fn remove(_: *Session, exec: *js.Execution) !js.Promise {
++        return reject(exec, null, error.InvalidStateError);
++    }
++    pub fn dispatch(self: *Session, event: *Event, exec: *js.Execution) !void {
++        const local = exec.js.local.?;
++        const wrapper = try local.zigValueToJs(event, .{});
++        const owner = try local.zigValueToJs(self, .{});
++        const key: *const js.v8.Private = @ptrCast(js.v8.v8__Global__Get(&local.ctx.env.private_symbols.speech_callbacks.handle, local.isolate.handle).?);
++        var result: js.v8.MaybeBool = undefined;
++        js.v8.v8__Object__SetPrivate(@ptrCast(wrapper.handle), local.handle, key, owner.handle, &result);
++        if (!result.has_value or !result.value) return error.JsException;
++        const previous = self._listener_local;
++        self._listener_local = local;
++        defer self._listener_local = previous;
++        try Speech.dispatchDirect(self._proto, &self._events, event, exec);
++    }
++
++    pub fn registerListener(self: *Session, typ: []const u8, callback: EventManagerBase.Callback, options: EventManagerBase.RegisterOptions, exec: *js.Execution) !void {
++        const listener = (try self._events.register(self._proto, typ, callback, options)) orelse return;
++        const slot = switch (listener.function) {
++            .value => |value| value.slot,
++            .object => |value| value.slot,
++            .string => unreachable,
++        };
++        errdefer {
++            self._events.remove(self._proto, typ, callback, options.capture);
++            slot.release();
++        }
++        const root = try self._listener_pool.create(self._arena.allocator());
++        errdefer self._listener_pool.destroy(root);
++        const value = switch (callback) {
++            .function => |f| js.Value{ .local = f.local, .handle = @ptrCast(f.handle) },
++            .object => |o| o.toValue(),
++        };
++        const data = try Speech.callbackData(self._proto, exec.js.local.?);
++        root.* = .{ .session = self, .listener = listener, .slot = slot, .data = try data.persist(), .signal = options.signal };
++        errdefer root.data.release();
++        const key = try std.fmt.bufPrint(&root.key, "listener{d}", .{@intFromPtr(root)});
++        root.key_len = key.len;
++        try Config.put(data, key, value);
++        if (options.signal) |signal| try signal._dependents.append(exec.arena, .{ .eme_listener = root });
++        js.v8.v8__Global__SetWeak(&slot.handle);
++        js.v8.v8__Global__SetWeak(&root.data.slot.handle);
++        self._listener_roots.append(&root.node);
++        listener.on_remove = .{ .ctx = root, .callback = ListenerRoot.removed };
++    }
++    pub fn removeListener(self: *Session, typ: []const u8, callback: EventManagerBase.Callback, capture: bool, exec: *js.Execution) void {
++        const previous = self._listener_local;
++        self._listener_local = exec.js.local.?;
++        defer self._listener_local = previous;
++        self._events.remove(self._proto, typ, callback, capture);
++    }
++    pub const ListenerRoot = struct {
++        session: *Session,
++        listener: *EventManagerBase.Listener,
++        slot: *js.GlobalSlot,
++        data: js.Object.Global,
++        signal: ?*@import("AbortSignal.zig"),
++        node: std.DoublyLinkedList.Node = .{},
++        key: [32]u8 = undefined,
++        key_len: usize = 0,
++        fn dispose(self: *ListenerRoot, local: ?*const js.Local) void {
++            const session = self.session;
++            if (local) |l| {
++                const data = self.data.local(l);
++                var deleted: js.v8.MaybeBool = undefined;
++                js.v8.v8__Object__Delete(data.handle, l.handle, @ptrCast(l.newString(self.key[0..self.key_len]).handle), &deleted);
++            }
++            if (self.signal) |signal| {
++                for (signal._dependents.items, 0..) |dep, i| {
++                    if (dep == .eme_listener and dep.eme_listener == self) {
++                        _ = signal._dependents.swapRemove(i);
++                        break;
++                    }
++                }
++            }
++            session._listener_roots.remove(&self.node);
++            self.slot.release();
++            self.data.release();
++            session._listener_pool.destroy(self);
++        }
++        fn removed(ptr: *anyopaque) void {
++            const self: *ListenerRoot = @ptrCast(@alignCast(ptr));
++            self.dispose(self.session._listener_local);
++        }
++        pub fn abort(self: *ListenerRoot, exec: *const js.Execution) void {
++            const session = self.session;
++            var scope: js.Local.Scope = undefined;
++            exec.js.localScope(&scope);
++            defer scope.deinit();
++            _ = scope.local.zigValueToJs(session, .{}) catch return;
++            const previous = session._listener_local;
++            session._listener_local = &scope.local;
++            defer session._listener_local = previous;
++            const list = session._events.getListeners(session._proto, self.listener.typ) orelse return;
++            session._events.removeListener(list, self.listener);
++        }
++    };
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Session);
++        pub const Meta = struct {
++            pub const name = "MediaKeySession";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub const creation_context = Session.creationContext;
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const sessionId = bridge.accessor(Session.sessionId, null, .{});
++        pub const expiration = bridge.accessor(Session.expiration, null, .{});
++        pub const closed = bridge.accessor(Session.closed, null, .{});
++        pub const keyStatuses = bridge.accessor(Session.statuses, null, .{});
++        pub const onkeystatuseschange = bridge.accessor(Speech.Binding(Session, 0).get, Speech.Binding(Session, 0).set, .{});
++        pub const onmessage = bridge.accessor(Speech.Binding(Session, 1).get, Speech.Binding(Session, 1).set, .{});
++        pub const generateRequest = bridge.function(Session.generateRequest, .{});
++        pub const load = bridge.function(Session.load, .{});
++        pub const update = bridge.function(Session.update, .{});
++        pub const close = bridge.function(Session.close, .{});
++        pub const remove = bridge.function(Session.remove, .{});
++    };
++};
++
++pub const StatusMap = struct {
++    _session: *Session,
++    pub fn acquireRef(self: *StatusMap) void {
++        self._session.acquireRef();
++    }
++    pub fn releaseRef(self: *StatusMap, page: *Page) void {
++        self._session.releaseRef(page);
++    }
++    pub fn creationContext(self: *const StatusMap, local: *const js.Local) *const js.v8.Context {
++        return self._session.creationContext(local);
++    }
++    fn size(_: *const StatusMap) u32 {
++        return 0;
++    }
++    fn has(_: *const StatusMap, input: js.Value) !bool {
++        _ = try input.toZig(js.BufferSource);
++        return false;
++    }
++    fn get(_: *const StatusMap, input: js.Value) !js.Undefined {
++        _ = try input.toZig(js.BufferSource);
++        return .{};
++    }
++    fn entries(_: *const StatusMap, exec: *js.Execution) !*EmptyIterator {
++        return exec._factory.create(EmptyIterator{});
++    }
++    fn forEach(_: *const StatusMap, _: js.Function, _: ?js.Value) void {}
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(StatusMap);
++        pub const Meta = struct {
++            pub const name = "MediaKeyStatusMap";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub const creation_context = StatusMap.creationContext;
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const size = bridge.accessor(StatusMap.size, null, .{});
++        pub const has = bridge.function(StatusMap.has, .{});
++        pub const get = bridge.function(StatusMap.get, .{});
++        pub const entries = bridge.function(StatusMap.entries, .{});
++        pub const keys = bridge.function(StatusMap.entries, .{});
++        pub const values = bridge.function(StatusMap.entries, .{});
++        pub const forEach = bridge.function(StatusMap.forEach, .{});
++        pub const symbol_iterator = bridge.iterator(StatusMap.entries, .{});
++    };
++};
++const EmptyIterator = struct {
++    _rc: lp.RC = .{},
++    pub fn acquireRef(self: *EmptyIterator) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *EmptyIterator, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *EmptyIterator, page: *Page) void {
++        page.factory.destroy(self);
++    }
++    fn next(_: *EmptyIterator) struct { done: bool, value: js.Undefined } {
++        return .{ .done = true, .value = .{} };
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(EmptyIterator);
++        pub const Meta = struct {
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const next = bridge.function(EmptyIterator.next, .{});
++        pub const symbol_iterator = bridge.iterator(EmptyIterator, .{});
++    };
++};
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index fc78d77..afa42ad 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -69,6 +69,7 @@ const SpeechSynthesis = @import("SpeechSynthesis.zig");
+ const SpeechSynthesisUtterance = @import("SpeechSynthesisUtterance.zig");
+ const VideoDecoder = @import("VideoDecoder.zig");
+ const AudioContext = @import("AudioContext.zig");
++const MediaKeySession = @import("EncryptedMedia.zig").Session;
+ 
+ const EventTarget = @This();
+ 
+@@ -95,6 +96,7 @@ pub const Type = enum(u8) {
+     idb_request,
+     idb_transaction,
+     media_devices,
++    media_key_session,
+     media_query_list,
+     message_port,
+     navigation,
+@@ -139,6 +141,7 @@ pub fn Subtype(comptime tag: Type) type {
+         .idb_request => IDBRequest,
+         .idb_transaction => IDBTransaction,
+         .media_devices => MediaDevices,
++        .media_key_session => MediaKeySession,
+         .media_query_list => MediaQueryList,
+         .message_port => MessagePort,
+         .navigation => Navigation,
+@@ -231,7 +234,7 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
+             try self.subtype(Subtype(tag))._audio.dispatchAt(self, event, exec);
+             return !event._cancelable or !event._prevent_default;
+         },
+-        inline .speech_synthesis, .speech_synthesis_utterance, .video_decoder => |tag| {
++        inline .speech_synthesis, .speech_synthesis_utterance, .video_decoder, .media_key_session => |tag| {
+             try self.subtype(Subtype(tag)).dispatch(event, exec);
+             return !event._cancelable or !event._prevent_default;
+         },
+@@ -349,6 +352,7 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
+             return;
+         },
+         .speech_synthesis_utterance => return self.subtype(SpeechSynthesisUtterance).registerListener(typ, em_callback, options, exec),
++        .media_key_session => return self.subtype(MediaKeySession).registerListener(typ, em_callback, options, exec),
+         .video_decoder => return self.subtype(VideoDecoder).registerListener(typ, em_callback, options, exec),
+         inline .audio_node, .base_audio_context => |tag| return self.subtype(Subtype(tag))._audio.registerListenerAt(self, typ, em_callback, options, exec),
+         else => {},
+@@ -404,6 +408,10 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
+             self.subtype(Subtype(tag))._audio.removeListenerAt(self, typ, em_callback, use_capture, exec);
+             return;
+         },
++        .media_key_session => {
++            self.subtype(MediaKeySession).removeListener(typ, em_callback, use_capture, exec);
++            return;
++        },
+         inline .speech_synthesis, .speech_synthesis_utterance, .video_decoder => |tag| {
+             self.subtype(Subtype(tag))._events.remove(self, typ, em_callback, use_capture);
+             return;
+@@ -432,6 +440,7 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         .base_audio_context => writer.writeAll("<AudioContext>"),
+         .battery_manager => writer.writeAll("<BatteryManager>"),
+         .media_devices => writer.writeAll("<MediaDevices>"),
++        .media_key_session => writer.writeAll("<MediaKeySession>"),
+         .media_query_list => writer.writeAll("<MediaQueryList>"),
+         .message_port => writer.writeAll("<MessagePort>"),
+         .broadcast_channel => writer.writeAll("<BroadcastChannel>"),
+@@ -471,6 +480,7 @@ pub fn toString(self: *EventTarget) []const u8 {
+         .idb_request => return "[object IDBRequest]",
+         .idb_transaction => return "[object IDBTransaction]",
+         .media_devices => return "[object MediaDevices]",
++        .media_key_session => return "[object MediaKeySession]",
+         .media_query_list => return "[object MediaQueryList]",
+         .message_port => return "[object MessagePort]",
+         .navigation => return "[object Navigation]",
+diff --git a/src/browser/webapi/MediaDevices.zig b/src/browser/webapi/MediaDevices.zig
+index 6e1c003..2b7d98c 100644
+--- a/src/browser/webapi/MediaDevices.zig
++++ b/src/browser/webapi/MediaDevices.zig
+@@ -237,8 +237,8 @@ fn sameOrigin(a: *Frame, b: *Frame) bool {
+     return URL.isSameOrigin(a.origin orelse return false, b.origin orelse return false);
+ }
+ 
+-// Only media-device directives are interpreted; this is not a general policy API.
+-fn allowed(frame: *Frame, feature: []const u8) bool {
++// Media directives used by native capability APIs, not a general policy API.
++pub fn allowed(frame: *Frame, feature: []const u8) bool {
+     return headerAllows(frame, frame, feature) and inheritedAllows(frame, feature);
+ }
+ 
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index 2b62a28..ea9e50c 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -362,6 +362,7 @@ pub const JsApi = struct {
+     pub const doNotTrack = bridge.accessor(Navigator.getDoNotTrack, null, .{});
+     pub const globalPrivacyControl = bridge.accessor(Navigator.getGlobalPrivacyControl, null, .{});
+ 
++    pub const requestMediaKeySystemAccess = bridge.function(@import("EncryptedMedia.zig").request, .{ .exposed = .window });
+     pub const getBattery = bridge.function(Navigator.getBattery, .{ .exposed = .window, .cache = .{ .private = "get_battery" } });
+     pub const canShare = bridge.function(WebShare.canShare, .{ .exposed = .window });
+     pub const share = bridge.function(WebShare.share, .{ .exposed = .window });
+diff --git a/src/browser/webapi/element/Html.zig b/src/browser/webapi/element/Html.zig
+index 83c4d7b..0ef7704 100644
+--- a/src/browser/webapi/element/Html.zig
++++ b/src/browser/webapi/element/Html.zig
+@@ -682,7 +682,7 @@ pub fn hasAttributeFunction(self: *HtmlElement, listener_type: GlobalEventHandle
+     return frame._event_target_attr_listeners.contains(.{ .target = self.asEventTarget(), .handler = listener_type });
+ }
+ 
+-fn setAttributeListener(
++pub fn setAttributeListener(
+     self: *Element.Html,
+     listener_type: GlobalEventHandler,
+     listener_callback: ?js.Function.Global,
+diff --git a/src/browser/webapi/element/html/Media.zig b/src/browser/webapi/element/html/Media.zig
+index 1aa7a6f..13b615f 100644
+--- a/src/browser/webapi/element/html/Media.zig
++++ b/src/browser/webapi/element/html/Media.zig
+@@ -29,6 +29,7 @@ const Event = @import("../../Event.zig");
+ pub const Audio = @import("Audio.zig");
+ pub const Video = @import("Video.zig");
+ const MediaError = @import("../../media/MediaError.zig");
++const EME = @import("../../EncryptedMedia.zig");
+ 
+ const Media = @This();
+ 
+@@ -87,6 +88,9 @@ _playback_rate: f64 = 1.0,
+ _ready_state: ReadyState = .HAVE_NOTHING,
+ _network_state: NetworkState = .NETWORK_EMPTY,
+ _error: ?*MediaError = null,
++_attaching_media_keys: bool = false,
++_media_keys: ?*EME.Keys = null,
++_media_keys_node: std.DoublyLinkedList.Node = .{},
+ 
+ pub fn asElement(self: *Media) *Element {
+     return Factory.protoOf(self).asElement();
+@@ -303,6 +307,11 @@ pub const JsApi = struct {
+     pub const networkState = bridge.accessor(Media.getNetworkState, null, .{});
+     pub const @"error" = bridge.accessor(Media.getError, null, .{});
+ 
++    pub const mediaKeys = bridge.accessor(EME.mediaKeys, null, .{});
++    pub const setMediaKeys = bridge.function(EME.setMediaKeys, .{});
++    pub const onencrypted = bridge.accessor(EME.MediaHandler(.onencrypted).get, EME.MediaHandler(.onencrypted).set, .{});
++    pub const onwaitingforkey = bridge.accessor(EME.MediaHandler(.onwaitingforkey).get, EME.MediaHandler(.onwaitingforkey).set, .{});
++
+     pub const canPlayType = bridge.function(Media.canPlayType, .{});
+     pub const play = bridge.function(Media.play, .{});
+     pub const pause = bridge.function(Media.pause, .{});
+diff --git a/src/browser/webapi/eme_configuration.zig b/src/browser/webapi/eme_configuration.zig
+new file mode 100644
+index 0000000..86d1748
+--- /dev/null
++++ b/src/browser/webapi/eme_configuration.zig
+@@ -0,0 +1,207 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const js = @import("../js/js.zig");
++const Mime = @import("../Mime.zig");
++const Conversion = @import("media_constraints.zig");
++const Allocator = std.mem.Allocator;
++
++pub const Capability = struct {
++    contentType: []const u8 = "",
++    encryptionScheme: ?[]const u8 = null,
++    robustness: []const u8 = "",
++};
++pub const Configuration = struct {
++    audioCapabilities: []const Capability = &.{},
++    distinctiveIdentifier: []const u8 = "optional",
++    initDataTypes: []const []const u8 = &.{},
++    label: []const u8 = "",
++    persistentState: []const u8 = "optional",
++    sessionTypes: []const []const u8 = &.{"temporary"},
++    videoCapabilities: []const Capability = &.{},
++};
++
++// Convert the entire sequence before selecting a candidate, including getters
++// on candidates which follow an otherwise supported one.
++pub fn configurations(value: js.Value, allocator: Allocator) ![]const Configuration {
++    const iterator = try value.iterator() orelse return error.TypeError;
++    var result: std.ArrayList(Configuration) = .empty;
++    while (try iterator.next()) |item| {
++        errdefer Conversion.closeIterator(iterator, value.local);
++        try result.append(allocator, try configuration(item, allocator));
++    }
++    return result.items;
++}
++
++fn strings(value: js.Value, allocator: Allocator) ![]const []const u8 {
++    const iterator = try value.iterator() orelse return error.TypeError;
++    var result: std.ArrayList([]const u8) = .empty;
++    while (try iterator.next()) |item| {
++        errdefer Conversion.closeIterator(iterator, value.local);
++        try result.append(allocator, try (try Conversion.domString(item)).toSlice());
++    }
++    return result.items;
++}
++fn text(object: js.Object, name: []const u8, default: []const u8) ![]const u8 {
++    const value = try object.get(name);
++    return if (value.isUndefined()) default else (try Conversion.domString(value)).toSlice();
++}
++fn requirement(object: js.Object, name: []const u8) ![]const u8 {
++    const result = try text(object, name, "optional");
++    for ([_][]const u8{ "required", "optional", "not-allowed" }) |choice| {
++        if (std.mem.eql(u8, result, choice)) return result;
++    }
++    return error.TypeError;
++}
++fn capabilities(value: js.Value, allocator: Allocator) ![]const Capability {
++    if (value.isUndefined()) return &.{};
++    const iterator = try value.iterator() orelse return error.TypeError;
++    var result: std.ArrayList(Capability) = .empty;
++    while (try iterator.next()) |item| {
++        errdefer Conversion.closeIterator(iterator, value.local);
++        var cap: Capability = .{};
++        if (try Conversion.dictionary(item)) |object| {
++            cap.contentType = try text(object, "contentType", "");
++            const scheme = try object.get("encryptionScheme");
++            if (!scheme.isNullOrUndefined()) cap.encryptionScheme = try (try Conversion.domString(scheme)).toSlice();
++            cap.robustness = try text(object, "robustness", "");
++        }
++        try result.append(allocator, cap);
++    }
++    return result.items;
++}
++fn configuration(value: js.Value, allocator: Allocator) !Configuration {
++    const object = try Conversion.dictionary(value) orelse return .{};
++    var result: Configuration = .{};
++    result.audioCapabilities = try capabilities(try object.get("audioCapabilities"), allocator);
++    result.distinctiveIdentifier = try requirement(object, "distinctiveIdentifier");
++    const init_types = try object.get("initDataTypes");
++    if (!init_types.isUndefined()) result.initDataTypes = try strings(init_types, allocator);
++    result.label = try text(object, "label", "");
++    result.persistentState = try requirement(object, "persistentState");
++    const sessions = try object.get("sessionTypes");
++    if (!sessions.isUndefined()) result.sessionTypes = try strings(sessions, allocator);
++    result.videoCapabilities = try capabilities(try object.get("videoCapabilities"), allocator);
++    return result;
++}
++
++pub fn select(input: Configuration, allocator: Allocator) !?Configuration {
++    if (std.mem.eql(u8, input.distinctiveIdentifier, "required") or std.mem.eql(u8, input.persistentState, "required")) return null;
++    if (input.sessionTypes.len == 0) return null;
++    for (input.sessionTypes) |session| if (!std.mem.eql(u8, session, "temporary")) return null;
++    if (input.audioCapabilities.len == 0 and input.videoCapabilities.len == 0) return null;
++    for (input.audioCapabilities) |cap| if (cap.contentType.len == 0) return null;
++    for (input.videoCapabilities) |cap| if (cap.contentType.len == 0) return null;
++    var result = input;
++    result.distinctiveIdentifier = "not-allowed";
++    result.persistentState = "not-allowed";
++    if (input.initDataTypes.len != 0) {
++        var supported: std.ArrayList([]const u8) = .empty;
++        for (input.initDataTypes) |init_type| {
++            if (std.mem.eql(u8, init_type, "cenc")) try supported.append(allocator, init_type);
++        }
++        if (supported.items.len == 0) return null;
++        result.initDataTypes = supported.items;
++    }
++    result.audioCapabilities = try filter(input.audioCapabilities, true, allocator);
++    result.videoCapabilities = try filter(input.videoCapabilities, false, allocator);
++    if (input.audioCapabilities.len != 0 and result.audioCapabilities.len == 0) return null;
++    if (input.videoCapabilities.len != 0 and result.videoCapabilities.len == 0) return null;
++    return result;
++}
++fn filter(input: []const Capability, audio: bool, allocator: Allocator) ![]const Capability {
++    var result: std.ArrayList(Capability) = .empty;
++    for (input) |cap| {
++        if (cap.encryptionScheme) |scheme| if (!std.mem.eql(u8, scheme, "cenc")) continue;
++        if (cap.robustness.len != 0 and !std.mem.eql(u8, cap.robustness, "SW_SECURE_CRYPTO") and !std.mem.eql(u8, cap.robustness, "SW_SECURE_DECODE")) continue;
++        if (supportsContent(cap.contentType, audio)) try result.append(allocator, cap);
++    }
++    return result.items;
++}
++fn supportsContent(content_type: []const u8, audio: bool) bool {
++    _ = Mime.parse(content_type) catch return false;
++    var mime = Mime.ContentTypeIterator.init(content_type);
++    if (!std.ascii.eqlIgnoreCase(mime.essence, if (audio) "audio/mp4" else "video/mp4")) return false;
++    var codec: ?[]const u8 = null;
++    while (mime.next()) |param| {
++        if (std.ascii.eqlIgnoreCase(param.key, "codecs")) {
++            if (codec != null) return false;
++            codec = param.value;
++        } else return false;
++    }
++    const value = codec orelse return false;
++    if (audio) return std.mem.eql(u8, value, "mp4a.40.2");
++    if (value.len != 11 or (!std.mem.startsWith(u8, value, "avc1.") and !std.mem.startsWith(u8, value, "avc3."))) return false;
++    const profile = std.fmt.parseUnsigned(u8, value[5..7], 16) catch return false;
++    _ = std.fmt.parseUnsigned(u8, value[7..9], 16) catch return false;
++    const level = std.fmt.parseUnsigned(u8, value[9..11], 16) catch return false;
++    return (profile == 0x42 or profile == 0x4d or profile == 0x58 or profile == 0x64) and
++        std.mem.indexOfScalar(u8, &.{ 9, 10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52 }, level) != null;
++}
++pub fn clone(input: Configuration, allocator: Allocator) !Configuration {
++    var result = input;
++    result.label = try allocator.dupe(u8, input.label);
++    inline for (.{ "initDataTypes", "sessionTypes" }) |field| {
++        const copied = try allocator.alloc([]const u8, @field(input, field).len);
++        for (@field(input, field), copied) |value, *entry| entry.* = try allocator.dupe(u8, value);
++        @field(result, field) = copied;
++    }
++    inline for (.{ "audioCapabilities", "videoCapabilities" }) |field| {
++        const copied = try allocator.dupe(Capability, @field(input, field));
++        for (copied) |*cap| {
++            cap.contentType = try allocator.dupe(u8, cap.contentType);
++            cap.robustness = try allocator.dupe(u8, cap.robustness);
++            if (cap.encryptionScheme) |scheme| cap.encryptionScheme = try allocator.dupe(u8, scheme);
++        }
++        @field(result, field) = copied;
++    }
++    return result;
++}
++pub fn put(object: js.Object, name: []const u8, value: anytype) !void {
++    const converted = try object.local.zigValueToJs(value, .{});
++    if (!(object.defineOwnProperty(name, converted, 0) orelse return error.JsException)) return error.JsException;
++}
++fn stringArray(values: []const []const u8, local: *const js.Local) !js.Array {
++    const array = local.newArray(0);
++    for (values, 0..) |value, i| {
++        var buf: [20]u8 = undefined;
++        try put(array.toObject(), try std.fmt.bufPrint(&buf, "{d}", .{i}), value);
++    }
++    return array;
++}
++pub fn serialize(config: Configuration, local: *const js.Local) !js.Object {
++    const result = local.newObject();
++    try put(result, "label", config.label);
++    try put(result, "initDataTypes", try stringArray(config.initDataTypes, local));
++    inline for (.{ "audioCapabilities", "videoCapabilities" }) |field| {
++        const array = local.newArray(0);
++        for (@field(config, field), 0..) |cap, i| {
++            const object = local.newObject();
++            try put(object, "contentType", cap.contentType);
++            try put(object, "robustness", cap.robustness);
++            try put(object, "encryptionScheme", cap.encryptionScheme);
++            var buf: [20]u8 = undefined;
++            try put(array.toObject(), try std.fmt.bufPrint(&buf, "{d}", .{i}), object);
++        }
++        try put(result, field, array);
++    }
++    try put(result, "distinctiveIdentifier", config.distinctiveIdentifier);
++    try put(result, "persistentState", config.persistentState);
++    try put(result, "sessionTypes", try stringArray(config.sessionTypes, local));
++    return result;
++}
+diff --git a/src/browser/webapi/global_event_handlers.zig b/src/browser/webapi/global_event_handlers.zig
+index 519cf70..c0a5265 100644
+--- a/src/browser/webapi/global_event_handlers.zig
++++ b/src/browser/webapi/global_event_handlers.zig
+@@ -101,6 +101,7 @@ pub const Handler = enum(u7) {
+     ondrop,
+     ondurationchange,
+     onemptied,
++    onencrypted,
+     onended,
+     onerror,
+     onfocus,
+@@ -164,6 +165,7 @@ pub const Handler = enum(u7) {
+     ontransitionstart,
+     onvolumechange,
+     onwaiting,
++    onwaitingforkey,
+     onwheel,
+ };
+ 

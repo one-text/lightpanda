@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 4 Nov 2026 13:49:51 -0300
+Subject: [PATCH] webapi: expose native rendering accessors and FontFace state
+
+Expose FontFace.status, Screen.colorDepth/pixelDepth, and the two
+constant TextMetrics bounds/baseline values as getter-only native Web IDL
+accessors with enumerable/configurable descriptors and receiver checks.
+Keep the existing synthetic screen depths and text metric values.
+
+Start local/URL FontFace instances unloaded. Reading loaded creates one
+pending promise without initiating loading; load enters loading and queues
+synthetic successful completion with loaded status before resolution.
+Keep the resolver GC-traced in private wrapper state and root the face only
+while its task is scheduled. Preserve load/loaded promise identity, original
+FontFace fulfillment, reentrancy, and scheduler cancellation cleanup.
+Update the existing upstream initial-status assertion; add no tests.
+
+This remains a synthetic successful font model, not font fetching, parsing,
+rasterization, or full FontFaceSet integration. The benchmark is unchanged.
+
+References:
+https://drafts.csswg.org/css-font-loading/#fontface-interface
+https://drafts.csswg.org/cssom-view/#the-screen-interface
+https://html.spec.whatwg.org/multipage/canvas.html#textmetrics
+
+Validation: all 1658 existing upstream tests and 76 temporary API checks
+pass. Benchmark improves from 111/130 to 112/130 (86.15%) with only
+rendering-property-descriptors changing; font-load-semantics still passes.
+One reviewer pass found no actionable issues.
+---
+ src/browser/js/Env.zig                    |  3 +
+ src/browser/tests/css/font_face.html      |  4 +-
+ src/browser/webapi/Screen.zig             |  8 ++-
+ src/browser/webapi/canvas/TextMetrics.zig |  8 ++-
+ src/browser/webapi/css/FontFace.zig       | 73 ++++++++++++++++++-----
+ 5 files changed, 76 insertions(+), 20 deletions(-)
+
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index a1481ca..611f338 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -1113,6 +1113,7 @@ const PrivateSymbols = struct {
+     network_information: Private,
+     chrome_result: Private,
+     speech_callbacks: Private,
++    font_face_resolver: Private,
+ 
+     fn init(isolate: *v8.Isolate) PrivateSymbols {
+         return .{
+@@ -1121,6 +1122,7 @@ const PrivateSymbols = struct {
+             .network_information = Private.init(isolate, "network_information"),
+             .chrome_result = Private.init(isolate, "chrome_result"),
+             .speech_callbacks = Private.init(isolate, "speech_callbacks"),
++            .font_face_resolver = Private.init(isolate, "font_face_resolver"),
+         };
+     }
+ 
+@@ -1130,6 +1132,7 @@ const PrivateSymbols = struct {
+         self.network_information.deinit();
+         self.chrome_result.deinit();
+         self.speech_callbacks.deinit();
++        self.font_face_resolver.deinit();
+     }
+ };
+ 
+diff --git a/src/browser/tests/css/font_face.html b/src/browser/tests/css/font_face.html
+index b515984..ecefccd 100644
+--- a/src/browser/tests/css/font_face.html
++++ b/src/browser/tests/css/font_face.html
+@@ -21,10 +21,10 @@
+ }
+ </script>
+ 
+-<script id="status_is_loaded">
++<script id="status_is_unloaded">
+ {
+     const face = new FontFace("F", "url(f.woff)");
+-    testing.expectEqual("loaded", face.status);
++    testing.expectEqual("unloaded", face.status);
+ }
+ </script>
+ 
+diff --git a/src/browser/webapi/Screen.zig b/src/browser/webapi/Screen.zig
+index 10f858e..d42501c 100644
+--- a/src/browser/webapi/Screen.zig
++++ b/src/browser/webapi/Screen.zig
+@@ -74,6 +74,10 @@ fn getAvailHeight(self: *const Screen, frame: *Frame) u32 {
+     return self.getHeight(frame) -| menu_bar_height;
+ }
+ 
++fn getDepth(_: *const Screen) u32 {
++    return 24;
++}
++
+ pub const JsApi = struct {
+     pub const bridge = js.Bridge(Screen);
+ 
+@@ -89,8 +93,8 @@ pub const JsApi = struct {
+     pub const availTop = bridge.accessor(Screen.getAvailTop, null, .{});
+     pub const availWidth = bridge.accessor(Screen.getWidth, null, .{});
+     pub const availHeight = bridge.accessor(Screen.getAvailHeight, null, .{});
+-    pub const colorDepth = bridge.property(24, .{ .template = false });
+-    pub const pixelDepth = bridge.property(24, .{ .template = false });
++    pub const colorDepth = bridge.accessor(Screen.getDepth, null, .{});
++    pub const pixelDepth = bridge.accessor(Screen.getDepth, null, .{});
+     pub const orientation = bridge.accessor(Screen.getOrientation, null, .{});
+ };
+ 
+diff --git a/src/browser/webapi/canvas/TextMetrics.zig b/src/browser/webapi/canvas/TextMetrics.zig
+index 6cae803..e77515a 100644
+--- a/src/browser/webapi/canvas/TextMetrics.zig
++++ b/src/browser/webapi/canvas/TextMetrics.zig
+@@ -65,6 +65,10 @@ fn getDescent(self: *const TextMetrics) f64 {
+     return self._descent;
+ }
+ 
++fn getZero(_: *const TextMetrics) f64 {
++    return 0;
++}
++
+ fn getIdeographicBaseline(self: *const TextMetrics) f64 {
+     return -self._descent;
+ }
+@@ -79,7 +83,7 @@ pub const JsApi = struct {
+     };
+ 
+     pub const width = bridge.accessor(TextMetrics.getWidth, null, .{});
+-    pub const actualBoundingBoxLeft = bridge.property(0.0, .{ .template = false });
++    pub const actualBoundingBoxLeft = bridge.accessor(TextMetrics.getZero, null, .{});
+     pub const actualBoundingBoxRight = bridge.accessor(TextMetrics.getWidth, null, .{});
+     pub const actualBoundingBoxAscent = bridge.accessor(TextMetrics.getAscent, null, .{});
+     pub const actualBoundingBoxDescent = bridge.accessor(TextMetrics.getDescent, null, .{});
+@@ -88,6 +92,6 @@ pub const JsApi = struct {
+     pub const emHeightAscent = bridge.accessor(TextMetrics.getAscent, null, .{});
+     pub const emHeightDescent = bridge.accessor(TextMetrics.getDescent, null, .{});
+     pub const hangingBaseline = bridge.accessor(TextMetrics.getAscent, null, .{});
+-    pub const alphabeticBaseline = bridge.property(0.0, .{ .template = false });
++    pub const alphabeticBaseline = bridge.accessor(TextMetrics.getZero, null, .{});
+     pub const ideographicBaseline = bridge.accessor(TextMetrics.getIdeographicBaseline, null, .{});
+ };
+diff --git a/src/browser/webapi/css/FontFace.zig b/src/browser/webapi/css/FontFace.zig
+index 3cd7a6e..ff76e98 100644
+--- a/src/browser/webapi/css/FontFace.zig
++++ b/src/browser/webapi/css/FontFace.zig
+@@ -29,6 +29,7 @@ const loaded_promise_slot = 1;
+ _rc: lp.RC = .{},
+ _arena: *lp.Arena,
+ _family: []const u8,
++_status: enum { unloaded, loading, loaded } = .unloaded,
+ 
+ pub fn init(family: []const u8, source: []const u8, frame: *Frame) !*FontFace {
+     _ = source;
+@@ -60,29 +61,73 @@ fn getFamily(self: *const FontFace) []const u8 {
+     return self._family;
+ }
+ 
+-// load() - resolves immediately; headless browser has no real font loading.
++fn getStatus(self: *const FontFace) []const u8 {
++    return @tagName(self._status);
++}
++
++// Fonts still load synthetically, but completion runs in a later task.
+ pub fn load(self: *FontFace, frame: *Frame) !js.Promise {
+-    return self.getLoaded(frame);
++    const promise = try self.getLoaded(frame);
++    if (self._status != .unloaded) return promise;
++
++    const arena = try frame.getArena(.tiny, "FontFace.load");
++    errdefer arena.release();
++    const root = try (try frame.js.local.?.zigValueToJs(self, .{})).persist();
++    errdefer root.release();
++    const task = try arena.create(LoadTask);
++    task.* = .{ .face = self, .context = frame.js, .arena = arena, .root = root };
++    try frame.js.scheduler.add(task, LoadTask.run, 0, .{ .name = "FontFace.load", .finalizer = LoadTask.finalize });
++    self._status = .loading;
++    return promise;
+ }
+ 
+-// loaded - returns the same fulfilled promise as load().
+ fn getLoaded(self: *FontFace, frame: *Frame) !js.Promise {
+-    const local = frame.js.local.?;
++    return (try self.loadedResolver(frame.js.local.?)).promise();
++}
++
++fn loadedResolver(self: *FontFace, local: *const js.Local) !js.PromiseResolver {
+     const wrapper = try local.mapZigInstanceToJs(null, self);
+-    if (js.v8.v8__Object__GetInternalField(wrapper.handle, loaded_promise_slot)) |cached| {
+-        if (!js.v8.v8__Value__IsUndefined(cached)) {
+-            return .{ .local = local, .handle = @ptrCast(cached) };
+-        }
++    const key: *const js.v8.Private = @ptrCast(js.v8.v8__Global__Get(&local.ctx.env.private_symbols.font_face_resolver.handle, local.isolate.handle).?);
++    const cached = js.v8.v8__Object__GetPrivate(wrapper.handle, local.handle, key) orelse return error.JsException;
++    if (!js.v8.v8__Value__IsUndefined(cached)) {
++        return .{ .local = local, .handle = @ptrCast(cached) };
+     }
+ 
+     const resolver = local.createPromiseResolver();
+-    const promise = resolver.promise();
+-    // Keep the cycle GC-traced, and publish before resolution can read a then getter.
+-    js.v8.v8__Object__SetInternalField(wrapper.handle, loaded_promise_slot, promise.toValue().handle);
+-    try resolver.resolveValue(wrapper.toValue());
+-    return promise;
++    // Keep pending reactions and the fulfilled FontFace cycle GC-traced.
++    var saved: js.v8.MaybeBool = undefined;
++    js.v8.v8__Object__SetPrivate(wrapper.handle, local.handle, key, @ptrCast(resolver.handle), &saved);
++    if (!saved.has_value or !saved.value) return error.JsException;
++    return resolver;
+ }
+ 
++const LoadTask = struct {
++    face: *FontFace,
++    context: *js.Context,
++    arena: *lp.Arena,
++    root: js.Value.Global,
++
++    fn finalize(ptr: *anyopaque) void {
++        const self: *LoadTask = @ptrCast(@alignCast(ptr));
++        self.root.release();
++        self.arena.release();
++    }
++
++    fn run(ptr: *anyopaque) !?u32 {
++        const self: *LoadTask = @ptrCast(@alignCast(ptr));
++        defer finalize(ptr);
++        var scope: js.Local.Scope = undefined;
++        self.context.localScope(&scope);
++        defer scope.deinit();
++        defer scope.local.runMicrotasks();
++
++        const resolver = try self.face.loadedResolver(&scope.local);
++        self.face._status = .loaded;
++        try resolver.resolveValue(self.root.local(&scope.local));
++        return null;
++    }
++};
++
+ pub const JsApi = struct {
+     pub const bridge = js.Bridge(FontFace);
+ 
+@@ -94,7 +139,7 @@ pub const JsApi = struct {
+ 
+     pub const constructor = bridge.constructor(FontFace.init, .{});
+     pub const family = bridge.accessor(FontFace.getFamily, null, .{});
+-    pub const status = bridge.property("loaded", .{ .template = false, .readonly = true });
++    pub const status = bridge.accessor(FontFace.getStatus, null, .{});
+     pub const style = bridge.property("normal", .{ .template = false, .readonly = true });
+     pub const weight = bridge.property("normal", .{ .template = false, .readonly = true });
+     pub const stretch = bridge.property("normal", .{ .template = false, .readonly = true });

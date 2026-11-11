@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 14 Oct 2026 00:10:05 -0300
+Subject: [PATCH] webapi: spoof Mac Chrome navigator platform natively
+
+Return MacIntel from the shared Navigator platform getter instead of
+revealing the build host OS. This is desktop Chrome's legacy platform
+token on macOS, including Apple silicon; it does not describe the CPU
+architecture of the base MacBook Neo / A18 Pro persona.
+
+Preserve the existing native readonly prototype accessor and
+WorkerNavigator forwarding. Remove the builtin import used only by the
+previous host-OS switch. Client Hint platform and HTTP headers remain
+separate work; no new API, configuration or test cases are introduced.
+
+References:
+https://github.com/chromium/chromium/blob/main/third_party/blink/renderer/core/execution_context/navigator_base.cc
+https://developer.mozilla.org/en-US/docs/Web/API/Navigator/platform
+
+Validation: development build and all 1658 existing tests pass. Temporary
+diagnostics confirm native descriptors, receiver checks, readonly behavior
+and stable MacIntel values in page, worker and frame realms. One reviewer
+pass found no issues.
+---
+ src/browser/webapi/Navigator.zig | 9 +--------
+ 1 file changed, 1 insertion(+), 8 deletions(-)
+
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index fe2010d..fb16d32 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -18,7 +18,6 @@
+ // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ 
+ const std = @import("std");
+-const builtin = @import("builtin");
+ 
+ const js = @import("../js/js.zig");
+ const Frame = @import("../Frame.zig");
+@@ -137,13 +136,7 @@ pub fn getGlobalPrivacyControl(_: *const Navigator) bool {
+ }
+ 
+ pub fn getPlatform(_: *const Navigator) []const u8 {
+-    return switch (builtin.os.tag) {
+-        .macos => "MacIntel",
+-        .windows => "Win32",
+-        .linux => "Linux x86_64",
+-        .freebsd => "FreeBSD",
+-        else => "Unknown",
+-    };
++    return "MacIntel";
+ }
+ 
+ /// Returns whether Java is enabled (always false)

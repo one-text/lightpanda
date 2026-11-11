@@ -1,0 +1,1243 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 9 Nov 2026 17:36:49 -0300
+Subject: [PATCH] webapi: model native Mac font-aware inline text dimensions
+
+Replace the fixed five-pixel fallback for naturally sized leaf inline and
+inline-block text boxes with deterministic, content-dependent dimensions.
+Share the existing canvas font-family resolver and representative ASCII
+advance tables through text_measure, preserving their attribution. Retain
+Unicode/combining-character fallbacks and model whitespace, line breaks,
+font-size scaling and line height without an installed macOS font backend.
+
+Track copied text-style values through the existing stylesheet cascade and
+invalidation machinery. Resolve inherited, relative and root-relative sizes,
+font shorthand and all resets, and reject invalid supported longhands before
+they replace valid declarations. Bound resolved sizes to keep hostile CSS
+from producing non-finite geometry. Keep SVG presentation sizes and older
+wrapping consumers connected to the same cascaded font-size resolution.
+
+Expand and round-trip the supported font shorthand constituents through
+native CSSOM bindings, retaining style/weight/variant/stretch even though the
+synthetic measurement model does not shape them. Preserve mutation ordering
+around all, including identical-value writes, and expose computed font sizes.
+
+Keep explicit dimensions, hidden/zero-size boxes and existing block/replaced
+layout paths intact. Bounding/client rectangles share fractional geometry;
+integer client/offset/scroll dimensions round measured text boxes. This is
+not full CSS layout, CoreText shaping, or transform support.
+
+Update only existing StyleManager expectations for newly tracked display
+values; add no permanent tests. Temporary fixtures passed 39 assertions.
+Validation: scripts/build.sh; 1658/1658 upstream tests; unchanged benchmark
+127/130 (97.69%), with dom-font-glyph-metrics now passing and no lost passes.
+---
+ src/browser/StyleManager.zig                  | 239 ++++++++++---
+ src/browser/text_measure.zig                  | 322 +++++++++++++++++-
+ src/browser/webapi/Element.zig                |  43 ++-
+ src/browser/webapi/canvas/context2d.zig       | 243 +------------
+ .../webapi/css/CSSStyleDeclaration.zig        |  99 +++++-
+ 5 files changed, 646 insertions(+), 300 deletions(-)
+
+diff --git a/src/browser/StyleManager.zig b/src/browser/StyleManager.zig
+index fbb706e..68ec978 100644
+--- a/src/browser/StyleManager.zig
++++ b/src/browser/StyleManager.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -21,6 +22,7 @@ const lp = @import("lightpanda");
+ 
+ const Frame = @import("Frame.zig");
+ const Viewport = @import("Viewport.zig");
++const text_measure = @import("text_measure.zig");
+ 
+ const units = @import("css/units.zig");
+ const CssParser = @import("css/Parser.zig");
+@@ -54,6 +56,7 @@ arena: *lp.Arena,
+ 
+ visibility: Group(Visibility) = .{},
+ geometry: Group(Geometry) = .{},
++text: Group(Text) = .{},
+ 
+ // Keyed by property name, pruning to what is (hopefully) one or few rules
+ custom_rules: std.StringHashMapUnmanaged(CustomProperty) = .empty,
+@@ -1398,13 +1401,176 @@ const Geometry = struct {
+     };
+ };
+ 
++const TextLength = struct {
++    value: f64 = 0,
++    unit: enum { presentation, inherit, normal, px, em, percentage, rem, number } = .inherit,
++
++    fn parse(value: []const u8, line_height: bool) ?TextLength {
++        if (std.ascii.eqlIgnoreCase(value, "inherit") or std.ascii.eqlIgnoreCase(value, "unset")) return .{};
++        if (std.ascii.eqlIgnoreCase(value, "initial") or std.ascii.eqlIgnoreCase(value, "revert") or std.ascii.eqlIgnoreCase(value, "revert-layer")) {
++            return if (line_height) .{ .unit = .normal } else .{ .value = 16, .unit = .px };
++        }
++        if (line_height and std.ascii.eqlIgnoreCase(value, "normal")) return .{ .unit = .normal };
++        if (!line_height and std.ascii.eqlIgnoreCase(value, "medium")) return .{ .value = 16, .unit = .px };
++        if (std.ascii.endsWithIgnoreCase(value, "rem")) {
++            const number = std.fmt.parseFloat(f64, value[0 .. value.len - 3]) catch return null;
++            if (!std.math.isFinite(number) or number < 0) return null;
++            return .{ .value = number, .unit = .rem };
++        }
++        const parsed = units.parse(value) catch return null;
++        if (parsed.value < 0) return null;
++        return switch (parsed.unit) {
++            .em => .{ .value = parsed.value, .unit = .em },
++            .ex => .{ .value = parsed.value / 2, .unit = .em },
++            .percentage => .{ .value = parsed.value, .unit = .percentage },
++            .none => if (line_height) .{ .value = parsed.value, .unit = .number } else if (parsed.value == 0) .{ .unit = .px } else null,
++            else => .{ .value = parsed.value * (units.absoluteLengthFactor(parsed.unit) orelse return null), .unit = .px },
++        };
++    }
++};
++
++// Keep hostile but individually finite relative lengths from overflowing layout.
++const MAX_TEXT_SIZE: f64 = 1_000_000;
++
++pub fn validTextDeclaration(name: []const u8, value: []const u8) bool {
++    if (value.len == 0 or isFontGlobal(value)) return true;
++    if (std.ascii.eqlIgnoreCase(name, "font-size")) return TextLength.parse(value, false) != null;
++    if (std.ascii.eqlIgnoreCase(name, "line-height")) return TextLength.parse(value, true) != null;
++    if (std.ascii.eqlIgnoreCase(name, "font-family")) return text_measure.resolveFamilies(value) != null;
++    if (std.ascii.eqlIgnoreCase(name, "white-space")) {
++        inline for (.{ "normal", "nowrap", "pre", "pre-wrap", "pre-line", "break-spaces" }) |keyword| {
++            if (std.ascii.eqlIgnoreCase(value, keyword)) return true;
++        }
++        return false;
++    }
++    return true;
++}
++
++fn isFontGlobal(value: []const u8) bool {
++    inline for (.{ "inherit", "initial", "unset", "revert", "revert-layer" }) |keyword| {
++        if (std.ascii.eqlIgnoreCase(value, keyword)) return true;
++    }
++    return false;
++}
++
++const Text = struct {
++    const Family = union(enum) { inherit, face: text_measure.FontFace };
++    const DisplayMode = enum { ua, inline_box, other };
++    const WhiteSpace = enum { inherit, normal, nowrap, pre, pre_wrap, pre_line };
++
++    const Declared = struct {
++        const names = [_][]const u8{ "display", "font-size", "font-family", "line-height", "white-space" };
++        display: ?DisplayMode = null,
++        font_size: ?TextLength = null,
++        font_family: ?Family = null,
++        line_height: ?TextLength = null,
++        white_space: ?WhiteSpace = null,
++
++        fn apply(self: *Declared, name: []const u8, value: []const u8) void {
++            if (std.ascii.eqlIgnoreCase(name, "display")) {
++                self.display = if (std.ascii.eqlIgnoreCase(value, "inline") or std.ascii.eqlIgnoreCase(value, "inline-block") or std.ascii.eqlIgnoreCase(value, "initial")) .inline_box else .other;
++            } else if (std.ascii.eqlIgnoreCase(name, "font-size")) {
++                self.font_size = TextLength.parse(value, false);
++            } else if (std.ascii.eqlIgnoreCase(name, "font-family")) {
++                self.font_family = if (std.ascii.eqlIgnoreCase(value, "inherit") or std.ascii.eqlIgnoreCase(value, "unset")) .inherit else if (isFontGlobal(value)) .{ .face = .serif } else .{ .face = text_measure.resolveFamilies(value) orelse return };
++            } else if (std.ascii.eqlIgnoreCase(name, "line-height")) {
++                self.line_height = TextLength.parse(value, true);
++            } else if (std.ascii.eqlIgnoreCase(name, "white-space")) {
++                self.white_space = if (std.ascii.eqlIgnoreCase(value, "inherit") or std.ascii.eqlIgnoreCase(value, "unset")) .inherit else if (std.ascii.eqlIgnoreCase(value, "pre")) .pre else if (std.ascii.eqlIgnoreCase(value, "pre-wrap") or std.ascii.eqlIgnoreCase(value, "break-spaces")) .pre_wrap else if (std.ascii.eqlIgnoreCase(value, "pre-line")) .pre_line else if (std.ascii.eqlIgnoreCase(value, "nowrap")) .nowrap else .normal;
++            }
++        }
++    };
++
++    const Computed = struct {
++        display: DisplayMode = .ua,
++        font_size: TextLength = .{ .unit = .presentation },
++        font_family: Family = .inherit,
++        line_height: TextLength = .{},
++        white_space: WhiteSpace = .inherit,
++    };
++};
++
++pub const TextStyle = struct {
++    size: f64 = 16,
++    face: text_measure.FontFace = .serif,
++    line_height: TextLength = .{ .unit = .normal },
++    white_space: Text.WhiteSpace = .normal,
++
++    pub fn lineHeight(self: TextStyle) f64 {
++        return @min(MAX_TEXT_SIZE, switch (self.line_height.unit) {
++            .px => self.line_height.value,
++            .number => self.size * self.line_height.value,
++            else => self.size * text_measure.LINE_HEIGHT,
++        });
++    }
++};
++
++pub fn inlineTextBox(self: *StyleManager, element: *Element) bool {
++    self.rebuildIfDirty() catch return false;
++    return switch (self.text.ownProps(self.arena.allocator(), element, self.frame).display) {
++        .inline_box => true,
++        .other => false,
++        .ua => std.mem.eql(u8, @import("webapi/css/CSSStyleDeclaration.zig").getDefaultDisplay(element), "inline"),
++    };
++}
++
++pub fn textStyle(self: *StyleManager, element: *Element) TextStyle {
++    self.assertOwns(element);
++    self.rebuildIfDirty() catch return .{};
++    return self.textStyleAt(element, 0);
++}
++
++fn textStyleAt(self: *StyleManager, element: ?*Element, depth: u8) TextStyle {
++    const current = element orelse return .{};
++    if (depth >= MAX_FONT_ANCESTOR_DEPTH) return .{};
++    var result = self.textStyleAt(current.parentElement(), depth + 1);
++    const own = self.text.ownProps(self.arena.allocator(), current, self.frame);
++    const size = if (own.font_size.unit == .presentation)
++        presentationFontSize(current)
++    else
++        own.font_size;
++    switch (size.unit) {
++        .px => result.size = size.value,
++        .em => result.size *= size.value,
++        .percentage => result.size *= size.value / 100,
++        .rem => result.size = size.value * self.rootFontSize(current, depth + 1),
++        else => {},
++    }
++    result.size = @min(MAX_TEXT_SIZE, result.size);
++    if (own.font_family == .face) result.face = own.font_family.face;
++    switch (own.line_height.unit) {
++        .inherit => {},
++        .em, .percentage, .rem => result.line_height = .{ .unit = .px, .value = own.line_height.value * (if (own.line_height.unit == .percentage) result.size / 100 else if (own.line_height.unit == .rem) (if (self.frame.document.getDocumentElement() == current) result.size else self.rootFontSize(current, depth + 1)) else result.size) },
++        else => result.line_height = own.line_height,
++    }
++    result.line_height.value = @min(MAX_TEXT_SIZE, result.line_height.value);
++    if (own.white_space != .inherit) result.white_space = own.white_space;
++    return result;
++}
++
++fn presentationFontSize(element: *Element) TextLength {
++    const raw = element.getAttributeSafe(comptime .wrap("font-size")) orelse return .{};
++    if (TextLength.parse(raw, false)) |size| return size;
++    // SVG presentation attributes also allow nonzero unitless pixel sizes.
++    const number = std.fmt.parseFloat(f64, raw) catch return .{};
++    if (number < 0 or !std.math.isFinite(number)) return .{};
++    return .{ .value = number, .unit = .px };
++}
++
++fn rootFontSize(self: *StyleManager, current: *Element, depth: u8) f64 {
++    const root = self.frame.document.getDocumentElement() orelse return 16;
++    return if (root == current) 16 else self.textStyleAt(root, depth).size;
++}
++
+ /// Every group's share of one declaration block, so a sheet's block is folded
+ /// once. Field names match the StyleManager's group fields.
+ const Declarations = struct {
+-    const names = Visibility.Declared.names ++ Geometry.Declared.names;
++    // display is already present in Visibility's names.
++    const names = Visibility.Declared.names ++ Geometry.Declared.names ++ Text.Declared.names[1..];
+ 
+     visibility: Visibility.Declared = .{},
+     geometry: Geometry.Declared = .{},
++    text: Text.Declared = .{},
+ 
+     fn apply(self: *Declarations, name: []const u8, value: []const u8) void {
+         inline for (group_fields) |field| {
+@@ -1572,12 +1738,27 @@ fn Slots(comptime Declared: type) type {
+         slots: [Declared.names.len]Slot = @splat(.{}),
+ 
+         fn apply(self: *Self, name: []const u8, value: []const u8, important: bool) void {
++            if (std.ascii.eqlIgnoreCase(name, "font")) {
++                if (text_measure.parseFont(value)) |font| {
++                    self.apply("font-size", font.size_text, important);
++                    self.apply("font-family", font.family_text, important);
++                    self.apply("line-height", font.line_height, important);
++                } else if (isFontGlobal(value)) {
++                    inline for (.{ "font-size", "font-family", "line-height" }) |property| self.apply(property, value, important);
++                }
++                return;
++            }
++            if (std.ascii.eqlIgnoreCase(name, "all") and isFontGlobal(value)) {
++                inline for (.{ "font-size", "font-family", "line-height", "white-space" }) |property| self.apply(property, value, important);
++                return;
++            }
+             if (CssParser.axisShorthand(name)) |shorthand| {
+                 const values = CssParser.splitAxisPair(value) orelse return;
+                 self.apply(shorthand.x, values.x, important);
+                 self.apply(shorthand.y, values.y, important);
+                 return;
+             }
++            if (!validTextDeclaration(name, value)) return;
+             for (Declared.names, &self.slots) |tracked, *slot| {
+                 if (std.ascii.eqlIgnoreCase(name, tracked)) {
+                     slot.apply(value, important);
+@@ -1735,51 +1916,9 @@ const MAX_FONT_ANCESTOR_DEPTH = 32;
+ /// element is part of a frameless document.
+ pub const DEFAULT_FONT_SIZE = 16;
+ 
+-/// Computed font-size in CSS pixels. We do what we can, namely inline styles
+-/// font-related attributes, up the parent chain.
++/// Shared cascaded resolution for DOM, SVG and explicit-width wrapping.
+ pub fn computedFontSize(self: *StyleManager, element: ?*Element) f64 {
+-    self.assertOwns(element);
+-    return self.computedFontSizeAt(element, 0);
+-}
+-
+-fn computedFontSizeAt(self: *StyleManager, element: ?*Element, depth: u8) f64 {
+-    if (depth >= MAX_FONT_ANCESTOR_DEPTH) {
+-        return DEFAULT_FONT_SIZE;
+-    }
+-    const current = element orelse return DEFAULT_FONT_SIZE;
+-    const parent = current.parentElement();
+-
+-    if (self.inlineStyleValue(current, comptime .wrap("font-size"))) |raw| {
+-        if (self.parseFontSize(raw, parent, depth + 1)) |size| {
+-            return size;
+-        }
+-    }
+-    if (current.getAttributeSafe(comptime .wrap("font-size"))) |raw| {
+-        if (self.parseFontSize(raw, parent, depth + 1)) |size| {
+-            return size;
+-        }
+-    }
+-    return self.computedFontSizeAt(parent, depth + 1);
+-}
+-
+-fn parseFontSize(self: *StyleManager, raw: []const u8, parent: ?*Element, depth: u8) ?f64 {
+-    const value = std.mem.trim(u8, raw, " \t\r\n\x0c");
+-    if (std.ascii.eqlIgnoreCase(value, "inherit") or std.ascii.eqlIgnoreCase(value, "unset")) {
+-        return self.computedFontSizeAt(parent, depth);
+-    }
+-    if (std.ascii.eqlIgnoreCase(value, "initial") or std.ascii.eqlIgnoreCase(value, "medium")) {
+-        return 16;
+-    }
+-
+-    const parsed = units.parse(value) catch return null;
+-    const factor = units.absoluteLengthFactor(parsed.unit) orelse switch (parsed.unit) {
+-        .percentage => self.computedFontSizeAt(parent, depth) / 100.0,
+-        .em => self.computedFontSizeAt(parent, depth),
+-        .ex => self.computedFontSizeAt(parent, depth) / 2.0,
+-        else => return null,
+-    };
+-    const size = parsed.value * factor;
+-    return if (size >= 0 and std.math.isFinite(size)) size else null;
++    return self.textStyle(element orelse return DEFAULT_FONT_SIZE).size;
+ }
+ 
+ const testing = @import("../testing.zig");
+@@ -1992,11 +2131,11 @@ test "StyleManager: inlineDeclared: scan matches the parsed style object" {
+         \\<i style="width: 2em !important; width: 10vw"></i>
+     );
+     const expected = [_]Declarations{
+-        .{ .visibility = .{ .display = .none } },
+-        .{ .visibility = .{ .display = .none } },
+-        .{ .visibility = .{ .display = .none } },
+-        .{ .visibility = .{ .display = .other } },
+-        .{ .visibility = .{ .display = .none, .visibility_hidden = true } },
++        .{ .visibility = .{ .display = .none }, .text = .{ .display = .other } },
++        .{ .visibility = .{ .display = .none }, .text = .{ .display = .other } },
++        .{ .visibility = .{ .display = .none }, .text = .{ .display = .other } },
++        .{ .visibility = .{ .display = .other }, .text = .{ .display = .other } },
++        .{ .visibility = .{ .display = .none, .visibility_hidden = true }, .text = .{ .display = .other } },
+         .{ .visibility = .{ .opacity_zero = true, .pointer_events_none = true } },
+         .{ .visibility = .{ .opacity_zero = false, .pointer_events_none = true } },
+         .{ .visibility = .{ .visibility_hidden = true } },
+diff --git a/src/browser/text_measure.zig b/src/browser/text_measure.zig
+index 31edde0..3e2f5bc 100644
+--- a/src/browser/text_measure.zig
++++ b/src/browser/text_measure.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -18,9 +19,274 @@
+ 
+ const std = @import("std");
+ 
+-// Deterministic DOM fallback only. This intentionally does not claim to shape
+-// scripts, apply kerning, or select fonts; a real shaping backend can replace
+-// this module without changing SVGTextContentElement.
++// Shared deterministic font models; no shaping, kerning or CoreText backend.
++
++pub const FontFace = enum { sans, serif, mono };
++
++// Representative ASCII advances in 1/1000 em from Adobe's Helvetica and
++// Times-Roman AFM metrics (matplotlib v3.10.7, mpl-data/fonts/pdfcorefonts).
++// Modification: only ASCII WX values are retained, without other AFM data.
++// Copyright (c) 1985, 1987, 1989, 1990, 1997 Adobe Systems Incorporated. All Rights Reserved.
++// Copyright (c) 1985, 1987, 1989, 1990, 1993, 1997 Adobe Systems Incorporated. All Rights Reserved.
++//
++// This file and the 14 PostScript(R) AFM files it accompanies may be used, copied,
++// and distributed for any purpose and without charge, with or without modification,
++// provided that all copyright notices are retained; that the AFM files are not
++// distributed without this file; that all modifications to this file or any of
++// the AFM files are prominently noted in the modified file(s); and that this
++// paragraph is not modified. Adobe Systems has no responsibility or obligation
++// to support the use of the AFM files.
++//
++// The Mac families below alias these three models, not installed font files.
++// No kerning, style-specific shaping, or pixel-identical CoreText is claimed.
++const sans_advances = [95]u16{
++    278,  278, 355, 556, 556, 889, 667, 222, 333, 333, 389, 584, 278, 333, 278, 278,
++    556,  556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
++    1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
++    667,  778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
++    222,  556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
++    556,  556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
++};
++const serif_advances = [95]u16{
++    250, 333, 408, 500, 500, 833, 778, 333, 333, 333, 500, 564, 250, 333, 250, 278,
++    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444,
++    921, 722, 667, 667, 722, 611, 556, 722, 722, 333, 389, 722, 611, 889, 722, 722,
++    556, 722, 667, 556, 611, 722, 722, 944, 722, 722, 611, 333, 278, 333, 469, 500,
++    333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278, 500, 278, 778, 500, 500,
++    500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541,
++};
++
++fn fontFace(name: []const u8, quoted: bool) ?FontFace {
++    const families = .{
++        .{ "Arial", FontFace.sans },               .{ "Helvetica", FontFace.sans },
++        .{ "Helvetica Neue", FontFace.sans },      .{ "Verdana", FontFace.sans },
++        .{ "Tahoma", FontFace.sans },              .{ "Trebuchet MS", FontFace.sans },
++        .{ "Impact", FontFace.sans },              .{ "Comic Sans MS", FontFace.sans },
++        .{ "Optima", FontFace.sans },              .{ "Geneva", FontFace.sans },
++        .{ "Lucida Grande", FontFace.sans },       .{ "Avenir Next", FontFace.sans },
++        .{ "PingFang SC", FontFace.sans },         .{ "Hiragino Sans", FontFace.sans },
++        .{ "Apple SD Gothic Neo", FontFace.sans }, .{ "Times", FontFace.serif },
++        .{ "Times New Roman", FontFace.serif },    .{ "Georgia", FontFace.serif },
++        .{ "Palatino", FontFace.serif },           .{ "Garamond", FontFace.serif },
++        .{ "Courier", FontFace.mono },             .{ "Courier New", FontFace.mono },
++        .{ "Menlo", FontFace.mono },               .{ "Monaco", FontFace.mono },
++    };
++    inline for (families) |family| {
++        if (std.ascii.eqlIgnoreCase(name, family[0])) return family[1];
++    }
++    if (!quoted) {
++        if (std.ascii.eqlIgnoreCase(name, "serif") or
++            std.ascii.eqlIgnoreCase(name, "ui-serif")) return .serif;
++        if (std.ascii.eqlIgnoreCase(name, "monospace") or
++            std.ascii.eqlIgnoreCase(name, "ui-monospace")) return .mono;
++        inline for (.{ "sans-serif", "system-ui", "ui-sans-serif", "cursive", "fantasy" }) |generic| {
++            if (std.ascii.eqlIgnoreCase(name, generic)) return .sans;
++        }
++    }
++    return null;
++}
++
++const Family = struct { face: ?FontFace };
++
++// Decode CSS escapes and collapse whitespace between unquoted identifiers.
++// A name too long to match the fixed profile is still a valid unknown family.
++fn parseFamily(raw: []const u8) ?Family {
++    const quoted = raw[0] == '"' or raw[0] == '\'';
++    var name = raw;
++    if (quoted) {
++        if (raw.len < 2 or raw[raw.len - 1] != raw[0]) return null;
++        name = raw[1 .. raw.len - 1];
++    }
++    var buf: [256]u8 = undefined;
++    var len: usize = 0;
++    var i: usize = 0;
++    var space = false;
++    while (i < name.len) {
++        var c: u21 = name[i];
++        var encoded: [4]u8 = undefined;
++        encoded[0] = name[i];
++        var n: usize = 1;
++        i += 1;
++        if (c == '\\') {
++            if (i == name.len) return null;
++            const start = i;
++            while (i < name.len and i - start < 6 and std.ascii.isHex(name[i])) : (i += 1) {}
++            if (i > start) {
++                c = std.fmt.parseInt(u21, name[start..i], 16) catch return null;
++                if (c == 0 or c > 0x10ffff or (c >= 0xd800 and c <= 0xdfff)) c = 0xfffd;
++                if (i < name.len and std.ascii.isWhitespace(name[i])) {
++                    const cr = name[i] == '\r';
++                    i += 1;
++                    if (cr and i < name.len and name[i] == '\n') i += 1;
++                }
++            } else {
++                c = name[i];
++                i += 1;
++                if (c == '\n' or c == '\r' or c == 0x0c) return null;
++            }
++            n = std.unicode.utf8Encode(c, &encoded) catch return null;
++        } else if (!quoted and len == 0 and std.ascii.isDigit(@intCast(c))) {
++            return null;
++        } else if (quoted and (c == '\n' or c == '\r' or c == 0x0c)) {
++            return null;
++        } else if (!quoted and std.ascii.isWhitespace(@intCast(c))) {
++            space = len > 0;
++            continue;
++        } else if ((quoted and c == raw[0]) or (!quoted and
++            !(std.ascii.isAlphanumeric(@intCast(c)) or c == '-' or c == '_' or c >= 0x80)))
++        {
++            return null;
++        }
++        if (space) {
++            if (len < buf.len) buf[len] = ' ';
++            len += 1;
++            space = false;
++        }
++        if (len + n <= buf.len) @memcpy(buf[len..][0..n], encoded[0..n]);
++        len += n;
++    }
++    if (len == 0 and !quoted) return null;
++    if (!quoted and len <= buf.len) {
++        inline for (.{ "inherit", "initial", "unset", "revert", "revert-layer", "default" }) |keyword| {
++            if (std.ascii.eqlIgnoreCase(buf[0..len], keyword)) return null;
++        }
++    }
++    return .{ .face = if (len <= buf.len) fontFace(buf[0..len], quoted) else null };
++}
++
++pub fn resolveFamilies(list: []const u8) ?FontFace {
++    var selected: ?FontFace = null;
++    var start: usize = 0;
++    var quote: u8 = 0;
++    var i: usize = 0;
++    while (i <= list.len) : (i += 1) {
++        if (i == list.len or (list[i] == ',' and quote == 0)) {
++            if (quote != 0) return null;
++            const raw = std.mem.trim(u8, list[start..i], &std.ascii.whitespace);
++            if (raw.len == 0) return null;
++            const family = parseFamily(raw) orelse return null;
++            if (selected == null) selected = family.face;
++            start = i + 1;
++        } else if (list[i] == '\\') {
++            i += 1;
++            if (i == list.len) return null;
++        } else if (list[i] == quote) {
++            quote = 0;
++        } else if (quote == 0 and (list[i] == '"' or list[i] == '\'')) {
++            quote = list[i];
++        }
++    }
++    // An entirely unknown stack falls back to the browser's default serif.
++    return selected orelse .serif;
++}
++
++pub fn measureWidth(text: []const u8, size: f64, face: FontFace) f64 {
++    var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
++    var measured: f64 = 0;
++    var start: usize = 0;
++    while (it.nextCodepoint()) |cp| {
++        // Canvas replaces ASCII whitespace with spaces before measuring.
++        const c = if (cp == '\t' or cp == '\n' or cp == '\r' or cp == 0x0c) ' ' else cp;
++        if (c >= 32 and c <= 126) {
++            const glyph_advance: u16 = switch (face) {
++                .sans => sans_advances[c - 32],
++                .serif => serif_advances[c - 32],
++                .mono => 600,
++            };
++            measured += @as(f64, @floatFromInt(glyph_advance));
++        } else {
++            // Retain the Unicode fallback's combining/zero-width handling.
++            measured += width(text[start..it.i], 1000);
++        }
++        start = it.i;
++    }
++    return measured * size / 1000;
++}
++
++pub const ParsedFont = struct {
++    size: f64,
++    face: FontFace,
++    size_text: []const u8,
++    family_text: []const u8,
++    line_height: []const u8,
++    style: []const u8,
++    variant: []const u8,
++    weight: []const u8,
++    stretch: []const u8,
++};
++
++fn parseSize(token: []const u8) ?f64 {
++    const units = [_]struct { suffix: []const u8, px: f64 }{
++        .{ .suffix = "px", .px = 1 },
++        .{ .suffix = "pt", .px = 4.0 / 3.0 },
++        .{ .suffix = "rem", .px = 16 },
++        .{ .suffix = "em", .px = 16 },
++        .{ .suffix = "%", .px = 0.16 },
++    };
++    for (units) |unit| {
++        if (!std.ascii.endsWithIgnoreCase(token, unit.suffix)) continue;
++        const number = std.fmt.parseFloat(f64, token[0 .. token.len - unit.suffix.len]) catch continue;
++        const size = number * unit.px;
++        if (size < 0 or !std.math.isFinite(size)) return null;
++        return size;
++    }
++    return null;
++}
++
++/// Retain the supported size units and styles, then resolve the family stack.
++pub fn parseFont(font: []const u8) ?ParsedFont {
++    var font_style: []const u8 = "normal";
++    var variant: []const u8 = "normal";
++    var font_weight: []const u8 = "normal";
++    var stretch: []const u8 = "normal";
++    var it = std.mem.tokenizeAny(u8, font, &std.ascii.whitespace);
++    while (it.next()) |raw| {
++        const slash = std.mem.indexOfScalar(u8, raw, '/');
++        const token = raw[0 .. slash orelse raw.len];
++        const size = parseSize(token) orelse {
++            const weight = std.fmt.parseInt(u16, raw, 10) catch 0;
++            var style = weight >= 1 and weight <= 1000;
++            inline for (.{ "normal", "italic", "oblique", "small-caps", "bold", "bolder", "lighter", "ultra-condensed", "extra-condensed", "condensed", "semi-condensed", "semi-expanded", "expanded", "extra-expanded", "ultra-expanded" }) |keyword| {
++                if (std.ascii.eqlIgnoreCase(raw, keyword)) style = true;
++            }
++            if (!style) return null;
++            if (std.ascii.eqlIgnoreCase(raw, "italic") or std.ascii.eqlIgnoreCase(raw, "oblique")) {
++                font_style = raw;
++            } else if (std.ascii.eqlIgnoreCase(raw, "small-caps")) {
++                variant = raw;
++            } else if (weight > 0 or std.ascii.eqlIgnoreCase(raw, "bold") or std.ascii.eqlIgnoreCase(raw, "bolder") or std.ascii.eqlIgnoreCase(raw, "lighter")) {
++                font_weight = raw;
++            } else if (!std.ascii.eqlIgnoreCase(raw, "normal")) {
++                stretch = raw;
++            }
++            continue;
++        };
++        var families = std.mem.trim(u8, font[it.index..], &std.ascii.whitespace);
++        var height: ?[]const u8 = null;
++        var line_height: []const u8 = "normal";
++        if (slash) |pos| {
++            height = raw[pos + 1 ..];
++        } else if (std.mem.startsWith(u8, families, "/")) {
++            height = "";
++            families = std.mem.trimStart(u8, families[1..], &std.ascii.whitespace);
++        }
++        if (height) |value| {
++            var h = value;
++            if (h.len == 0) {
++                const end = std.mem.indexOfAny(u8, families, &std.ascii.whitespace) orelse return null;
++                h = families[0..end];
++                families = std.mem.trimStart(u8, families[end..], &std.ascii.whitespace);
++            }
++            line_height = h;
++            if (!std.ascii.eqlIgnoreCase(h, "normal") and parseSize(h) == null) {
++                const number = std.fmt.parseFloat(f64, h) catch return null;
++                if (number < 0 or !std.math.isFinite(number)) return null;
++            }
++        }
++        return .{ .size = size, .face = resolveFamilies(families) orelse return null, .size_text = token, .family_text = families, .line_height = line_height, .style = font_style, .variant = variant, .weight = font_weight, .stretch = stretch };
++    }
++    return null;
++}
+ 
+ // Character counts and indices are UTF-16 code units, to match DOM string
+ // semantics: an astral codepoint is two addressable characters in browsers.
+@@ -66,6 +332,56 @@ pub fn substringWidth(text: []const u8, charnum: u32, nchars: u32, font_size: f6
+ /// Line height for `line-height: normal`, in em.
+ pub const LINE_HEIGHT = 1.2;
+ 
++/// Unwrapped inline text. Whitespace state carries across adjacent text nodes.
++pub const TextRun = struct {
++    size: f64,
++    face: FontFace,
++    preserve_spaces: bool,
++    preserve_lines: bool,
++    x: f64 = 0,
++    width: f64 = 0,
++    lines: u32 = 0,
++    pending_space: bool = false,
++    previous_cr: bool = false,
++
++    pub fn add(self: *TextRun, text: []const u8) void {
++        var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
++        var start: usize = 0;
++        while (it.nextCodepoint()) |cp| {
++            const glyph = text[start..it.i];
++            start = it.i;
++            if (cp == '\n' and self.previous_cr and self.preserve_lines) {
++                self.previous_cr = false;
++                continue;
++            }
++            self.previous_cr = cp == '\r';
++            if ((cp == '\n' or cp == '\r') and self.preserve_lines) {
++                self.width = @max(self.width, self.x);
++                self.x = 0;
++                self.lines = @max(self.lines, 1) + 1;
++                self.pending_space = false;
++                continue;
++            }
++            if (cp <= 0x7f and std.ascii.isWhitespace(@intCast(cp)) and !self.preserve_spaces) {
++                self.pending_space = self.x > 0;
++                continue;
++            }
++            if (self.pending_space) {
++                self.x += measureWidth(" ", self.size, self.face);
++                self.pending_space = false;
++            }
++            if (cp == '\t' and self.preserve_spaces) {
++                const stop = measureWidth(" ", self.size, self.face) * 8;
++                if (stop > 0) self.x = (@floor(self.x / stop) + 1) * stop;
++            } else {
++                self.x += measureWidth(glyph, self.size, self.face);
++            }
++            self.lines = @max(self.lines, 1);
++            self.width = @max(self.width, self.x);
++        }
++    }
++};
++
+ /// Greedy line breaking under `white-space: normal`. Text can be added in
+ /// pieces (one per text node) that flow on from each other.
+ pub const LineWrap = struct {
+diff --git a/src/browser/webapi/Element.zig b/src/browser/webapi/Element.zig
+index 1f0858c..7b563c4 100644
+--- a/src/browser/webapi/Element.zig
++++ b/src/browser/webapi/Element.zig
+@@ -1540,9 +1540,42 @@ pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.S
+         }
+     }
+ 
++    if (self.naturalTextSize(frame)) |size| {
++        return .{ .value = @field(size, @tagName(axis)) };
++    }
+     return .{ .value = 5.0 };
+ }
+ 
++// Only leaf inline boxes: block sizing, replaced elements and nested layout
++// retain their existing paths. Read text afresh so mutations cannot stale it.
++fn naturalTextSize(self: *Element, frame: *Frame) ?struct { width: f64, height: f64 } {
++    const owner = self.ownerFrame(frame) orelse return null;
++    const manager = &owner._style_manager;
++    if (!manager.inlineTextBox(self)) return null;
++    const style = manager.textStyle(self);
++    var run: text_measure.TextRun = .{
++        .size = style.size,
++        .face = style.face,
++        .preserve_spaces = style.white_space == .pre or style.white_space == .pre_wrap,
++        .preserve_lines = style.white_space == .pre or style.white_space == .pre_wrap or style.white_space == .pre_line,
++    };
++    var has_text = false;
++    var child = self.asNode().firstChild();
++    while (child) |node| : (child = node.nextSibling()) {
++        if (node.is(Element) != null) return null;
++        if (node.is(Node.CData.Text)) |text| {
++            has_text = true;
++            run.add(text.ownData());
++        }
++    }
++    if (!has_text) return null;
++    return .{ .width = run.width, .height = @as(f64, @floatFromInt(run.lines)) * style.lineHeight() };
++}
++
++fn integerTextAxis(self: *Element, frame: *Frame, value: f64) f64 {
++    return if (self.naturalTextSize(frame) != null) @round(value) else value;
++}
++
+ // The document's <html>, or a <body> under it. These span the document and
+ // scroll the viewport. A script can insert these tags anywhere, and a nested
+ // one gets treated as a normal element.
+@@ -1574,7 +1607,7 @@ fn clientAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
+     if (!self.isVisible(frame)) {
+         return 0.0;
+     }
+-    return self.viewportAxis(frame, axis) orelse self.boxAxis(frame, axis);
++    return self.viewportAxis(frame, axis) orelse self.integerTextAxis(frame, self.boxAxis(frame, axis));
+ }
+ 
+ /// Document.scrollSize, when self is the root scroller (see viewportAxis).
+@@ -1720,7 +1753,7 @@ pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
+         return self.rootScrollSize(frame, .height) orelse height;
+     }
+ 
+-    return @max(height, self.contentAxis(frame, .height));
++    return self.integerTextAxis(frame, @max(height, self.contentAxis(frame, .height)));
+ }
+ 
+ pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
+@@ -1736,7 +1769,7 @@ pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
+         return self.rootScrollSize(frame, .width) orelse width;
+     }
+ 
+-    return @max(width, self.contentAxis(frame, .width));
++    return self.integerTextAxis(frame, @max(width, self.contentAxis(frame, .width)));
+ }
+ 
+ /// Null where we can't prove a limit, which leaves the offset unbounded:
+@@ -1827,7 +1860,7 @@ pub fn getOffsetHeight(self: *Element, frame: *Frame) f64 {
+         return 0.0;
+     }
+     const size = self.boxAxis(frame, .height);
+-    return if (self.is(Html.Image) != null) @round(size) else size;
++    return if (self.is(Html.Image) != null) @round(size) else self.integerTextAxis(frame, size);
+ }
+ 
+ pub fn getOffsetWidth(self: *Element, frame: *Frame) f64 {
+@@ -1835,7 +1868,7 @@ pub fn getOffsetWidth(self: *Element, frame: *Frame) f64 {
+         return 0.0;
+     }
+     const size = self.boxAxis(frame, .width);
+-    return if (self.is(Html.Image) != null) @round(size) else size;
++    return if (self.is(Html.Image) != null) @round(size) else self.integerTextAxis(frame, size);
+ }
+ 
+ pub fn getOffsetTop(self: *Element, frame: *Frame) f64 {
+diff --git a/src/browser/webapi/canvas/context2d.zig b/src/browser/webapi/canvas/context2d.zig
+index a5a0e4e..a4e34e2 100644
+--- a/src/browser/webapi/canvas/context2d.zig
++++ b/src/browser/webapi/canvas/context2d.zig
+@@ -41,187 +41,8 @@ const default_font = "10px sans-serif";
+ const font_capacity = 256;
+ const dash_capacity = 8;
+ 
+-const FontFace = enum { sans, serif, mono };
+-
+-// Representative ASCII advances in 1/1000 em from Adobe's Helvetica and
+-// Times-Roman AFM metrics (matplotlib v3.10.7, mpl-data/fonts/pdfcorefonts).
+-// Modification: only ASCII WX values are retained, without other AFM data.
+-// Copyright (c) 1985, 1987, 1989, 1990, 1997 Adobe Systems Incorporated. All Rights Reserved.
+-// Copyright (c) 1985, 1987, 1989, 1990, 1993, 1997 Adobe Systems Incorporated. All Rights Reserved.
+-//
+-// This file and the 14 PostScript(R) AFM files it accompanies may be used, copied,
+-// and distributed for any purpose and without charge, with or without modification,
+-// provided that all copyright notices are retained; that the AFM files are not
+-// distributed without this file; that all modifications to this file or any of
+-// the AFM files are prominently noted in the modified file(s); and that this
+-// paragraph is not modified. Adobe Systems has no responsibility or obligation
+-// to support the use of the AFM files.
+-//
+-// The Mac families below alias these three models, not installed font files.
+-// No kerning, style-specific shaping, or pixel-identical CoreText is claimed.
+-const sans_advances = [95]u16{
+-    278,  278, 355, 556, 556, 889, 667, 222, 333, 333, 389, 584, 278, 333, 278, 278,
+-    556,  556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
+-    1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+-    667,  778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
+-    222,  556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
+-    556,  556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
+-};
+-const serif_advances = [95]u16{
+-    250, 333, 408, 500, 500, 833, 778, 333, 333, 333, 500, 564, 250, 333, 250, 278,
+-    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444,
+-    921, 722, 667, 667, 722, 611, 556, 722, 722, 333, 389, 722, 611, 889, 722, 722,
+-    556, 722, 667, 556, 611, 722, 722, 944, 722, 722, 611, 333, 278, 333, 469, 500,
+-    333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278, 500, 278, 778, 500, 500,
+-    500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541,
+-};
+-
+-fn fontFace(name: []const u8, quoted: bool) ?FontFace {
+-    const families = .{
+-        .{ "Arial", FontFace.sans },               .{ "Helvetica", FontFace.sans },
+-        .{ "Helvetica Neue", FontFace.sans },      .{ "Verdana", FontFace.sans },
+-        .{ "Tahoma", FontFace.sans },              .{ "Trebuchet MS", FontFace.sans },
+-        .{ "Impact", FontFace.sans },              .{ "Comic Sans MS", FontFace.sans },
+-        .{ "Optima", FontFace.sans },              .{ "Geneva", FontFace.sans },
+-        .{ "Lucida Grande", FontFace.sans },       .{ "Avenir Next", FontFace.sans },
+-        .{ "PingFang SC", FontFace.sans },         .{ "Hiragino Sans", FontFace.sans },
+-        .{ "Apple SD Gothic Neo", FontFace.sans }, .{ "Times", FontFace.serif },
+-        .{ "Times New Roman", FontFace.serif },    .{ "Georgia", FontFace.serif },
+-        .{ "Palatino", FontFace.serif },           .{ "Garamond", FontFace.serif },
+-        .{ "Courier", FontFace.mono },             .{ "Courier New", FontFace.mono },
+-        .{ "Menlo", FontFace.mono },               .{ "Monaco", FontFace.mono },
+-    };
+-    inline for (families) |family| {
+-        if (std.ascii.eqlIgnoreCase(name, family[0])) return family[1];
+-    }
+-    if (!quoted) {
+-        if (std.ascii.eqlIgnoreCase(name, "serif") or
+-            std.ascii.eqlIgnoreCase(name, "ui-serif")) return .serif;
+-        if (std.ascii.eqlIgnoreCase(name, "monospace") or
+-            std.ascii.eqlIgnoreCase(name, "ui-monospace")) return .mono;
+-        inline for (.{ "sans-serif", "system-ui", "ui-sans-serif", "cursive", "fantasy" }) |generic| {
+-            if (std.ascii.eqlIgnoreCase(name, generic)) return .sans;
+-        }
+-    }
+-    return null;
+-}
+-
+-const Family = struct { face: ?FontFace };
+-
+-// Decode CSS escapes and collapse whitespace between unquoted identifiers.
+-// A name too long to match the fixed profile is still a valid unknown family.
+-fn parseFamily(raw: []const u8) ?Family {
+-    const quoted = raw[0] == '"' or raw[0] == '\'';
+-    var name = raw;
+-    if (quoted) {
+-        if (raw.len < 2 or raw[raw.len - 1] != raw[0]) return null;
+-        name = raw[1 .. raw.len - 1];
+-    }
+-    var buf: [256]u8 = undefined;
+-    var len: usize = 0;
+-    var i: usize = 0;
+-    var space = false;
+-    while (i < name.len) {
+-        var c: u21 = name[i];
+-        var encoded: [4]u8 = undefined;
+-        encoded[0] = name[i];
+-        var n: usize = 1;
+-        i += 1;
+-        if (c == '\\') {
+-            if (i == name.len) return null;
+-            const start = i;
+-            while (i < name.len and i - start < 6 and std.ascii.isHex(name[i])) : (i += 1) {}
+-            if (i > start) {
+-                c = std.fmt.parseInt(u21, name[start..i], 16) catch return null;
+-                if (c == 0 or c > 0x10ffff or (c >= 0xd800 and c <= 0xdfff)) c = 0xfffd;
+-                if (i < name.len and std.ascii.isWhitespace(name[i])) {
+-                    const cr = name[i] == '\r';
+-                    i += 1;
+-                    if (cr and i < name.len and name[i] == '\n') i += 1;
+-                }
+-            } else {
+-                c = name[i];
+-                i += 1;
+-                if (c == '\n' or c == '\r' or c == 0x0c) return null;
+-            }
+-            n = std.unicode.utf8Encode(c, &encoded) catch return null;
+-        } else if (!quoted and len == 0 and std.ascii.isDigit(@intCast(c))) {
+-            return null;
+-        } else if (quoted and (c == '\n' or c == '\r' or c == 0x0c)) {
+-            return null;
+-        } else if (!quoted and std.ascii.isWhitespace(@intCast(c))) {
+-            space = len > 0;
+-            continue;
+-        } else if ((quoted and c == raw[0]) or (!quoted and
+-            !(std.ascii.isAlphanumeric(@intCast(c)) or c == '-' or c == '_' or c >= 0x80)))
+-        {
+-            return null;
+-        }
+-        if (space) {
+-            if (len < buf.len) buf[len] = ' ';
+-            len += 1;
+-            space = false;
+-        }
+-        if (len + n <= buf.len) @memcpy(buf[len..][0..n], encoded[0..n]);
+-        len += n;
+-    }
+-    if (len == 0 and !quoted) return null;
+-    if (!quoted and len <= buf.len) {
+-        inline for (.{ "inherit", "initial", "unset", "revert", "revert-layer", "default" }) |keyword| {
+-            if (std.ascii.eqlIgnoreCase(buf[0..len], keyword)) return null;
+-        }
+-    }
+-    return .{ .face = if (len <= buf.len) fontFace(buf[0..len], quoted) else null };
+-}
+-
+-fn resolveFamilies(list: []const u8) ?FontFace {
+-    var selected: ?FontFace = null;
+-    var start: usize = 0;
+-    var quote: u8 = 0;
+-    var i: usize = 0;
+-    while (i <= list.len) : (i += 1) {
+-        if (i == list.len or (list[i] == ',' and quote == 0)) {
+-            if (quote != 0) return null;
+-            const raw = std.mem.trim(u8, list[start..i], &std.ascii.whitespace);
+-            if (raw.len == 0) return null;
+-            const family = parseFamily(raw) orelse return null;
+-            if (selected == null) selected = family.face;
+-            start = i + 1;
+-        } else if (list[i] == '\\') {
+-            i += 1;
+-            if (i == list.len) return null;
+-        } else if (list[i] == quote) {
+-            quote = 0;
+-        } else if (quote == 0 and (list[i] == '"' or list[i] == '\'')) {
+-            quote = list[i];
+-        }
+-    }
+-    // An entirely unknown stack falls back to the browser's default serif.
+-    return selected orelse .serif;
+-}
+-
+-fn measureWidth(text: []const u8, size: f64, face: FontFace) f64 {
+-    var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
+-    var width: f64 = 0;
+-    var start: usize = 0;
+-    while (it.nextCodepoint()) |cp| {
+-        // Canvas replaces ASCII whitespace with spaces before measuring.
+-        const c = if (cp == '\t' or cp == '\n' or cp == '\r' or cp == 0x0c) ' ' else cp;
+-        if (c >= 32 and c <= 126) {
+-            const advance: u16 = switch (face) {
+-                .sans => sans_advances[c - 32],
+-                .serif => serif_advances[c - 32],
+-                .mono => 600,
+-            };
+-            width += @as(f64, @floatFromInt(advance));
+-        } else {
+-            // Retain the Unicode fallback's combining/zero-width handling.
+-            width += text_measure.width(text[start..it.i], 1000);
+-        }
+-        start = it.i;
+-    }
+-    return width * size / 1000;
+-}
++const FontFace = text_measure.FontFace;
++const measureWidth = text_measure.measureWidth;
+ 
+ /// What fillStyle/strokeStyle hold. Gradients and patterns are never painted,
+ /// but they round-trip so a script that assigns one reads it back.
+@@ -465,65 +286,7 @@ pub fn Painting(comptime Context: type) type {
+     };
+ }
+ 
+-const ParsedFont = struct { size: f64, face: FontFace };
+-
+-fn parseSize(token: []const u8) ?f64 {
+-    const units = [_]struct { suffix: []const u8, px: f64 }{
+-        .{ .suffix = "px", .px = 1 },
+-        .{ .suffix = "pt", .px = 4.0 / 3.0 },
+-        .{ .suffix = "rem", .px = 16 },
+-        .{ .suffix = "em", .px = 16 },
+-        .{ .suffix = "%", .px = 0.16 },
+-    };
+-    for (units) |unit| {
+-        if (!std.ascii.endsWithIgnoreCase(token, unit.suffix)) continue;
+-        const number = std.fmt.parseFloat(f64, token[0 .. token.len - unit.suffix.len]) catch continue;
+-        const size = number * unit.px;
+-        if (size < 0 or !std.math.isFinite(size)) return null;
+-        return size;
+-    }
+-    return null;
+-}
+-
+-/// Retain the supported size units and styles, then resolve the family stack.
+-fn parseFont(font: []const u8) ?ParsedFont {
+-    var it = std.mem.tokenizeAny(u8, font, &std.ascii.whitespace);
+-    while (it.next()) |raw| {
+-        const slash = std.mem.indexOfScalar(u8, raw, '/');
+-        const token = raw[0 .. slash orelse raw.len];
+-        const size = parseSize(token) orelse {
+-            const weight = std.fmt.parseInt(u16, raw, 10) catch 0;
+-            var style = weight >= 1 and weight <= 1000;
+-            inline for (.{ "normal", "italic", "oblique", "small-caps", "bold", "bolder", "lighter", "ultra-condensed", "extra-condensed", "condensed", "semi-condensed", "semi-expanded", "expanded", "extra-expanded", "ultra-expanded" }) |keyword| {
+-                if (std.ascii.eqlIgnoreCase(raw, keyword)) style = true;
+-            }
+-            if (!style) return null;
+-            continue;
+-        };
+-        var families = std.mem.trim(u8, font[it.index..], &std.ascii.whitespace);
+-        var height: ?[]const u8 = null;
+-        if (slash) |pos| {
+-            height = raw[pos + 1 ..];
+-        } else if (std.mem.startsWith(u8, families, "/")) {
+-            height = "";
+-            families = std.mem.trimStart(u8, families[1..], &std.ascii.whitespace);
+-        }
+-        if (height) |value| {
+-            var h = value;
+-            if (h.len == 0) {
+-                const end = std.mem.indexOfAny(u8, families, &std.ascii.whitespace) orelse return null;
+-                h = families[0..end];
+-                families = std.mem.trimStart(u8, families[end..], &std.ascii.whitespace);
+-            }
+-            if (!std.ascii.eqlIgnoreCase(h, "normal") and parseSize(h) == null) {
+-                const number = std.fmt.parseFloat(f64, h) catch return null;
+-                if (number < 0 or !std.math.isFinite(number)) return null;
+-            }
+-        }
+-        return .{ .size = size, .face = resolveFamilies(families) orelse return null };
+-    }
+-    return null;
+-}
++const parseFont = text_measure.parseFont;
+ 
+ const testing = std.testing;
+ test "context2d: parseFont" {
+diff --git a/src/browser/webapi/css/CSSStyleDeclaration.zig b/src/browser/webapi/css/CSSStyleDeclaration.zig
+index e581def..bcde4e8 100644
+--- a/src/browser/webapi/css/CSSStyleDeclaration.zig
++++ b/src/browser/webapi/css/CSSStyleDeclaration.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -20,6 +21,8 @@ const std = @import("std");
+ const lp = @import("lightpanda");
+ 
+ const CssParser = @import("../../css/Parser.zig");
++const text_measure = @import("../../text_measure.zig");
++const StyleManager = @import("../../StyleManager.zig");
+ 
+ const js = @import("../../js/js.zig");
+ const Frame = @import("../../Frame.zig");
+@@ -82,6 +85,9 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
+         if (self._element) |element| {
+             if (element.ownerFrame(frame)) |owner| {
+                 const style_manager = &owner._style_manager;
++                if (wrapped.eql(comptime .wrap("font-size"))) {
++                    return std.fmt.allocPrint(frame.local_arena, "{d}px", .{style_manager.computedFontSize(element)}) catch "16px";
++                }
+                 if (wrapped.eql(comptime .wrap("display"))) {
+                     if (style_manager.hasDisplayNone(element)) {
+                         return "none";
+@@ -155,6 +161,32 @@ pub fn declaredValue(self: *const CSSStyleDeclaration, name: String, frame: *Fra
+         pair.formatValue(&buf.writer) catch return null;
+         return buf.written();
+     }
++    if (name.eql(comptime .wrap("font"))) {
++        var values: [font_longhands.len][]const u8 = undefined;
++        var important: ?bool = null;
++        inline for (font_longhands, 0..) |longhand, i| {
++            const property = self.findProperty(.wrap(longhand)) orelse return null;
++            if (important) |priority| {
++                if (priority != property._important) return null;
++            }
++            important = property._important;
++            values[i] = property._value.str();
++        }
++        if (fontParts(values[0]) != null) {
++            for (values[1..]) |value| {
++                if (!std.mem.eql(u8, value, values[0])) return null;
++            }
++            return values[0];
++        }
++        var result = std.Io.Writer.Allocating.init(frame.local_arena);
++        for (values[3..]) |value| {
++            if (!std.ascii.eqlIgnoreCase(value, "normal")) result.writer.print("{s} ", .{value}) catch return null;
++        }
++        result.writer.writeAll(values[0]) catch return null;
++        if (!std.ascii.eqlIgnoreCase(values[2], "normal")) result.writer.print("/{s}", .{values[2]}) catch return null;
++        result.writer.print(" {s}", .{values[1]}) catch return null;
++        return result.written();
++    }
+     const prop = self.findProperty(name) orelse return null;
+     return prop._value.str();
+ }
+@@ -212,6 +244,13 @@ pub fn getPropertyPriority(self: *const CSSStyleDeclaration, property_name: []co
+ 
+ /// Whether a declared property is !important; false when it isn't declared.
+ pub fn declaredImportant(self: *const CSSStyleDeclaration, name: String) bool {
++    if (name.eql(comptime .wrap("font"))) {
++        inline for (font_longhands) |longhand| {
++            const property = self.findProperty(.wrap(longhand)) orelse return false;
++            if (!property._important) return false;
++        }
++        return true;
++    }
+     if (CssParser.axisShorthand(name.str())) |shorthand| {
+         const x = self.findProperty(.wrap(shorthand.x)) orelse return false;
+         const pair = self.axisPair(x) orelse return false;
+@@ -244,6 +283,13 @@ pub fn setProperty(self: *CSSStyleDeclaration, property_name: []const u8, value:
+ /// setProperty path, within a single declaration block a normal declaration must
+ /// not override an earlier !important one (CSS cascade precedence).
+ fn applyParsedDeclaration(self: *CSSStyleDeclaration, declaration: CssParser.Declaration, frame: *Frame) !void {
++    if (std.ascii.eqlIgnoreCase(declaration.name, "font")) {
++        const parts = fontParts(declaration.value) orelse return;
++        inline for (font_longhands, 0..) |name, i| {
++            try self.applyParsedDeclaration(.{ .name = name, .value = parts[i], .important = declaration.important }, frame);
++        }
++        return;
++    }
+     const normalized = normalizePropertyName(declaration.name, &frame.buf);
+     if (CssParser.axisShorthand(normalized)) |shorthand| {
+         const values = CssParser.splitAxisPair(declaration.value) orelse return;
+@@ -251,6 +297,7 @@ fn applyParsedDeclaration(self: *CSSStyleDeclaration, declaration: CssParser.Dec
+         try self.applyParsedDeclaration(.{ .name = shorthand.y, .value = values.y, .important = declaration.important }, frame);
+         return;
+     }
++    if (!StyleManager.validTextDeclaration(normalized, declaration.value)) return;
+     if (!declaration.important) {
+         if (self.findProperty(.wrap(normalized))) |existing| {
+             if (existing._important) return;
+@@ -259,6 +306,24 @@ fn applyParsedDeclaration(self: *CSSStyleDeclaration, declaration: CssParser.Dec
+     _ = try self.setPropertyImpl(declaration.name, declaration.value, declaration.important, frame);
+ }
+ 
++const font_longhands = .{ "font-size", "font-family", "line-height", "font-style", "font-variant", "font-weight", "font-stretch" };
++
++fn isTextCascadeProperty(name: []const u8) bool {
++    if (std.ascii.eqlIgnoreCase(name, "all") or std.ascii.eqlIgnoreCase(name, "white-space")) return true;
++    inline for (font_longhands) |property| {
++        if (std.ascii.eqlIgnoreCase(name, property)) return true;
++    }
++    return false;
++}
++
++fn fontParts(value: []const u8) ?[font_longhands.len][]const u8 {
++    if (text_measure.parseFont(value)) |font| return .{ font.size_text, font.family_text, font.line_height, font.style, font.variant, font.weight, font.stretch };
++    inline for (.{ "inherit", "initial", "unset", "revert", "revert-layer" }) |keyword| {
++        if (std.ascii.eqlIgnoreCase(value, keyword)) return @splat(value);
++    }
++    return null;
++}
++
+ fn initOwnedString(allocator: Allocator, value: []const u8) !String {
+     if (value.len <= 12) return String.wrap(value);
+     if (value.len >= std.math.maxInt(i32)) return error.StringTooLarge;
+@@ -270,6 +335,14 @@ fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value:
+         return (try self.removePropertyImpl(property_name, frame)) != null;
+     }
+ 
++    if (std.ascii.eqlIgnoreCase(property_name, "font")) {
++        const parts = fontParts(value) orelse return false;
++        var changed = false;
++        inline for (font_longhands, 0..) |name, i| {
++            changed = (try self.setPropertyImpl(name, parts[i], important, frame)) or changed;
++        }
++        return changed;
++    }
+     const normalized = normalizePropertyName(property_name, &frame.buf);
+     if (CssParser.axisShorthand(normalized)) |shorthand| {
+         const values = CssParser.splitAxisPair(value) orelse return false;
+@@ -278,17 +351,31 @@ fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value:
+         return x or y;
+     }
+ 
++    if (!StyleManager.validTextDeclaration(normalized, value)) return false;
++
+     // Normalize the value for canonical serialization
+     const normalized_value = try normalizePropertyValue(frame.local_arena, normalized, value);
+ 
+     // Find existing property
+     if (self.findProperty(.wrap(normalized))) |existing| {
+-        if (existing._value.eql(.wrap(normalized_value)) and existing._important == important) return false;
++        // Keep resets and later text longhands in cascade order, including
++        // an imperative write after an existing all:initial declaration.
++        const reorder = isTextCascadeProperty(normalized) and existing._node.next != null;
++        if (existing._value.eql(.wrap(normalized_value)) and existing._important == important) {
++            if (!reorder) return false;
++            self._properties.remove(&existing._node);
++            self._properties.append(&existing._node);
++            return true;
++        }
+         const allocator = frame._factory.storageAllocator();
+         const new_value = try initOwnedString(allocator, normalized_value);
+         existing._value.deinit(allocator);
+         existing._value = new_value;
+         existing._important = important;
++        if (reorder) {
++            self._properties.remove(&existing._node);
++            self._properties.append(&existing._node);
++        }
+         return true;
+     }
+ 
+@@ -313,6 +400,14 @@ pub fn removeProperty(self: *CSSStyleDeclaration, property_name: []const u8, fra
+ }
+ 
+ fn removePropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, frame: *Frame) !?[]const u8 {
++    if (std.ascii.eqlIgnoreCase(property_name, "font")) {
++        const old = self.declaredValue(comptime .wrap("font"), frame) orelse "";
++        var removed = false;
++        inline for (font_longhands) |name| {
++            removed = (try self.removePropertyImpl(name, frame) != null) or removed;
++        }
++        return if (removed) old else null;
++    }
+     const normalized = normalizePropertyName(property_name, &frame.buf);
+     if (CssParser.axisShorthand(normalized)) |shorthand| {
+         const old_value = self.declaredValue(.wrap(shorthand.name), frame) orelse "";
+@@ -989,7 +1084,7 @@ fn getDefaultPropertyValue(self: *const CSSStyleDeclaration, name: String) []con
+     return "";
+ }
+ 
+-fn getDefaultDisplay(element: *const Element) []const u8 {
++pub fn getDefaultDisplay(element: *const Element) []const u8 {
+     switch (element._type) {
+         .html => {
+             return switch (element.subtype(Element.Html)._type) {

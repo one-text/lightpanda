@@ -1,0 +1,716 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 9 Nov 2026 18:43:32 -0300
+Subject: [PATCH] webapi: apply CSS transforms to visual box geometry
+
+Compose planar transforms and box-relative origins using DOMMatrix helpers. Keep layout metrics untransformed; align client rectangles, quad hit testing and document overflow. Track cascaded transforms with owned CSSOM strings and mutation invalidation. Preserve the untransformed hit-testing fast path and SVG syntax. Update existing position assertions.
+
+Targets transformed-text-geometry without a native renderer. Upstream tests: 1658/1658; ignored geometry diagnostics: 26/26. Full 3D/perspective and complete CSS layout remain out of scope.
+---
+ src/browser/StyleManager.zig                  |  40 +++-
+ src/browser/tests/element/position.html       |  15 +-
+ src/browser/webapi/DOMMatrixReadOnly.zig      |  48 +++--
+ src/browser/webapi/Document.zig               |  39 ++--
+ src/browser/webapi/Element.zig                | 203 +++++++++++++++---
+ .../webapi/css/CSSStyleDeclaration.zig        |  12 +-
+ src/browser/webapi/css/CSSStyleSheet.zig      |   2 +
+ 7 files changed, 288 insertions(+), 71 deletions(-)
+
+diff --git a/src/browser/StyleManager.zig b/src/browser/StyleManager.zig
+index 68ec978..e8e3cb3 100644
+--- a/src/browser/StyleManager.zig
++++ b/src/browser/StyleManager.zig
+@@ -56,6 +56,7 @@ arena: *lp.Arena,
+ 
+ visibility: Group(Visibility) = .{},
+ geometry: Group(Geometry) = .{},
++transforms: Group(Transforms) = .{},
+ text: Group(Text) = .{},
+ 
+ // Keyed by property name, pruning to what is (hopefully) one or few rules
+@@ -728,6 +729,12 @@ pub fn positioning(self: *StyleManager, el: *Element) Positioning {
+     return .{ .position = p.position, .left = p.left.resolve(viewport), .top = p.top.resolve(viewport) };
+ }
+ 
++pub fn transformStyle(self: *StyleManager, el: *Element) Transforms.Computed {
++    self.assertOwns(el);
++    self.rebuildIfDirty() catch return .{};
++    return self.transforms.ownProps(self.arena.allocator(), el, self.frame);
++}
++
+ /// Like declaredSize, but only the inline style counts.
+ pub fn inlineSize(self: *StyleManager, el: *Element, comptime axis: Element.Axis) ?f64 {
+     self.assertOwns(el);
+@@ -1023,7 +1030,13 @@ fn addRule(self: *StyleManager, style_rule: *CSSStyleRule) !bool {
+         return false;
+     }
+     const style = style_rule._style orelse return false;
+-    const folded = extractDeclared(Declarations, style);
++    var folded = extractDeclared(Declarations, style);
++    // CSSOM can replace or destroy Property storage while these rules live.
++    inline for (Declarations.names, &folded.slots) |name, *slot| {
++        if (comptime std.mem.eql(u8, name, "transform") or std.mem.eql(u8, name, "transform-origin")) {
++            if (slot.value) |value| slot.value = try self.arena.allocator().dupe(u8, value);
++        }
++    }
+     const customs = try self.extractCustomDeclarations(style);
+ 
+     // A custom rule holds selector_text until the property is looked up, but it
+@@ -1401,6 +1414,28 @@ const Geometry = struct {
+     };
+ };
+ 
++const Transforms = struct {
++    const Declared = struct {
++        const names = [_][]const u8{ "transform", "transform-origin" };
++
++        transform: ?[]const u8 = null,
++        transform_origin: ?[]const u8 = null,
++
++        fn apply(self: *Declared, name: []const u8, value: []const u8) void {
++            if (std.ascii.eqlIgnoreCase(name, "transform")) {
++                self.transform = value;
++            } else if (std.ascii.eqlIgnoreCase(name, "transform-origin")) {
++                self.transform_origin = value;
++            }
++        }
++    };
++
++    const Computed = struct {
++        transform: []const u8 = "none",
++        transform_origin: []const u8 = "50% 50%",
++    };
++};
++
+ const TextLength = struct {
+     value: f64 = 0,
+     unit: enum { presentation, inherit, normal, px, em, percentage, rem, number } = .inherit,
+@@ -1566,10 +1601,11 @@ fn rootFontSize(self: *StyleManager, current: *Element, depth: u8) f64 {
+ /// once. Field names match the StyleManager's group fields.
+ const Declarations = struct {
+     // display is already present in Visibility's names.
+-    const names = Visibility.Declared.names ++ Geometry.Declared.names ++ Text.Declared.names[1..];
++    const names = Visibility.Declared.names ++ Geometry.Declared.names ++ Transforms.Declared.names ++ Text.Declared.names[1..];
+ 
+     visibility: Visibility.Declared = .{},
+     geometry: Geometry.Declared = .{},
++    transforms: Transforms.Declared = .{},
+     text: Text.Declared = .{},
+ 
+     fn apply(self: *Declarations, name: []const u8, value: []const u8) void {
+diff --git a/src/browser/tests/element/position.html b/src/browser/tests/element/position.html
+index 03011d7..936e74c 100644
+--- a/src/browser/tests/element/position.html
++++ b/src/browser/tests/element/position.html
+@@ -234,17 +234,20 @@
+   testing.expectEqual(base, card.getBoundingClientRect().x);
+   testing.expectEqual(base, card.offsetLeft);
+ 
+-  // The X translation of the element and of its ancestors moves it.
++  // Visual transforms move rectangles, not layout offsets.
+   track.style.transform = 'translateX(-12.5px)';
+   testing.expectEqual(base - 12.5, card.getBoundingClientRect().x);
+-  testing.expectEqual(base - 12.5, card.offsetLeft);
++  testing.expectEqual(base, card.offsetLeft);
++  const width = card.offsetWidth;
++  const height = card.offsetHeight;
+   card.style.transform = 'translate3d(2px, 100px, 0) rotate(45deg) matrix(1, 0, 0, 1, 3, 9)';
+-  testing.expectEqual(base - 7.5, card.getBoundingClientRect().x);
+-  testing.expectEqual(base - 7.5, card.offsetLeft);
++  const shift = 2 + width / 2 + Math.SQRT1_2 * (3 - width / 2 - 9 - height / 2);
++  testing.expectTrue(Math.abs(base - 12.5 + shift - card.getBoundingClientRect().x) < 1e-8);
++  testing.expectEqual(base, card.offsetLeft);
+ 
+-  // Percentages and other units are not resolved.
++  // Percentage translations resolve against the transformed element's box.
+   track.style.transform = 'translateX(-100%)';
+-  testing.expectEqual(base + 5, card.getBoundingClientRect().x);
++  testing.expectTrue(Math.abs(base - track.offsetWidth + shift - card.getBoundingClientRect().x) < 1e-8);
+ }
+ </script>
+ 
+diff --git a/src/browser/webapi/DOMMatrixReadOnly.zig b/src/browser/webapi/DOMMatrixReadOnly.zig
+index 3bd40f5..ba5fdc5 100644
+--- a/src/browser/webapi/DOMMatrixReadOnly.zig
++++ b/src/browser/webapi/DOMMatrixReadOnly.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -456,9 +457,8 @@ pub fn parseTransformFunction(function: TransformFunction, syntax: TransformSynt
+     var units: [16]ParsedValue.Unit = undefined;
+     const count = try parseArguments(function.arguments, syntax, &values, &units);
+     const name = function.name;
+-    const Eql = std.mem.eql;
+ 
+-    if (Eql(u8, name, "matrix")) {
++    if (transformNameEquals(syntax, name, "matrix")) {
+         try requireCount(count, 6, 6);
+         try requireUnitless(units[0..count]);
+         return makeParsedTransform(.matrix, .{
+@@ -469,72 +469,72 @@ pub fn parseTransformFunction(function: TransformFunction, syntax: TransformSynt
+         }, values, count, true);
+     }
+ 
+-    if (Eql(u8, name, "matrix3d")) {
++    if (transformNameEquals(syntax, name, "matrix3d")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 16, 16);
+         try requireUnitless(units[0..count]);
+         return makeParsedTransform(.matrix3d, values, values, count, false);
+     }
+ 
+-    if (Eql(u8, name, "translate")) {
++    if (transformNameEquals(syntax, name, "translate")) {
+         try requireCount(count, 1, 2);
+         if (syntax == .svg) try requireUnitless(units[0..count]);
+         const ty = if (count == 2) values[1] else 0;
+         return makeParsedTransform(.translate, translationMatrix(values[0], ty, 0), values, count, true);
+     }
+-    if (Eql(u8, name, "translateX")) {
++    if (transformNameEquals(syntax, name, "translateX")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 1, 1);
+         return makeParsedTransform(.translate_x, translationMatrix(values[0], 0, 0), values, count, true);
+     }
+-    if (Eql(u8, name, "translateY")) {
++    if (transformNameEquals(syntax, name, "translateY")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 1, 1);
+         return makeParsedTransform(.translate_y, translationMatrix(0, values[0], 0), values, count, true);
+     }
+-    if (Eql(u8, name, "translateZ")) {
++    if (transformNameEquals(syntax, name, "translateZ")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 1, 1);
+         return makeParsedTransform(.translate_z, translationMatrix(0, 0, values[0]), values, count, false);
+     }
+-    if (Eql(u8, name, "translate3d")) {
++    if (transformNameEquals(syntax, name, "translate3d")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 3, 3);
+         return makeParsedTransform(.translate_3d, translationMatrix(values[0], values[1], values[2]), values, count, false);
+     }
+ 
+-    if (Eql(u8, name, "scale")) {
++    if (transformNameEquals(syntax, name, "scale")) {
+         try requireCount(count, 1, 2);
+         try requireUnitless(units[0..count]);
+         const sy = if (count == 2) values[1] else values[0];
+         return makeParsedTransform(.scale, scaleMatrix(values[0], sy, 1), values, count, true);
+     }
+-    if (Eql(u8, name, "scaleX")) {
++    if (transformNameEquals(syntax, name, "scaleX")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 1, 1);
+         try requireUnitless(units[0..count]);
+         return makeParsedTransform(.scale_x, scaleMatrix(values[0], 1, 1), values, count, true);
+     }
+-    if (Eql(u8, name, "scaleY")) {
++    if (transformNameEquals(syntax, name, "scaleY")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 1, 1);
+         try requireUnitless(units[0..count]);
+         return makeParsedTransform(.scale_y, scaleMatrix(1, values[0], 1), values, count, true);
+     }
+-    if (Eql(u8, name, "scaleZ")) {
++    if (transformNameEquals(syntax, name, "scaleZ")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 1, 1);
+         try requireUnitless(units[0..count]);
+         return makeParsedTransform(.scale_z, scaleMatrix(1, 1, values[0]), values, count, false);
+     }
+-    if (Eql(u8, name, "scale3d")) {
++    if (transformNameEquals(syntax, name, "scale3d")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 3, 3);
+         try requireUnitless(units[0..count]);
+         return makeParsedTransform(.scale_3d, scaleMatrix(values[0], values[1], values[2]), values, count, false);
+     }
+ 
+-    if (Eql(u8, name, "rotate")) {
++    if (transformNameEquals(syntax, name, "rotate")) {
+         try requireCount(count, 1, if (syntax == .svg) 3 else 1);
+         if (count != 1 and count != 3) return error.SyntaxError;
+         try requireAngle(units[0]);
+@@ -547,15 +547,15 @@ pub fn parseTransformFunction(function: TransformFunction, syntax: TransformSynt
+         }
+         return makeParsedTransform(.rotate, matrix, values, count, true);
+     }
+-    if (Eql(u8, name, "rotateX") or Eql(u8, name, "rotateY") or Eql(u8, name, "rotateZ")) {
++    if (transformNameEquals(syntax, name, "rotateX") or transformNameEquals(syntax, name, "rotateY") or transformNameEquals(syntax, name, "rotateZ")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 1, 1);
+         try requireAngle(units[0]);
+-        if (Eql(u8, name, "rotateX")) return makeParsedTransform(.rotate_x, rotateXMatrix(toRadians(values[0], units[0])), values, count, false);
+-        if (Eql(u8, name, "rotateY")) return makeParsedTransform(.rotate_y, rotateYMatrix(toRadians(values[0], units[0])), values, count, false);
++        if (transformNameEquals(syntax, name, "rotateX")) return makeParsedTransform(.rotate_x, rotateXMatrix(toRadians(values[0], units[0])), values, count, false);
++        if (transformNameEquals(syntax, name, "rotateY")) return makeParsedTransform(.rotate_y, rotateYMatrix(toRadians(values[0], units[0])), values, count, false);
+         return makeParsedTransform(.rotate_z, rotateZMatrix(toRadians(values[0], units[0])), values, count, false);
+     }
+-    if (Eql(u8, name, "rotate3d")) {
++    if (transformNameEquals(syntax, name, "rotate3d")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 4, 4);
+         try requireUnitless(units[0..3]);
+@@ -563,7 +563,7 @@ pub fn parseTransformFunction(function: TransformFunction, syntax: TransformSynt
+         return makeParsedTransform(.rotate_3d, axisAngleMatrix(values[0], values[1], values[2], toRadians(values[3], units[3])), values, count, false);
+     }
+ 
+-    if (Eql(u8, name, "skew")) {
++    if (transformNameEquals(syntax, name, "skew")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 1, 2);
+         try requireAngle(units[0]);
+@@ -571,15 +571,15 @@ pub fn parseTransformFunction(function: TransformFunction, syntax: TransformSynt
+         const ay = if (count == 2) toRadians(values[1], units[1]) else 0;
+         return makeParsedTransform(.skew, skewMatrix(toRadians(values[0], units[0]), ay), values, count, true);
+     }
+-    if (Eql(u8, name, "skewX") or Eql(u8, name, "skewY")) {
++    if (transformNameEquals(syntax, name, "skewX") or transformNameEquals(syntax, name, "skewY")) {
+         try requireCount(count, 1, 1);
+         try requireAngle(units[0]);
+         if (syntax == .svg and units[0] != .none) return error.SyntaxError;
+-        if (Eql(u8, name, "skewX")) return makeParsedTransform(.skew_x, skewMatrix(toRadians(values[0], units[0]), 0), values, count, true);
++        if (transformNameEquals(syntax, name, "skewX")) return makeParsedTransform(.skew_x, skewMatrix(toRadians(values[0], units[0]), 0), values, count, true);
+         return makeParsedTransform(.skew_y, skewMatrix(0, toRadians(values[0], units[0])), values, count, true);
+     }
+ 
+-    if (Eql(u8, name, "perspective")) {
++    if (transformNameEquals(syntax, name, "perspective")) {
+         if (syntax == .svg) return error.SyntaxError;
+         try requireCount(count, 1, 1);
+         var matrix = identity();
+@@ -590,6 +590,10 @@ pub fn parseTransformFunction(function: TransformFunction, syntax: TransformSynt
+     return error.SyntaxError;
+ }
+ 
++fn transformNameEquals(syntax: TransformSyntax, name: []const u8, expected: []const u8) bool {
++    return if (syntax == .css) std.ascii.eqlIgnoreCase(name, expected) else std.mem.eql(u8, name, expected);
++}
++
+ fn makeParsedTransform(kind: TransformKind, matrix: [16]f64, values: [16]f64, count: usize, is_2d: bool) ParsedTransform {
+     return .{ .kind = kind, .matrix = matrix, .values = values, .count = count, .is_2d = is_2d };
+ }
+diff --git a/src/browser/webapi/Document.zig b/src/browser/webapi/Document.zig
+index 914b9a5..a7a1bcd 100644
+--- a/src/browser/webapi/Document.zig
++++ b/src/browser/webapi/Document.zig
+@@ -524,6 +524,7 @@ pub fn extent(self: *Document) Extent {
+ 
+     const style_manager = &frame._style_manager;
+     var size: Extent = .{ .width = 0, .height = 0 };
++    var transformed_overflow: std.ArrayList(*Element) = .empty;
+ 
+     // A nested spacer (virtualized lists) must extend the document even when
+     // its auto-height ancestors count as 5px each. Body's own children are
+@@ -541,6 +542,7 @@ pub fn extent(self: *Document) Extent {
+                 // scrolling. A scroll container owns its own overflow instead.
+                 const container = parent.scrollContainer(.{ .x = true, .y = true }, frame);
+                 if (container == .viewport) {
++                    if (el.hasVisualTransform(frame)) transformed_overflow.append(frame.local_arena, el) catch {};
+                     if (el.positionedClientCoordinate(frame, .height)) |y| {
+                         size.height = @max(size.height, y + @as(f64, @floatFromInt(frame.window.getScrollY())) + el.boxAxis(frame, .height));
+                     }
+@@ -582,6 +584,14 @@ pub fn extent(self: *Document) Extent {
+         .viewport_height = viewport.height,
+         .extent = size,
+     };
++    // Seed the layout extent before resolving visual overflow: a transformed
++    // root's percentage origin/translation can read its document-sized box.
++    for (transformed_overflow.items) |el| {
++        const rect = el.boundingClientRectValuesForVisible(frame);
++        size.width = @max(size.width, @ceil(rect.x + rect.width + @as(f64, @floatFromInt(frame.window.getScrollX()))));
++        size.height = @max(size.height, @ceil(rect.y + rect.height + @as(f64, @floatFromInt(frame.window.getScrollY()))));
++    }
++    self._extent.?.extent = size;
+     return size;
+ }
+ 
+@@ -1021,9 +1031,9 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame:
+     if (!ignore_x and (!std.math.isFinite(x) or x < 0 or x >= @as(f64, @floatFromInt(viewport.width)))) return null;
+     const style_manager = &owner._style_manager;
+     var flow_positions: Element.FlowPositions = .empty;
+-    const Entry = struct { node: *Node, hidden: bool };
++    const Entry = struct { node: *Node, hidden: bool, transformed: bool };
+     var stack: std.ArrayList(Entry) = .empty;
+-    try stack.append(frame.local_arena, .{ .node = root, .hidden = false });
++    try stack.append(frame.local_arena, .{ .node = root, .hidden = false, .transformed = false });
+ 
+     var preorder_index: f64 = 0;
+ 
+@@ -1031,6 +1041,7 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame:
+         const entry = stack.pop() orelse break;
+         const node = entry.node;
+         var hidden = entry.hidden;
++        var transformed = entry.transformed;
+         const pos = preorder_index * 5.0;
+ 
+         preorder_index += 1;
+@@ -1038,16 +1049,20 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame:
+             try flow_positions.put(frame.local_arena, element, pos);
+             hidden = hidden or style_manager.hasDisplayNone(element);
+             if (!hidden) {
+-                const top = element.clientCoordinate(frame, .height, &flow_positions);
+-                if (y >= top and y <= top + element.boxAxis(frame, .height)) {
+-                    if (ignore_x) {
+-                        topmost = element;
+-                    } else {
+-                        // only bother calculating the horiziontal position for
+-                        // elements contained by the vertical band
+-                        const left = element.horizontalPosition(frame);
+-                        if (x >= left and x <= left + element.boxAxis(frame, .width)) {
++                const transform = style_manager.transformStyle(element).transform;
++                transformed = transformed or (transform.len > 0 and !std.ascii.eqlIgnoreCase(transform, "none"));
++                if (transformed) {
++                    if (element.transformedContains(x, y, ignore_x, frame, &flow_positions)) topmost = element;
++                } else {
++                    // Ordinary pages retain the vertical-only fast path; do
++                    // not scan horizontal siblings until the Y band matches.
++                    const top = element.clientCoordinate(frame, .height, &flow_positions);
++                    if (y >= top and y <= top + element.boxAxis(frame, .height)) {
++                        if (ignore_x) {
+                             topmost = element;
++                        } else {
++                            const left = element.horizontalPosition(frame);
++                            if (x >= left and x <= left + element.boxAxis(frame, .width)) topmost = element;
+                         }
+                     }
+                 }
+@@ -1057,7 +1072,7 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame:
+         // Add children to stack in reverse order so we process them in document order
+         var child = node.lastChild();
+         while (child) |c| {
+-            try stack.append(frame.local_arena, .{ .node = c, .hidden = hidden });
++            try stack.append(frame.local_arena, .{ .node = c, .hidden = hidden, .transformed = transformed });
+             child = c.previousSibling();
+         }
+     }
+diff --git a/src/browser/webapi/Element.zig b/src/browser/webapi/Element.zig
+index 7b563c4..df12c16 100644
+--- a/src/browser/webapi/Element.zig
++++ b/src/browser/webapi/Element.zig
+@@ -27,7 +27,8 @@ const StyleManager = @import("../StyleManager.zig");
+ const Factory = @import("../Factory.zig");
+ const text_measure = @import("../text_measure.zig");
+ 
+-const CSS = @import("CSS.zig");
++const Matrix = @import("DOMMatrixReadOnly.zig");
++const units = @import("../css/units.zig");
+ const Node = @import("Node.zig");
+ const TreeWalker = @import("TreeWalker.zig");
+ const ShadowRoot = @import("ShadowRoot.zig");
+@@ -1666,12 +1667,177 @@ pub fn boundingClientRectValues(self: *Element, frame: *Frame) DOMRect.Data {
+ 
+ // Some cases need the bounding rect but have already done the visibility check.
+ pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect.Data {
+-    return .{
+-        .x = self.horizontalPosition(frame),
+-        .y = self.clientCoordinate(frame, .height, null),
++    return self.clientRectValues(frame, null);
++}
++
++pub fn clientRectValues(self: *Element, frame: *Frame, positions: ?*const FlowPositions) DOMRect.Data {
++    const corners = self.clientQuadValues(frame, positions);
++    var left = corners[0][0];
++    var right = left;
++    var top = corners[0][1];
++    var bottom = top;
++    for (corners[1..]) |point| {
++        left = @min(left, point[0]);
++        right = @max(right, point[0]);
++        top = @min(top, point[1]);
++        bottom = @max(bottom, point[1]);
++    }
++    return .{ .x = left, .y = top, .width = right - left, .height = bottom - top };
++}
++
++pub fn hasVisualTransform(self: *Element, frame: *Frame) bool {
++    const owner = self.ownerFrame(frame) orelse return false;
++    var current: ?*Element = self;
++    while (current) |element| : (current = layoutParent(element)) {
++        const transform = owner._style_manager.transformStyle(element).transform;
++        if (transform.len > 0 and !std.ascii.eqlIgnoreCase(transform, "none")) return true;
++    }
++    return false;
++}
++
++pub fn transformedContains(self: *Element, x: f64, y: f64, ignore_x: bool, frame: *Frame, positions: *const FlowPositions) bool {
++    const corners = self.clientQuadValues(frame, positions);
++    if (ignore_x) {
++        var top = corners[0][1];
++        var bottom = top;
++        for (corners[1..]) |point| {
++            top = @min(top, point[1]);
++            bottom = @max(bottom, point[1]);
++        }
++        return y >= top and y <= bottom;
++    }
++    var positive = false;
++    var negative = false;
++    for (corners, 0..) |point, i| {
++        const next = corners[(i + 1) % corners.len];
++        const cross = (next[0] - point[0]) * (y - point[1]) - (next[1] - point[1]) * (x - point[0]);
++        positive = positive or cross > 0;
++        negative = negative or cross < 0;
++        if (positive and negative) return false;
++    }
++    return positive != negative;
++}
++
++// Keep layout coordinates untransformed. Apply each ancestor's visual matrix
++// to the original corners, not intermediate bounding boxes (which lose rotation).
++fn clientQuadValues(self: *Element, frame: *Frame, positions: ?*const FlowPositions) [4][2]f64 {
++    const rect: DOMRect.Data = .{
++        .x = self.clientCoordinate(frame, .width, positions),
++        .y = self.clientCoordinate(frame, .height, positions),
+         .width = self.boxAxis(frame, .width),
+         .height = self.boxAxis(frame, .height),
+     };
++    const original = [4][2]f64{
++        .{ rect.x, rect.y },
++        .{ rect.x + rect.width, rect.y },
++        .{ rect.x + rect.width, rect.y + rect.height },
++        .{ rect.x, rect.y + rect.height },
++    };
++    const owner = self.ownerFrame(frame) orelse return original;
++    var corners = original;
++    var current: ?*Element = self;
++    while (current) |element| : (current = layoutParent(element)) {
++        const style = owner._style_manager.transformStyle(element);
++        if (style.transform.len == 0 or std.ascii.eqlIgnoreCase(style.transform, "none")) continue;
++        const width = element.boxAxis(owner, .width);
++        const height = element.boxAxis(owner, .height);
++        const matrix = element.visualTransform(style.transform, width, height, owner) orelse continue;
++        const origin = element.transformOrigin(style.transform_origin, width, height, owner);
++        const ox = element.clientCoordinate(owner, .width, positions) + origin[0];
++        const oy = element.clientCoordinate(owner, .height, positions) + origin[1];
++        for (&corners) |*point| {
++            const x = point[0] - ox;
++            const y = point[1] - oy;
++            point.* = .{ matrix[0] * x + matrix[4] * y + matrix[12] + ox, matrix[1] * x + matrix[5] * y + matrix[13] + oy };
++            if (!std.math.isFinite(point[0]) or !std.math.isFinite(point[1])) return original;
++        }
++    }
++    return corners;
++}
++
++fn visualTransform(self: *Element, value: []const u8, width: f64, height: f64, frame: *Frame) ?[16]f64 {
++    var matrix = Matrix.identity();
++    var iterator = Matrix.TransformFunctionIterator{ .input = value };
++    while (iterator.next() catch return null) |function| {
++        const translation = std.ascii.eqlIgnoreCase(function.name, "translate") or
++            std.ascii.eqlIgnoreCase(function.name, "translateX") or
++            std.ascii.eqlIgnoreCase(function.name, "translateY") or
++            std.ascii.eqlIgnoreCase(function.name, "translateZ") or
++            std.ascii.eqlIgnoreCase(function.name, "translate3d");
++        const next = if (translation) blk: {
++            const single_y = std.ascii.eqlIgnoreCase(function.name, "translateY");
++            const single_z = std.ascii.eqlIgnoreCase(function.name, "translateZ");
++            const triple = std.ascii.eqlIgnoreCase(function.name, "translate3d");
++            const pair = std.ascii.eqlIgnoreCase(function.name, "translate");
++            var args = std.mem.splitScalar(u8, function.arguments, ',');
++            var values = [3]f64{ 0, 0, 0 };
++            var count: usize = 0;
++            while (args.next()) |arg| {
++                if (count == 3) return null;
++                const axis = if (single_y) 1 else if (single_z) 2 else count;
++                const reference = if (axis == 0) width else if (axis == 1) height else 0;
++                values[axis] = self.transformLength(arg, reference, frame) orelse return null;
++                count += 1;
++            }
++            if (triple) {
++                if (count != 3) return null;
++            } else if (pair) {
++                if (count < 1 or count > 2) return null;
++            } else if (count != 1) return null;
++            break :blk Matrix.translationMatrix(values[0], values[1], values[2]);
++        } else (Matrix.parseTransformFunction(function, .css) catch return null).matrix;
++        matrix = Matrix.multiplyMatrix(matrix, next);
++    }
++    // The renderless box model supports planar affine transforms, including
++    // translate3d(x,y,0), but not perspective or out-of-plane projection.
++    for (matrix) |component| if (!std.math.isFinite(component)) return null;
++    for ([_]usize{ 2, 3, 6, 7, 8, 9, 11, 14 }) |i| if (matrix[i] != 0) return null;
++    if (matrix[10] != 1 or matrix[15] != 1) return null;
++    return matrix;
++}
++
++fn transformLength(self: *Element, raw: []const u8, reference: f64, frame: *Frame) ?f64 {
++    const value = std.mem.trim(u8, raw, &std.ascii.whitespace);
++    if (std.ascii.endsWithIgnoreCase(value, "rem")) {
++        const number = std.fmt.parseFloat(f64, value[0 .. value.len - 3]) catch return null;
++        const root = frame.document.getDocumentElement();
++        const result = number * frame._style_manager.computedFontSize(root);
++        return if (std.math.isFinite(result)) result else null;
++    }
++    const parsed = units.parse(value) catch return null;
++    const result = switch (parsed.unit) {
++        .none => if (parsed.value == 0) @as(f64, 0) else return null,
++        .percentage => parsed.value * reference / 100,
++        .em => parsed.value * frame._style_manager.computedFontSize(self),
++        .ex => parsed.value * frame._style_manager.computedFontSize(self) / 2,
++        .vw => parsed.value * @as(f64, @floatFromInt(frame.page.getViewport().width)) / 100,
++        .vh => parsed.value * @as(f64, @floatFromInt(frame.page.getViewport().height)) / 100,
++        else => parsed.value * (units.absoluteLengthFactor(parsed.unit) orelse return null),
++    };
++    return if (std.math.isFinite(result)) result else null;
++}
++
++fn transformOrigin(self: *Element, value: []const u8, width: f64, height: f64, frame: *Frame) [2]f64 {
++    const center = [2]f64{ width / 2, height / 2 };
++    var tokens = std.mem.tokenizeAny(u8, value, &std.ascii.whitespace);
++    var x = tokens.next() orelse return center;
++    var y = tokens.next() orelse "center";
++    if (std.ascii.eqlIgnoreCase(x, "top") or std.ascii.eqlIgnoreCase(x, "bottom") or
++        std.ascii.eqlIgnoreCase(y, "left") or std.ascii.eqlIgnoreCase(y, "right"))
++    {
++        std.mem.swap([]const u8, &x, &y);
++    }
++    return .{
++        self.originAxis(x, width, true, frame) orelse return center,
++        self.originAxis(y, height, false, frame) orelse return center,
++    };
++}
++
++fn originAxis(self: *Element, value: []const u8, size: f64, horizontal: bool, frame: *Frame) ?f64 {
++    if (std.ascii.eqlIgnoreCase(value, "center")) return size / 2;
++    if (std.ascii.eqlIgnoreCase(value, if (horizontal) "left" else "top")) return 0;
++    if (std.ascii.eqlIgnoreCase(value, if (horizontal) "right" else "bottom")) return size;
++    return self.transformLength(value, size, frame);
+ }
+ 
+ pub fn getClientRects(self: *Element, frame: *Frame) ![]*DOMRect {
+@@ -2010,8 +2176,6 @@ fn countSubtreeNodes(node: *Node) f64 {
+ // contentAxis: an element sits to the right of the visible element
+ // siblings before it.
+ 
+-// translateX is commonly used to shift elements around, e.g. in a carousel to
+-// shift things around. So we honor any transform: translateX inline styles.
+ pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
+     return self.clientCoordinate(frame, .width, null);
+ }
+@@ -2033,16 +2197,7 @@ fn flowHorizontalPosition(self: *Element, frame: *Frame) f64 {
+     const owner = self.ownerFrame(frame) orelse return 0;
+     const style_manager = &owner._style_manager;
+ 
+-    if (self.inlineStyle(frame)) |style| {
+-        x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
+-    }
+-
+     while (current.parentNode()) |parent| {
+-        if (parent.is(Element)) |el| {
+-            if (el.inlineStyle(frame)) |style| {
+-                x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
+-            }
+-        }
+         var sibling = parent.firstChild();
+         while (sibling) |s| : (sibling = s.nextSibling()) {
+             if (s == current) break;
+@@ -2097,7 +2252,6 @@ pub fn positionedCoordinate(self: *Element, frame: *Frame, comptime axis: Axis,
+             value -= current.ancestorScroll(element, frame, axis);
+         }
+         value += inset;
+-        if (axis == .width) value += element.translateX(frame);
+ 
+         const containing = element.positionedContainingBlock(frame, p.position == .fixed) orelse {
+             return value - if (p.position == .fixed) @as(f64, 0) else window_scroll;
+@@ -2125,11 +2279,6 @@ pub fn isViewportFixed(self: *Element, frame: *Frame) bool {
+     return false;
+ }
+ 
+-fn translateX(self: *Element, frame: *Frame) f64 {
+-    const style = self.inlineStyle(frame) orelse return 0;
+-    return CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
+-}
+-
+ fn layoutParent(self: *Element) ?*Element {
+     var node = self.asNode().parentNode();
+     while (node) |parent| : (node = parent.parentNode()) {
+@@ -2142,12 +2291,10 @@ fn layoutParent(self: *Element) ?*Element {
+ fn positionedContainingBlock(self: *Element, frame: *Frame, fixed: bool) ?*Element {
+     var parent = layoutParent(self);
+     while (parent) |element| : (parent = layoutParent(element)) {
+-        // Preserve the existing translateX subset; a transformed ancestor also
+-        // establishes a containing block for fixed descendants.
+-        if (element.inlineStyle(frame)) |style| {
+-            const transform = style.asCSSStyleDeclaration().getPropertyValue("transform", frame);
+-            if (transform.len > 0 and !std.ascii.eqlIgnoreCase(transform, "none")) return element;
+-        }
++        // A transformed ancestor establishes a containing block even when static.
++        const owner = element.ownerFrame(frame) orelse return null;
++        const transform = owner._style_manager.transformStyle(element).transform;
++        if (transform.len > 0 and !std.ascii.eqlIgnoreCase(transform, "none")) return element;
+         if (!fixed and element.positionStyle(frame) != .static) return element;
+     }
+     return null;
+@@ -2266,7 +2413,7 @@ pub fn scrollIntoView(self: *Element, opts: ?ScrollIntoViewOpts, frame: *Frame)
+     // Convert supported positioned client coordinates back to document space.
+     if (self.isViewportFixed(frame)) return;
+     const owner = self.ownerFrame(frame) orelse return;
+-    const y = self.clientCoordinate(owner, .height, null) + @as(f64, @floatFromInt(owner.window.getScrollY()));
++    const y = self.boundingClientRectValuesForVisible(owner).y + @as(f64, @floatFromInt(owner.window.getScrollY()));
+     const target = scrollOffset(y);
+     owner.window.scrollTo(.{ .x = 0 }, target, owner) catch {};
+ }
+diff --git a/src/browser/webapi/css/CSSStyleDeclaration.zig b/src/browser/webapi/css/CSSStyleDeclaration.zig
+index bcde4e8..2b80b31 100644
+--- a/src/browser/webapi/css/CSSStyleDeclaration.zig
++++ b/src/browser/webapi/css/CSSStyleDeclaration.zig
+@@ -35,6 +35,7 @@ const Allocator = std.mem.Allocator;
+ const CSSStyleDeclaration = @This();
+ 
+ _element: ?*Element = null,
++_rule_owner: ?*Element = null,
+ _properties: std.DoublyLinkedList = .{},
+ _is_computed: bool = false,
+ _syncing: bool = false,
+@@ -98,6 +99,9 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
+                     }
+                 } else if (wrapped.eql(comptime .wrap("position"))) {
+                     return @tagName(style_manager.positioning(element).position);
++                } else if (wrapped.eql(comptime .wrap("transform")) or std.mem.eql(u8, normalized, "transform-origin")) {
++                    const style = style_manager.transformStyle(element);
++                    return if (wrapped.eql(comptime .wrap("transform"))) style.transform else style.transform_origin;
+                 } else if (wrapped.eql(comptime .wrap("left")) or wrapped.eql(comptime .wrap("top"))) {
+                     const positioning = style_manager.positioning(element);
+                     const offset = if (wrapped.eql(comptime .wrap("left"))) positioning.left else positioning.top;
+@@ -432,7 +436,13 @@ fn removePropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, fra
+ // Serialize current properties back to the element's style attribute so that
+ // DOM serialization (outerHTML, getAttribute) reflects JS-modified styles.
+ fn syncStyleAttribute(self: *CSSStyleDeclaration, frame: *Frame) !void {
+-    const element = self._element orelse return;
++    const element = self._element orelse {
++        // Rule declarations have no element attribute to trigger invalidation.
++        if (self._rule_owner) |node| {
++            if (node.ownerFrame(frame)) |owner| owner._style_manager.sheetModified();
++        }
++        return;
++    };
+     const css_text = try self.getCssText(frame);
+     self._syncing = true;
+     defer self._syncing = false;
+diff --git a/src/browser/webapi/css/CSSStyleSheet.zig b/src/browser/webapi/css/CSSStyleSheet.zig
+index 744b8dc..a214eac 100644
+--- a/src/browser/webapi/css/CSSStyleSheet.zig
++++ b/src/browser/webapi/css/CSSStyleSheet.zig
+@@ -100,6 +100,7 @@ pub fn insertRule(self: *CSSStyleSheet, rule: []const u8, maybe_index: ?u32, fra
+             const style_props = try style_rule.getStyle(frame);
+             const style = style_props.asCSSStyleDeclaration();
+             try style.replaceCssText(s.block, frame);
++            style._rule_owner = self._owner_node;
+             break :blk style_rule._proto;
+         },
+         // Opaque placeholder for at-rules. The CSS engine doesn't apply
+@@ -195,6 +196,7 @@ fn parseInto(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!voi
+                 const style_props = try style_rule.getStyle(frame);
+                 const style = style_props.asCSSStyleDeclaration();
+                 try style.replaceCssText(s.block, frame);
++                style._rule_owner = self._owner_node;
+                 break :blk style_rule._proto;
+             },
+             .at_rule => |a| try CSSRule.initAtRule(atRuleTypeFor(a.keyword), a.text, frame),

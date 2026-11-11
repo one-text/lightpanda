@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 4 Nov 2026 20:57:47 -0300
+Subject: [PATCH] config: enable native service workers by default
+
+Default ExperimentalFeatures.serviceworker to true for the desktop Chrome
+persona. Reuse native registration, lifecycle, client messaging and the
+existing Chrome UA bindings instead of injecting worker objects or canned
+probe replies. Keep explicit programmatic disabling and secure-origin
+restrictions; enabling this feature also exposes native CacheStorage.
+
+Hide CacheStorage in insecure dedicated/shared worker contexts using the
+captured worker secure-context state. One reviewer pass identified that
+the previous flag-only worker gate would expose caches on ordinary HTTP
+when the default changed; preserve Chrome-like secure-context exposure
+before rolling this feature out by default.
+
+Have the existing positive ServiceWorker/CacheStorage fixtures exercise
+the default, and pass serviceworker=false explicitly in the existing
+disabled-feature runners. Align fixture comments, CLI help and affected
+source comments. Add no tests or benchmark changes.
+
+Validation: ReleaseFast build and all 1658 upstream tests pass. The
+unchanged benchmark without opt-in flags improves from 117/130 (90%) to
+118/130 (90.77%); only sw-ua-consistency changes verdict. Temporary local
+diagnostics verify page, dedicated-worker and shared-worker CacheStorage
+exposure and native getters on trustworthy loopback versus untrustworthy
+HTTP, plus native page ServiceWorker exposure. Explicitly disabled
+fixtures continue to pass. This does not claim full Chrome service-worker
+compatibility or persistent cross-session storage.
+---
+ src/Config.zig                                 | 2 +-
+ src/browser/Session.zig                        | 2 +-
+ src/browser/js/Env.zig                         | 7 ++++---
+ src/browser/tests/cache/disabled.html          | 8 ++++----
+ src/browser/tests/service_worker/disabled.html | 4 ++--
+ src/browser/webapi/Navigator.zig               | 2 +-
+ src/browser/webapi/ServiceWorkerContainer.zig  | 6 ++++--
+ src/browser/webapi/cache/CacheStorage.zig      | 4 ++--
+ src/help.zon                                   | 2 +-
+ 9 files changed, 20 insertions(+), 17 deletions(-)
+
+diff --git a/src/Config.zig b/src/Config.zig
+index 7ee1852..50fb365 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -241,7 +241,7 @@ pub const LoadResources = packed struct(u4) {
+ 
+ pub const ExperimentalFeatures = packed struct(u2) {
+     cors: bool = false, // ignored, kept only for backward compatibility.
+-    serviceworker: bool = false,
++    serviceworker: bool = true,
+ };
+ 
+ pub const DisabledFeatures = packed struct(u1) {
+diff --git a/src/browser/Session.zig b/src/browser/Session.zig
+index 705f4e2..d395e1e 100644
+--- a/src/browser/Session.zig
++++ b/src/browser/Session.zig
+@@ -120,7 +120,7 @@ _console_capture: bool = false,
+ // configured external resources (images, stylesheet, worker, iframe) to load
+ load_resources: Config.LoadResources,
+ 
+-// opt-in unstable features (--experimental-features)
++// experimental feature settings (--experimental-features); service workers default on
+ experimental_features: Config.ExperimentalFeatures,
+ 
+ // CDP Page.setBypassCSP survives document replacement within this target.
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 8abeeb7..d5fd109 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -334,7 +334,8 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+     // Get the global object for the context
+     const global_obj = v8.v8__Context__Global(v8_context).?;
+ 
+-    if (global._session.experimental_features.serviceworker == false) {
++    const insecure_worker = if (comptime is_frame) false else !global._secure_context;
++    if (global._session.experimental_features.serviceworker == false or insecure_worker) {
+         self.hideServiceWorker(is_frame, v8_context, global_obj);
+     }
+ 
+@@ -466,8 +467,8 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+     return context;
+ }
+ 
+-// When ServiceWorkers are disabled (as they are by default), or the frame isn't
+-// a secure context, this must be false:
++// When ServiceWorkers are explicitly disabled, or the realm isn't
++// a secure context, caches must be absent. In frames, this must be false:
+ //     'serviceWorker' in navigator
+ // If you disable ServiceWorkers in FireFox (about:config) this is the behavior
+ // you get, and it seems to be the safest way to not break sites. BUT, the
+diff --git a/src/browser/tests/cache/disabled.html b/src/browser/tests/cache/disabled.html
+index a48b6d8..aae2197 100644
+--- a/src/browser/tests/cache/disabled.html
++++ b/src/browser/tests/cache/disabled.html
+@@ -1,10 +1,10 @@
+ <!DOCTYPE html>
+ <script src="../testing.js"></script>
+ 
+-<script id="caches_absent_without_the_flag">
+-  // `caches` rides on --experimental-features serviceworker. Like
+-  // navigator.serviceWorker it is absent rather than null, and only the way in
+-  // is removed.
++<script id="caches_absent_when_disabled">
++  // This fixture explicitly disables service workers and their `caches` entry.
++  // Like navigator.serviceWorker it is absent rather than null, and only the way
++  // in is removed.
+   {
+     testing.expectFalse('caches' in window);
+     testing.expectEqual(undefined, window.caches);
+diff --git a/src/browser/tests/service_worker/disabled.html b/src/browser/tests/service_worker/disabled.html
+index 63df252..53656ac 100644
+--- a/src/browser/tests/service_worker/disabled.html
++++ b/src/browser/tests/service_worker/disabled.html
+@@ -2,8 +2,8 @@
+ <body></body>
+ <script src="../testing.js"></script>
+ 
+-<script id="service_worker_absent_without_the_flag">
+-  // Without --experimental-features serviceworker the accessor is deleted from
++<script id="service_worker_absent_when_disabled">
++  // This fixture explicitly disables service workers, deleting the accessor from
+   // this context's Navigator.prototype. It has to be absent rather than null:
+   // `'serviceWorker' in navigator` is the standard feature check, and Firefox
+   // with dom.serviceWorkers.enabled=false makes it undefined for the same reason.
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index cd70179..dc740fa 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -236,7 +236,7 @@ fn getConnection(_: *Navigator, exec: *Execution) !*NetworkInformation {
+ }
+ 
+ // NOTE, the binding for this API is removed at runtime if ServiceWorkers are
+-// not enabled (Env.createContext; by default, they are not) or if the frame
++// explicitly disabled (Env.createContext) or if the frame
+ // isn't a secure context (Context.setOrigin).
+ fn getServiceWorker(self: *Navigator, frame: *Frame) !*ServiceWorkerContainer {
+     if (self._service_worker) |sw| {
+diff --git a/src/browser/webapi/ServiceWorkerContainer.zig b/src/browser/webapi/ServiceWorkerContainer.zig
+index 3a02fb5..bf3a3c2 100644
+--- a/src/browser/webapi/ServiceWorkerContainer.zig
++++ b/src/browser/webapi/ServiceWorkerContainer.zig
+@@ -498,10 +498,12 @@ test "WebApi: ServiceWorker" {
+     testing.silenceLog(&.{ .http, .browser });
+     try testing.htmlRunner("service_worker/service_worker.html", .{
+         .timeout_ms = 8000,
+-        .experimental_features = .{ .serviceworker = true },
+     });
+ }
+ 
+ test "WebApi: ServiceWorker disabled" {
+-    try testing.htmlRunner("service_worker/disabled.html", .{ .timeout_ms = 8000 });
++    try testing.htmlRunner("service_worker/disabled.html", .{
++        .timeout_ms = 8000,
++        .experimental_features = .{ .serviceworker = false },
++    });
+ }
+diff --git a/src/browser/webapi/cache/CacheStorage.zig b/src/browser/webapi/cache/CacheStorage.zig
+index ba01f98..c7a1203 100644
+--- a/src/browser/webapi/cache/CacheStorage.zig
++++ b/src/browser/webapi/cache/CacheStorage.zig
+@@ -94,7 +94,7 @@ pub const JsApi = struct {
+ const testing = @import("../../../testing.zig");
+ test "WebApi: CacheStorage" {
+     testing.silenceLog(&.{.http}); // addAll's 404 case
+-    try testing.htmlRunner("cache/cache.html", .{ .experimental_features = .{ .serviceworker = true } });
++    try testing.htmlRunner("cache/cache.html", .{});
+ }
+ 
+ test "WebApi: CacheStorage addAll torn down in flight" {
+@@ -102,5 +102,5 @@ test "WebApi: CacheStorage addAll torn down in flight" {
+ }
+ 
+ test "WebApi: CacheStorage disabled" {
+-    try testing.htmlRunner("cache/disabled.html", .{});
++    try testing.htmlRunner("cache/disabled.html", .{ .experimental_features = .{ .serviceworker = false } });
+ }
+diff --git a/src/help.zon b/src/help.zon
+index faf02e3..10f7185 100644
+--- a/src/help.zon
++++ b/src/help.zon
+@@ -419,7 +419,7 @@
+     \\  --experimental-features <FEATURE>
+     \\          Enable an experimental, unstable feature. Can be passed multiple times.
+     \\          Behavior may change or be removed without notice.
+-    \\          Defaults to none enabled.
++    \\          Defaults to serviceworker enabled.
+     \\  --load-resources <RESOURCE>
+     \\          Sub-resource to actually request. Can be passed multiple times.
+     \\          Defaults to loading all resource types listed below.

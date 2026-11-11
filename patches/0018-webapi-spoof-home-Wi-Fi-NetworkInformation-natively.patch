@@ -1,0 +1,361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 14 Oct 2026 15:42:06 -0300
+Subject: [PATCH] webapi: spoof home Wi-Fi NetworkInformation natively
+
+Expose a native EventTarget-derived NetworkInformation with Chrome desktop
+members: onchange, effectiveType, rtt, downlink and saveData. Cache connection
+privately on each Navigator/WorkerNavigator wrapper for SameObject identity
+without crossing isolated-world prototypes. Register Window and all worker
+exposures; leave NetInfoDownlinkMax-gated members absent.
+
+Model the Neo browsing from a US household over Wi-Fi on a representative
+300/20 Mbps cable plan. Report fixed 4g, 10 Mbps downlink, 50 ms HTTP RTT and
+saveData=false. The reported throughput is Chrome's capped estimate, not
+ISP-plan bandwidth; no host measurement, shaping, synthetic periodic events
+or HTTP hint support is added. See parent AGENTS.md for the network persona.
+
+Implement onchange with a stable native listener, preserving ordering across
+replacement, removal and re-addition. Reuse EventManagerBase for listeners,
+abort/once semantics and dispatch. Allocate per execution scope and dispatch
+through the current valid execution context; retain no raw context pointer.
+This keeps retained iframe connections safe after child navigation.
+
+References:
+- Chromium 155.0.8059.40 modules/netinfo/network_information.idl and
+  navigator_network_information.idl: exposed members and SameObject binding
+- Chromium 155.0.8059.40 platform/network/network_state_notifier.cc:
+  10 Mbps cap and 50 kbps / 50 ms estimate quantization
+- https://www.optimum.com/articles/internet/average-home-internet-speed
+  for context on a representative household plan, not measured averages
+
+Validation: dev build; all 1658 existing upstream tests; 54/54 temporary CDP
+checks including isolated-world surface/events, dedicated/shared/service
+worker checks and an iframe connection retained across child navigation.
+No new unit tests or benchmark changes.
+---
+ src/browser/js/Env.zig                    |   3 +
+ src/browser/js/bridge.zig                 |   2 +
+ src/browser/webapi/EventTarget.zig        |  18 ++++
+ src/browser/webapi/Navigator.zig          |   6 ++
+ src/browser/webapi/NetworkInformation.zig | 126 ++++++++++++++++++++++
+ src/browser/webapi/WorkerNavigator.zig    |   6 ++
+ 6 files changed, 161 insertions(+)
+ create mode 100644 src/browser/webapi/NetworkInformation.zig
+
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index bd06a29..082563d 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -937,17 +937,20 @@ const PrivateSymbols = struct {
+ 
+     child_nodes: Private,
+     get_battery: Private,
++    network_information: Private,
+ 
+     fn init(isolate: *v8.Isolate) PrivateSymbols {
+         return .{
+             .child_nodes = Private.init(isolate, "child_nodes"),
+             .get_battery = Private.init(isolate, "get_battery"),
++            .network_information = Private.init(isolate, "network_information"),
+         };
+     }
+ 
+     fn deinit(self: *PrivateSymbols) void {
+         self.child_nodes.deinit();
+         self.get_battery.deinit();
++        self.network_information.deinit();
+     }
+ };
+ 
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 5fc2053..c1bc6d2 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1030,6 +1030,7 @@ pub const SubType = enum {
+ // APIs for Page/Window contexts. Used by Snapshot.zig for Page snapshot creation.
+ pub const PageJsApis = flattenTypes(&.{
+     @import("../webapi/BatteryManager.zig"),
++    @import("../webapi/NetworkInformation.zig"),
+     @import("../webapi/AbortController.zig"),
+     @import("../webapi/AbortSignal.zig"),
+     @import("../webapi/Scheduler.zig"),
+@@ -1338,6 +1339,7 @@ pub const PageJsApis = flattenTypes(&.{
+ // This is a subset of PageJsApis plus WorkerGlobalScope.
+ // TODO: Expand this list to include all worker-appropriate APIs.
+ const worker_common_apis = [_]type{
++    @import("../webapi/NetworkInformation.zig"),
+     @import("../webapi/WorkerGlobalScope.zig"),
+     @import("../webapi/WorkerLocation.zig"),
+     @import("../webapi/WorkerNavigator.zig"),
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index 0ee670c..1f18dc3 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -62,6 +62,7 @@ const XMLHttpRequestEventTarget = @import("net/XMLHttpRequestEventTarget.zig");
+ const RegisterOptions = EventManager.RegisterOptions;
+ 
+ const BatteryManager = @import("BatteryManager.zig");
++const NetworkInformation = @import("NetworkInformation.zig");
+ 
+ const EventTarget = @This();
+ 
+@@ -89,6 +90,7 @@ pub const Type = enum(u8) {
+     message_port,
+     navigation,
+     navigation_history_entry,
++    network_information,
+     node,
+     notification,
+     performance,
+@@ -126,6 +128,7 @@ pub fn Subtype(comptime tag: Type) type {
+         .message_port => MessagePort,
+         .navigation => Navigation,
+         .navigation_history_entry => NavigationHistoryEntry,
++        .network_information => NetworkInformation,
+         .node => Node,
+         .notification => Notification,
+         .performance => Performance,
+@@ -195,6 +198,11 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
+         return !event._cancelable or !event._prevent_default;
+     }
+ 
++    if (self._type == .network_information) {
++        try self.subtype(NetworkInformation).dispatch(event, exec);
++        return !event._cancelable or !event._prevent_default;
++    }
++
+     switch (exec.js.global) {
+         .frame => |frame| {
+             event.acquireRef();
+@@ -292,6 +300,10 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
+         _ = try self.subtype(BatteryManager)._events.register(self, typ, em_callback, options);
+         return;
+     }
++    if (self._type == .network_information) {
++        _ = try self.subtype(NetworkInformation)._events.register(self, typ, em_callback, options);
++        return;
++    }
+     return exec.registerListener(self, typ, em_callback, options);
+ }
+ 
+@@ -330,6 +342,10 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
+         self.subtype(BatteryManager)._events.remove(self, typ, em_callback, use_capture);
+         return;
+     }
++    if (self._type == .network_information) {
++        self.subtype(NetworkInformation)._events.remove(self, typ, em_callback, use_capture);
++        return;
++    }
+     exec.removeListener(self, typ, em_callback, use_capture);
+ }
+ 
+@@ -365,6 +381,7 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         .idb_transaction => writer.writeAll("<IDBTransaction>"),
+         .notification => writer.writeAll("<Notification>"),
+         .navigation_history_entry => writer.writeAll("<NavigationHistoryEntry>"),
++        .network_information => writer.writeAll("<NetworkInformation>"),
+     };
+ }
+ 
+@@ -385,6 +402,7 @@ pub fn toString(self: *EventTarget) []const u8 {
+         .message_port => return "[object MessagePort]",
+         .navigation => return "[object Navigation]",
+         .navigation_history_entry => return "[object NavigationHistoryEntry]",
++        .network_information => return "[object NetworkInformation]",
+         .node => return "[object Node]",
+         .notification => return "[object Notification]",
+         .performance => return "[object Performance]",
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index 85ba7a2..54c28f0 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -33,6 +33,7 @@ const NavigatorUAData = @import("NavigatorUAData.zig");
+ const Geolocation = @import("geolocation/Geolocation.zig");
+ const ServiceWorkerContainer = @import("ServiceWorkerContainer.zig");
+ const BatteryManager = @import("BatteryManager.zig");
++const NetworkInformation = @import("NetworkInformation.zig");
+ 
+ const Navigator = @This();
+ 
+@@ -209,6 +210,10 @@ fn getStorage(self: *Navigator) *StorageManager {
+     return &self._storage;
+ }
+ 
++fn getConnection(_: *Navigator, exec: *Execution) !*NetworkInformation {
++    return NetworkInformation.init(exec);
++}
++
+ // NOTE, the binding for this API is removed at runtime if ServiceWorkers are
+ // not enabled (Env.createContext; by default, they are not) or if the frame
+ // isn't a secure context (Context.setOrigin).
+@@ -347,6 +352,7 @@ pub const JsApi = struct {
+     pub const sendBeacon = bridge.function(Navigator.sendBeacon, .{});
+     pub const permissions = bridge.accessor(Navigator.getPermissions, null, .{});
+     pub const storage = bridge.accessor(Navigator.getStorage, null, .{});
++    pub const connection = bridge.accessor(Navigator.getConnection, null, .{ .cache = .{ .private = "network_information" } });
+     pub const serviceWorker = bridge.accessor(Navigator.getServiceWorker, null, .{});
+     pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});
+     pub const plugins = bridge.accessor(Navigator.getPlugins, null, .{});
+diff --git a/src/browser/webapi/NetworkInformation.zig b/src/browser/webapi/NetworkInformation.zig
+new file mode 100644
+index 0000000..83a40c7
+--- /dev/null
++++ b/src/browser/webapi/NetworkInformation.zig
+@@ -0,0 +1,126 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const js = @import("../js/js.zig");
++const Event = @import("Event.zig");
++const EventTarget = @import("EventTarget.zig");
++const EventManagerBase = @import("../EventManagerBase.zig");
++
++const NetworkInformation = @This();
++
++pub const Proto = EventTarget;
++
++_proto: *EventTarget,
++_events: EventManagerBase,
++_onchange: ?js.Object.Global = null,
++_change_listener: ?js.Function.Global = null,
++
++pub fn init(exec: *js.Execution) !*NetworkInformation {
++    return exec._factory.eventTargetWithAllocator(exec.arena, NetworkInformation{
++        ._proto = undefined,
++        ._events = EventManagerBase.init(exec.arena),
++    });
++}
++
++// Fixed home-Wi-Fi estimates; the connection persona is documented in AGENTS.md.
++fn getEffectiveType(_: *const NetworkInformation) []const u8 {
++    return "4g";
++}
++
++fn getRtt(_: *const NetworkInformation) u64 {
++    return 50;
++}
++
++fn getDownlink(_: *const NetworkInformation) f64 {
++    return 10;
++}
++
++fn getSaveData(_: *const NetworkInformation) bool {
++    return false;
++}
++
++fn getOnChange(self: *const NetworkInformation) ?js.Object.Global {
++    return self._onchange;
++}
++
++fn setOnChange(self: *NetworkInformation, value: js.Value, exec: *js.Execution) !void {
++    const local = exec.js.local.?;
++    const callback = if (value.isObject())
++        try (js.Object{ .local = local, .handle = @ptrCast(value.handle) }).persist()
++    else
++        null;
++    errdefer if (callback) |cb| cb.release();
++
++    // Keep the handler's place among listeners when replacing its callback.
++    if (self._onchange == null and callback != null) {
++        if (self._change_listener == null) {
++            self._change_listener = try local.newCallback(invokeOnChange, self).persist();
++        }
++        _ = try self._events.register(self._proto, "change", .{
++            .function = self._change_listener.?.local(local),
++        }, .{});
++    } else if (self._onchange != null and callback == null) {
++        self._events.remove(self._proto, "change", .{
++            .function = self._change_listener.?.local(local),
++        }, false);
++    }
++
++    if (self._onchange) |old| old.release();
++    self._onchange = callback;
++}
++
++fn invokeOnChange(self: *NetworkInformation, event: *Event, exec: *js.Execution) !void {
++    const callback = self._onchange orelse return;
++    const local = exec.js.local.?;
++    const object = callback.local(local);
++    if (!object.toValue().isFunction()) return local.typeError("The event handler is not callable");
++    const function = js.Function{ .local = local, .handle = @ptrCast(object.handle) };
++    const result = try function.callWithThisRethrow(js.Value, self, .{event});
++    if (result.isBoolean() and result.isFalse()) event.preventDefault();
++}
++
++pub fn dispatch(self: *NetworkInformation, event: *Event, exec: *js.Execution) !void {
++    event._target = self._proto;
++    event._dispatch_target = self._proto;
++    event._event_phase = .at_target;
++    defer {
++        event._event_phase = .none;
++        event._current_target = null;
++        event._dispatch_target = null;
++        event._stop_propagation = false;
++        event._stop_immediate_propagation = false;
++        event._in_passive_listener = false;
++    }
++    if (event._stop_propagation) return;
++    try self._events.dispatchDirect(exec.call_arena, exec.js, self._proto, event, null, exec.page, .{ .run_microtasks = false });
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(NetworkInformation);
++
++    pub const Meta = struct {
++        pub const name = "NetworkInformation";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++
++    pub const onchange = bridge.accessor(getOnChange, setOnChange, .{});
++    pub const effectiveType = bridge.accessor(getEffectiveType, null, .{});
++    pub const rtt = bridge.accessor(getRtt, null, .{});
++    pub const downlink = bridge.accessor(getDownlink, null, .{});
++    pub const saveData = bridge.accessor(getSaveData, null, .{});
++};
+diff --git a/src/browser/webapi/WorkerNavigator.zig b/src/browser/webapi/WorkerNavigator.zig
+index 477434c..5158dd5 100644
+--- a/src/browser/webapi/WorkerNavigator.zig
++++ b/src/browser/webapi/WorkerNavigator.zig
+@@ -24,6 +24,7 @@ const Navigator = @import("Navigator.zig");
+ const Permissions = @import("Permissions.zig");
+ const StorageManager = @import("StorageManager.zig");
+ const NavigatorUAData = @import("NavigatorUAData.zig");
++const NetworkInformation = @import("NetworkInformation.zig");
+ 
+ const WorkerNavigator = @This();
+ 
+@@ -99,6 +100,10 @@ fn getStorage(self: *WorkerNavigator) *StorageManager {
+     return &self._storage;
+ }
+ 
++fn getConnection(_: *WorkerNavigator, exec: *Execution) !*NetworkInformation {
++    return NetworkInformation.init(exec);
++}
++
+ fn getUserAgentData(self: *WorkerNavigator) *NavigatorUAData {
+     return &self._ua_data;
+ }
+@@ -127,5 +132,6 @@ pub const JsApi = struct {
+ 
+     pub const permissions = bridge.accessor(WorkerNavigator.getPermissions, null, .{});
+     pub const storage = bridge.accessor(WorkerNavigator.getStorage, null, .{});
++    pub const connection = bridge.accessor(WorkerNavigator.getConnection, null, .{ .cache = .{ .private = "network_information" } });
+     pub const userAgentData = bridge.accessor(WorkerNavigator.getUserAgentData, null, .{});
+ };

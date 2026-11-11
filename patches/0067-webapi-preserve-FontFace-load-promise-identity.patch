@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 4 Nov 2026 10:45:38 -0300
+Subject: [PATCH] webapi: preserve FontFace load promise identity
+
+Fulfill load() and loaded with the original FontFace and share a GC-traced wrapper cache. Publish before resolving for then-getter reentrancy; preserve normal microtask checkpoints and mocked successful loading.
+
+Reference: https://drafts.csswg.org/css-font-loading/#dom-fontface-load
+
+Validation: 1658 upstream tests and 19 temporary API checks pass. Benchmark improves from 112/130 to 113/130 with only font-load-semantics changing. No new tests added.
+---
+ src/browser/webapi/css/FontFace.zig | 27 +++++++++++++++++++++------
+ 1 file changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/src/browser/webapi/css/FontFace.zig b/src/browser/webapi/css/FontFace.zig
+index a63305b..3cd7a6e 100644
+--- a/src/browser/webapi/css/FontFace.zig
++++ b/src/browser/webapi/css/FontFace.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -23,6 +24,7 @@ const Page = @import("../../Page.zig");
+ const Frame = @import("../../Frame.zig");
+ 
+ const FontFace = @This();
++const loaded_promise_slot = 1;
+ 
+ _rc: lp.RC = .{},
+ _arena: *lp.Arena,
+@@ -59,13 +61,26 @@ fn getFamily(self: *const FontFace) []const u8 {
+ }
+ 
+ // load() - resolves immediately; headless browser has no real font loading.
+-pub fn load(_: *FontFace, frame: *Frame) !js.Promise {
+-    return frame.js.local.?.resolvePromise({});
++pub fn load(self: *FontFace, frame: *Frame) !js.Promise {
++    return self.getLoaded(frame);
+ }
+ 
+-// loaded - returns an already-resolved Promise.
+-fn getLoaded(_: *FontFace, frame: *Frame) !js.Promise {
+-    return frame.js.local.?.resolvePromise({});
++// loaded - returns the same fulfilled promise as load().
++fn getLoaded(self: *FontFace, frame: *Frame) !js.Promise {
++    const local = frame.js.local.?;
++    const wrapper = try local.mapZigInstanceToJs(null, self);
++    if (js.v8.v8__Object__GetInternalField(wrapper.handle, loaded_promise_slot)) |cached| {
++        if (!js.v8.v8__Value__IsUndefined(cached)) {
++            return .{ .local = local, .handle = @ptrCast(cached) };
++        }
++    }
++
++    const resolver = local.createPromiseResolver();
++    const promise = resolver.promise();
++    // Keep the cycle GC-traced, and publish before resolution can read a then getter.
++    js.v8.v8__Object__SetInternalField(wrapper.handle, loaded_promise_slot, promise.toValue().handle);
++    try resolver.resolveValue(wrapper.toValue());
++    return promise;
+ }
+ 
+ pub const JsApi = struct {
+@@ -87,7 +102,7 @@ pub const JsApi = struct {
+     pub const variant = bridge.property("normal", .{ .template = false, .readonly = true });
+     pub const featureSettings = bridge.property("normal", .{ .template = false, .readonly = true });
+     pub const display = bridge.property("auto", .{ .template = false, .readonly = true });
+-    pub const loaded = bridge.accessor(FontFace.getLoaded, null, .{});
++    pub const loaded = bridge.accessor(FontFace.getLoaded, null, .{ .cache = .{ .internal = loaded_promise_slot } });
+     pub const load = bridge.function(FontFace.load, .{});
+ };
+ 

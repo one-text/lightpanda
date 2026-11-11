@@ -1,0 +1,903 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 15 Oct 2026 23:26:19 -0300
+Subject: [PATCH] webapi: mock Neo Web Audio context and stereo destination
+ natively
+
+Expose a Window-only AudioContext/BaseAudioContext and
+AudioDestinationNode/AudioNode hierarchy through native Zig bindings. Model
+the base MacBook Neo's built-in stereo output with a synthetic 48 kHz
+default, two channels, and plausible latency values; never query host audio.
+Honor sample-rate and latency options and preserve native descriptors,
+receiver checks, illegal constructors, destination identity and context
+back-references. This is a partial facade, not DSP, playback, an audio graph,
+an AudioListener, or OfflineAudioContext.
+
+Keep the clock frozen while suspended/closed and advance it in synthetic
+128-frame quanta while running. Require trusted sticky activation for
+resume, order accepted lifecycle operations, return native Promises and
+DOMExceptions, and dispatch asynchronous trusted statechange events.
+Detach contexts on navigation and disconnected frames; pending tasks root
+their owners, rejection storage survives its originating iframe, and
+collectible JS wrapper links preserve callbacks across context/destination
+GC. Release callback ownership on explicit, once, and AbortSignal removal
+using an optional direct-event listener cleanup hook.
+
+The benchmark audio-sample-rate probe reads AudioContext.sampleRate,
+destination.maxChannelCount and awaits close. Temporary diagnostics also
+exercise API shape, options, autoplay, lifecycle interleaving, event
+ownership, callback collection, iframe lifetime and navigation cleanup.
+No upstream tests are added and no resource-loading defaults are changed.
+
+References: benchmark/src/probes/signals.ts; Web Audio API interfaces and
+lifecycle algorithms; Apple MacBook Neo technical specifications. Generic
+prototype/option behavior was checked against Chrome 154 on Linux; the
+synthetic Mac timing values are a chosen persona, not physical measurements.
+---
+ src/browser/EventManagerBase.zig    |  12 +
+ src/browser/Frame.zig               |   4 +
+ src/browser/js/Context.zig          |   5 +
+ src/browser/js/bridge.zig           |   1 +
+ src/browser/webapi/AbortSignal.zig  |  20 +-
+ src/browser/webapi/AudioContext.zig | 600 ++++++++++++++++++++++++++++
+ src/browser/webapi/EventTarget.zig  |  18 +
+ src/browser/webapi/WebShare.zig     |   2 +
+ 8 files changed, 656 insertions(+), 6 deletions(-)
+ create mode 100644 src/browser/webapi/AudioContext.zig
+
+diff --git a/src/browser/EventManagerBase.zig b/src/browser/EventManagerBase.zig
+index f15d266..f80152c 100644
+--- a/src/browser/EventManagerBase.zig
++++ b/src/browser/EventManagerBase.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -185,6 +186,7 @@ pub fn removeListener(self: *EventManagerBase, list: *std.DoublyLinkedList, list
+     } else {
+         // Outside dispatch, remove immediately
+         list.remove(&listener.node);
++        listener.notifyRemoved();
+         self.listener_pool.destroy(listener);
+     }
+ }
+@@ -291,6 +293,7 @@ pub fn dispatchDirect(
+         if (self.dispatch_depth == 0) {
+             for (self.deferred_removals.items) |removal| {
+                 removal.list.remove(&removal.listener.node);
++                removal.listener.notifyRemoved();
+                 self.listener_pool.destroy(removal.listener);
+             }
+             self.deferred_removals.clearRetainingCapacity();
+@@ -443,6 +446,15 @@ pub const Listener = struct {
+     signal: ?*@import("webapi/AbortSignal.zig") = null,
+     node: std.DoublyLinkedList.Node,
+     removed: bool = false,
++    // Optional ownership cleanup after deferred/once invocation has finished.
++    on_remove: ?struct { ctx: *anyopaque, callback: *const fn (*anyopaque) void } = null,
++
++    fn notifyRemoved(self: *Listener) void {
++        if (self.on_remove) |hook| {
++            self.on_remove = null;
++            hook.callback(hook.ctx);
++        }
++    }
+ 
+     // Per DOM §2.9 step 4 substep 8 ("Inner invoke"), a listener callback that
+     // throws must have its exception *reported* to the global error handler,
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index 0c74714..9c84179 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -550,6 +550,10 @@ pub fn deinit(self: *Frame) void {
+ }
+ 
+ pub fn detachPdf(self: *Frame) void {
++    while (self.js.audio_contexts.first) |node| {
++        const audio: *@import("webapi/AudioContext.zig") = @fieldParentPtr("_context_node", node);
++        audio.detach();
++    }
+     if (self.window._speech_synthesis) |speech| speech.detach();
+     self.window._navigator.detachPdf();
+     for (self.child_frames.items) |child| child.detachPdf();
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index 18051b6..00ce820 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -74,6 +74,7 @@ media_device_bindings: ?struct {
+ 
+ video_bindings: ?[4]v8.Global = null,
+ video_decoders: std.DoublyLinkedList = .{},
++audio_contexts: std.DoublyLinkedList = .{},
+ 
+ cpu_profiler: ?*v8.CpuProfiler = null,
+ 
+@@ -219,6 +220,10 @@ pub fn deinit(self: *Context) void {
+         const decoder: *@import("../webapi/VideoDecoder.zig") = @fieldParentPtr("_context_node", node);
+         decoder.detach();
+     }
++    while (self.audio_contexts.first) |node| {
++        const audio: *@import("../webapi/AudioContext.zig") = @fieldParentPtr("_context_node", node);
++        audio.detach();
++    }
+     // this can release objects
+     self.scheduler.deinit();
+ 
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index f20f673..f8c4f5b 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1029,6 +1029,7 @@ pub const SubType = enum {
+ 
+ // APIs for Page/Window contexts. Used by Snapshot.zig for Page snapshot creation.
+ pub const PageJsApis = flattenTypes(&.{
++    @import("../webapi/AudioContext.zig"),
+     @import("../webapi/SpeechSynthesis.zig"),
+     @import("../webapi/VideoDecoder.zig"),
+     @import("../webapi/SpeechSynthesisVoice.zig"),
+diff --git a/src/browser/webapi/AbortSignal.zig b/src/browser/webapi/AbortSignal.zig
+index 82d1c16..729978b 100644
+--- a/src/browser/webapi/AbortSignal.zig
++++ b/src/browser/webapi/AbortSignal.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -40,6 +41,7 @@ const Dependend = union(enum) {
+     // Handled by the owning signal's markAborted (which runs for dependent
+     // signals too, unlike this union's markAborted).
+     scheduler_task: *Scheduler.Task,
++    audio_listener: *@import("AudioContext.zig").ListenerRoot,
+ 
+     // Returns false if the dependent was already aborted, in which case no
+     // abort event must be dispatched for it.
+@@ -54,14 +56,14 @@ const Dependend = union(enum) {
+                 try dep.markAborted(exec);
+                 return true;
+             },
+-            .scheduler_task => return false,
++            .scheduler_task, .audio_listener => return false,
+         }
+     }
+ 
+     fn dispatchAbortEvent(self: Dependend, exec: *const Execution) !void {
+         switch (self) {
+             .signal => |dep| try dep.dispatchAbortEvent(exec),
+-            .model_context_tool, .scheduler_task => {},
++            .model_context_tool, .scheduler_task, .audio_listener => {},
+         }
+     }
+ };
+@@ -150,10 +152,16 @@ fn markAborted(self: *AbortSignal, reason_: ?Reason, exec: *const Execution) !vo
+ 
+     // Unlike the loop in abort(), this runs for dependent signals too, so a
+     // task registered on an any() signal still gets rejected.
+-    for (self._dependents.items) |dep| {
+-        switch (dep) {
+-            .scheduler_task => |task| task.onAbort(self._reason, exec),
+-            else => {},
++    var index: usize = 0;
++    while (index < self._dependents.items.len) {
++        const dep = self._dependents.items[index];
++        if (dep == .audio_listener) {
++            _ = self._dependents.swapRemove(index);
++            dep.audio_listener.signal = null;
++            dep.audio_listener.abort(exec);
++        } else {
++            if (dep == .scheduler_task) dep.scheduler_task.onAbort(self._reason, exec);
++            index += 1;
+         }
+     }
+ }
+diff --git a/src/browser/webapi/AudioContext.zig b/src/browser/webapi/AudioContext.zig
+new file mode 100644
+index 0000000..f8c2ccf
+--- /dev/null
++++ b/src/browser/webapi/AudioContext.zig
+@@ -0,0 +1,600 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const Factory = @import("../Factory.zig");
++const EventManagerBase = @import("../EventManagerBase.zig");
++const EventTarget = @import("EventTarget.zig");
++const Event = @import("Event.zig");
++const DOMException = @import("DOMException.zig");
++const Speech = @import("SpeechSynthesis.zig");
++const Audio = @This();
++
++pub fn registerTypes() []const type {
++    return &.{ Audio, Base, Node, Destination };
++}
++
++pub const Proto = Base;
++_proto: *Base,
++_arena: *lp.Arena,
++_rc: lp.RC = .{},
++_context: ?*js.Context,
++_context_node: std.DoublyLinkedList.Node = .{},
++_destination: *Destination = undefined,
++_events: EventManagerBase,
++_handlers: [1]Speech.Handler = undefined,
++_listener_roots: std.DoublyLinkedList = .{},
++_listener_pool: std.heap.MemoryPool(ListenerRoot) = .empty,
++_listener_local: ?*const js.Local = null,
++_state: State = .suspended,
++_sample_rate: f64,
++_base_latency: f64,
++_elapsed: f64 = 0,
++_started_us: u64 = 0,
++_user_suspended: bool = false,
++_pending: std.DoublyLinkedList = .{},
++
++const State = enum { suspended, running, closed };
++const Options = struct { latencyHint: ?js.Value = null, sampleRate: ?js.Value = null };
++
++fn init(options_: ?Options, exec: *js.Execution) !*Audio {
++    const options = options_ orelse Options{};
++    // Synthetic built-in stereo output on the MacBook Neo, never host audio.
++    const rate: f64 = if (options.sampleRate) |value| @as(f32, @floatCast(try value.toF64())) else 48000;
++    if (!std.math.isFinite(rate)) return error.TypeError;
++    if (rate < 3000 or rate > 768000) return error.NotSupported;
++    var frames: f64 = 128;
++    if (options.latencyHint) |hint| {
++        if (hint.isNumber()) {
++            const seconds = try hint.toF64();
++            if (!std.math.isFinite(seconds)) return error.TypeError;
++            frames = @min(8192, @max(128, @ceil(seconds * 48000 / 128) * 128));
++        } else {
++            const category = try hint.toStringSlice();
++            if (std.mem.eql(u8, category, "balanced")) {
++                frames = 512;
++            } else if (std.mem.eql(u8, category, "playback")) {
++                frames = 1024;
++            } else if (!std.mem.eql(u8, category, "interactive")) return error.TypeError;
++        }
++    }
++    const arena = try exec.getArena(.small, "AudioContext");
++    errdefer arena.release();
++    const self = try Factory.chainedWithAllocator(arena.allocator(), .{
++        EventTarget{ ._type = .base_audio_context },
++        Base{ ._proto = undefined, ._audio = undefined },
++        Audio{ ._proto = undefined, ._arena = arena, ._context = exec.js, ._events = .init(arena.allocator()), ._sample_rate = rate, ._base_latency = @ceil(frames * rate / 48000) / rate },
++    });
++    self._proto._audio = self;
++    self._destination = try Factory.chainedWithAllocator(arena.allocator(), .{
++        EventTarget{ ._type = .audio_node },
++        Node{ ._proto = undefined, ._audio = self },
++        Destination{ ._proto = undefined },
++    });
++    self._handlers[0] = .{ .target = self._proto._proto, .events = &self._events, .name = "statechange", .weak = true };
++    if (self.allowed()) {
++        self._state = .running;
++        self._started_us = lp.datetime.microTimestamp(.boot);
++    }
++    exec.js.audio_contexts.append(&self._context_node);
++    return self;
++}
++
++pub fn acquireRef(self: *Audio) void {
++    self._rc.acquire();
++}
++pub fn releaseRef(self: *Audio, page: *Page) void {
++    self._rc.release(self, page);
++}
++pub fn deinit(self: *Audio, _: *Page) void {
++    if (self._context) |ctx| ctx.audio_contexts.remove(&self._context_node);
++    for (&self._handlers) |*handler| handler.deinit();
++    while (self._listener_roots.first) |node| {
++        const root: *ListenerRoot = @fieldParentPtr("node", node);
++        root.dispose(null);
++    }
++    self._arena.release();
++}
++pub fn detach(self: *Audio) void {
++    const ctx = self._context orelse return;
++    ctx.audio_contexts.remove(&self._context_node);
++    self.freeze();
++    self._context = null;
++    self._state = .closed;
++    // Releasing the last waiting operation can collect this context.
++    self.acquireRef();
++    defer self.releaseRef(ctx.page);
++    while (self._pending.first) |node| {
++        const task: *Task = @fieldParentPtr("node", node);
++        task.abandon();
++    }
++}
++fn creationContext(self: *const Audio, local: *const js.Local) *const js.v8.Context {
++    return if (self._context) |ctx| js.v8.v8__Global__Get(&ctx.handle, local.isolate.handle).? else local.handle;
++}
++fn linkWrappers(self: *Audio, local: *const js.Local) !void {
++    const context = try local.zigValueToJs(self, .{});
++    const destination = try local.zigValueToJs(self._destination, .{});
++    const context_data = try Speech.callbackData(self._proto._proto, local);
++    const destination_data = try Speech.callbackData(self._destination._proto._proto, local);
++    // Both wrappers own the other's callback edges, but the JS cycle is collectible.
++    if (!(context_data.defineOwnProperty("destination", destination, 0) orelse false)) return error.JsException;
++    if (!(destination_data.defineOwnProperty("context", context, 0) orelse false)) return error.JsException;
++}
++fn allowed(self: *const Audio) bool {
++    const ctx = self._context orelse return false;
++    return ctx.global.frame.window._navigator._speech_has_activation;
++}
++
++// Called after trusted activation has propagated to the frame's navigator.
++pub fn notifyActivation(ctx: *js.Context) void {
++    var entry = ctx.audio_contexts.first;
++    while (entry) |node| {
++        const self: *Audio = @fieldParentPtr("_context_node", node);
++        entry = node.next;
++        if (!self._user_suspended and self._pending.first != null) {
++            self.startResume() catch |err| ctx.page.recordJsError(err);
++        }
++    }
++}
++
++pub fn registerListenerAt(self: *Audio, target: *EventTarget, typ: []const u8, callback: EventManagerBase.Callback, options: EventManagerBase.RegisterOptions, exec: *js.Execution) !void {
++    const listener = (try self._events.register(target, typ, callback, options)) orelse return;
++    const slot = switch (listener.function) {
++        .value => |value| value.slot,
++        .object => |value| value.slot,
++        .string => unreachable,
++    };
++    errdefer {
++        self._events.remove(target, typ, callback, options.capture);
++        slot.release();
++    }
++    const root = try self._listener_pool.create(self._arena.allocator());
++    errdefer self._listener_pool.destroy(root);
++    const value = switch (callback) {
++        .function => |f| js.Value{ .local = f.local, .handle = @ptrCast(f.handle) },
++        .object => |o| o.toValue(),
++    };
++    const data = try Speech.callbackData(target, exec.js.local.?);
++    root.* = .{ .audio = self, .target = target, .listener = listener, .slot = slot, .data = try data.persist(), .signal = options.signal };
++    errdefer root.data.release();
++    const key = try std.fmt.bufPrint(&root.key, "listener{d}", .{@intFromPtr(root)});
++    root.key_len = key.len;
++    if (!(data.defineOwnProperty(key, value, 0) orelse false)) return error.JsException;
++    if (options.signal) |signal| try signal._dependents.append(exec.arena, .{ .audio_listener = root });
++    js.v8.v8__Global__SetWeak(&slot.handle);
++    js.v8.v8__Global__SetWeak(&root.data.slot.handle);
++    self._listener_roots.append(&root.node);
++    listener.on_remove = .{ .ctx = root, .callback = ListenerRoot.removed };
++}
++
++pub fn removeListenerAt(self: *Audio, target: *EventTarget, typ: []const u8, callback: EventManagerBase.Callback, capture: bool, exec: *js.Execution) void {
++    const previous_local = self._listener_local;
++    self._listener_local = exec.js.local.?;
++    defer self._listener_local = previous_local;
++    self._events.remove(target, typ, callback, capture);
++}
++
++pub const ListenerRoot = struct {
++    audio: *Audio,
++    target: *EventTarget,
++    listener: *EventManagerBase.Listener,
++    slot: *js.GlobalSlot,
++    data: js.Object.Global,
++    signal: ?*@import("AbortSignal.zig"),
++    node: std.DoublyLinkedList.Node = .{},
++    key: [32]u8 = undefined,
++    key_len: usize = 0,
++
++    fn dispose(self: *ListenerRoot, local: ?*const js.Local) void {
++        const audio = self.audio;
++        if (local) |l| {
++            const data = self.data.local(l);
++            var deleted: js.v8.MaybeBool = undefined;
++            js.v8.v8__Object__Delete(data.handle, l.handle, @ptrCast(l.newString(self.key[0..self.key_len]).handle), &deleted);
++        }
++        if (self.signal) |signal| {
++            for (signal._dependents.items, 0..) |dep, i| {
++                if (dep == .audio_listener and dep.audio_listener == self) {
++                    _ = signal._dependents.swapRemove(i);
++                    break;
++                }
++            }
++        }
++        audio._listener_roots.remove(&self.node);
++        self.slot.release();
++        self.data.release();
++        audio._listener_pool.destroy(self);
++    }
++    fn removed(ptr: *anyopaque) void {
++        const self: *ListenerRoot = @ptrCast(@alignCast(ptr));
++        self.dispose(self.audio._listener_local);
++    }
++    pub fn abort(self: *ListenerRoot, exec: *const js.Execution) void {
++        const audio = self.audio;
++        var scope: js.Local.Scope = undefined;
++        exec.js.localScope(&scope);
++        defer scope.deinit();
++        // Aborting a signal need not otherwise retain the listener's target.
++        _ = scope.local.zigValueToJs(self.target, .{}) catch return;
++        const previous_local = audio._listener_local;
++        audio._listener_local = &scope.local;
++        defer audio._listener_local = previous_local;
++        const list = audio._events.getListeners(self.target, self.listener.typ) orelse return;
++        audio._events.removeListener(list, self.listener);
++    }
++};
++
++pub fn dispatchAt(self: *Audio, target: *EventTarget, event: *Event, exec: *js.Execution) !void {
++    var scope: js.Local.Scope = undefined;
++    exec.js.localScope(&scope);
++    defer scope.deinit();
++    const local = &scope.local;
++    const previous_local = self._listener_local;
++    self._listener_local = local;
++    defer self._listener_local = previous_local;
++    // Retained Event.target must keep the native context alive as well.
++    const wrapper = try local.zigValueToJs(event, .{});
++    const owner = try local.zigValueToJs(target, .{});
++    const key: *const js.v8.Private = @ptrCast(js.v8.v8__Global__Get(&local.ctx.env.private_symbols.speech_callbacks.handle, local.isolate.handle).?);
++    var saved: js.v8.MaybeBool = undefined;
++    js.v8.v8__Object__SetPrivate(@ptrCast(wrapper.handle), local.handle, key, owner.handle, &saved);
++    if (!saved.has_value or !saved.value) return error.JsException;
++    try Speech.dispatchDirect(target, &self._events, event, exec);
++}
++fn currentTime(self: *const Audio) f64 {
++    const seconds = self._elapsed + if (self._state == .running)
++        @as(f64, @floatFromInt(lp.datetime.microTimestamp(.boot) - self._started_us)) / 1e6
++    else
++        0;
++    return @floor(seconds * self._sample_rate / 128) * 128 / self._sample_rate;
++}
++fn freeze(self: *Audio) void {
++    self._elapsed = self.currentTime();
++}
++fn closedError(local: *const js.Local) !js.Value {
++    const exception = try local.ctx.execution._factory.create(DOMException.init("The audio context is closed", "InvalidStateError"));
++    return local.zigValueToJs(exception, .{});
++}
++fn result(exec: *js.Execution, reject: bool) !js.Promise {
++    const local = exec.js.local.?;
++    const resolver = js.PromiseResolver.init(local);
++    if (reject) {
++        try resolver.rejectValue(try closedError(local));
++    } else try resolver.resolveValue(try local.zigValueToJs({}, .{}));
++    return resolver.promise();
++}
++fn @"suspend"(self: *Audio, exec: *js.Execution) !js.Promise {
++    if (self._state == .closed or self._context == null) return result(exec, true);
++    self._user_suspended = true;
++    const changed = self._state != .suspended;
++    self.freeze();
++    self._state = .suspended;
++    // An accepted resume must complete before a later suspend, not disappear.
++    var node = self._pending.first;
++    while (node) |entry| : (node = entry.next) {
++        const task: *Task = @fieldParentPtr("node", entry);
++        if (task.kind == .@"resume" and task.scheduled) return self.transition(.@"suspend", exec);
++    }
++    if (changed) try self.schedule(.event, exec, exec.js.local.?);
++    return result(exec, false);
++}
++fn @"resume"(self: *Audio, exec: *js.Execution) !js.Promise {
++    if (self._state == .closed or self._context == null) return result(exec, true);
++    self._user_suspended = false;
++    if (self._state == .running) return result(exec, false);
++    return self.transition(.@"resume", exec);
++}
++fn transition(self: *Audio, kind: Task.Kind, exec: *js.Execution) !js.Promise {
++    const resolver = js.PromiseResolver.init(exec.js.local.?);
++    const task = try self.createTask(kind, exec, exec.js.local.?);
++    errdefer task.dispose();
++    task.resolver = try resolver.persist();
++    self._pending.append(&task.node);
++    if (kind == .@"suspend") try task.enqueue() else try self.startResume();
++    return resolver.promise();
++}
++fn startResume(self: *Audio) !void {
++    if (self._state == .closed or !self.allowed()) return;
++    var entry = self._pending.first;
++    while (entry) |node| : (entry = node.next) {
++        const task: *Task = @fieldParentPtr("node", node);
++        if (task.kind == .@"resume" and !task.scheduled) try task.enqueue();
++    }
++}
++fn close(self: *Audio, exec: *js.Execution) !js.Promise {
++    if (self._state == .closed or self._context == null) return result(exec, true);
++    self.freeze();
++    self._state = .closed;
++    while (self._pending.first) |node| {
++        const task: *Task = @fieldParentPtr("node", node);
++        try task.settle(exec.js.local.?, true);
++        if (!task.scheduled) task.dispose();
++    }
++    try self.schedule(.event, exec, exec.js.local.?);
++    return result(exec, false);
++}
++fn getBaseLatency(self: *const Audio) f64 {
++    return self._base_latency;
++}
++fn getOutputLatency(_: *const Audio) f64 {
++    return 128.0 / 48000.0;
++}
++fn getOutputTimestamp(self: *const Audio, exec: *js.Execution) struct { contextTime: f64, performanceTime: f64 } {
++    if (self._state != .running) return .{ .contextTime = 0, .performanceTime = 0 };
++    return .{ .contextTime = @max(0, self.currentTime() - self._base_latency), .performanceTime = exec.js.global.frame.window._performance.now() };
++}
++
++const Task = struct {
++    audio: *Audio,
++    arena: *lp.Arena,
++    root: js.Value.Global,
++    kind: Kind,
++    node: std.DoublyLinkedList.Node = .{},
++    resolver: ?js.PromiseResolver.Global = null,
++    scheduled: bool = false,
++    const Kind = enum { @"resume", @"suspend", event };
++
++    fn enqueue(self: *Task) !void {
++        const ctx = self.audio._context orelse return error.InvalidStateError;
++        try ctx.scheduler.add(self, Task.run, 0, .{ .name = "AudioContext", .finalizer = Task.cancel });
++        self.scheduled = true;
++    }
++    fn abandon(self: *Task) void {
++        if (self.resolver) |resolver| {
++            self.audio._pending.remove(&self.node);
++            self.resolver = null;
++            resolver.release();
++        }
++        if (!self.scheduled) self.dispose();
++    }
++    fn dispose(self: *Task) void {
++        if (self.resolver) |resolver| {
++            self.audio._pending.remove(&self.node);
++            resolver.release();
++        }
++        self.root.release();
++        self.arena.release();
++    }
++    fn settle(self: *Task, local: *const js.Local, reject: bool) !void {
++        const resolver = self.resolver orelse return;
++        self.audio._pending.remove(&self.node);
++        self.resolver = null;
++        defer resolver.release();
++        if (reject) {
++            try resolver.local(local).rejectValue(try closedError(local));
++        } else try resolver.local(local).resolveValue(try local.zigValueToJs({}, .{}));
++    }
++    fn cancel(ptr: *anyopaque) void {
++        const self: *Task = @ptrCast(@alignCast(ptr));
++        self.dispose();
++    }
++    fn run(ptr: *anyopaque) !?u32 {
++        const self: *Task = @ptrCast(@alignCast(ptr));
++        defer self.dispose();
++        const audio = self.audio;
++        const ctx = audio._context orelse return null;
++        var scope: js.Local.Scope = undefined;
++        ctx.localScope(&scope);
++        defer scope.deinit();
++        defer scope.local.runMicrotasks();
++        if (self.kind == .event) {
++            const event = try Event.init("statechange", null, ctx.page);
++            event._is_trusted = true;
++            try audio.dispatchAt(audio._proto._proto, event, &ctx.execution);
++        } else {
++            if (audio._state == .closed) {
++                try self.settle(&scope.local, true);
++                return null;
++            }
++            const state: State = if (self.kind == .@"resume") .running else .suspended;
++            if (audio._state != state) {
++                audio.freeze();
++                audio._state = state;
++                if (state == .running) audio._started_us = lp.datetime.microTimestamp(.boot);
++                try audio.schedule(.event, &ctx.execution, &scope.local);
++            }
++            try self.settle(&scope.local, false);
++        }
++        return null;
++    }
++};
++fn createTask(self: *Audio, kind: Task.Kind, exec: *js.Execution, local: *const js.Local) !*Task {
++    const arena = try exec.getArena(.tiny, "AudioContext.task");
++    errdefer arena.release();
++    const root = try (try local.zigValueToJs(self, .{})).persist();
++    errdefer root.release();
++    const task = try arena.create(Task);
++    task.* = .{ .audio = self, .arena = arena, .root = root, .kind = kind };
++    return task;
++}
++fn schedule(self: *Audio, kind: Task.Kind, exec: *js.Execution, local: *const js.Local) !void {
++    const task = try self.createTask(kind, exec, local);
++    errdefer task.dispose();
++    try task.enqueue();
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Audio);
++    pub const Meta = struct {
++        pub const name = "AudioContext";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub const creation_context = Audio.creationContext;
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(init, .{});
++    pub const baseLatency = bridge.accessor(getBaseLatency, null, .{});
++    pub const outputLatency = bridge.accessor(getOutputLatency, null, .{});
++    pub const getOutputTimestamp = bridge.function(Audio.getOutputTimestamp, .{});
++    pub const @"suspend" = bridge.function(Audio.@"suspend", .{});
++    pub const @"resume" = bridge.function(Audio.@"resume", .{});
++    pub const close = bridge.function(Audio.close, .{});
++};
++
++pub const Base = struct {
++    pub const Proto = EventTarget;
++    _proto: *EventTarget,
++    _audio: *Audio,
++    _type: Type = .audio_context,
++    pub const Type = enum { audio_context };
++    pub fn Subtype(comptime _: Type) type {
++        return Audio;
++    }
++    pub fn subtype(self: *Base, comptime _: type) *Audio {
++        return self._audio;
++    }
++    fn getDestination(self: *const Base, exec: *js.Execution) !*Destination {
++        try self._audio.linkWrappers(exec.js.local.?);
++        return self._audio._destination;
++    }
++    fn getSampleRate(self: *const Base) f64 {
++        return self._audio._sample_rate;
++    }
++    fn getCurrentTime(self: *const Base) f64 {
++        return self._audio.currentTime();
++    }
++    fn getState(self: *const Base) []const u8 {
++        return @tagName(self._audio._state);
++    }
++    fn getHandler(self: *const Base) ?js.Object.Global {
++        return Speech.Binding(Audio, 0).get(self._audio);
++    }
++    fn setHandler(self: *Base, value: js.Value, exec: *js.Execution) !void {
++        try Speech.Binding(Audio, 0).set(self._audio, value, exec);
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Base);
++        pub const Meta = struct {
++            pub const name = "BaseAudioContext";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const destination = bridge.accessor(getDestination, null, .{});
++        pub const sampleRate = bridge.accessor(getSampleRate, null, .{});
++        pub const currentTime = bridge.accessor(getCurrentTime, null, .{});
++        pub const state = bridge.accessor(getState, null, .{});
++        pub const onstatechange = bridge.accessor(getHandler, setHandler, .{});
++    };
++};
++
++pub const Node = struct {
++    pub const Proto = EventTarget;
++    _proto: *EventTarget,
++    _audio: *Audio,
++    _type: Type = .audio_destination_node,
++    _channels: u32 = 2,
++    _mode: []const u8 = "explicit",
++    _interpretation: []const u8 = "speakers",
++    pub const Type = enum { audio_destination_node };
++    pub fn Subtype(comptime _: Type) type {
++        return Destination;
++    }
++    pub fn subtype(self: *Node, comptime _: type) *Destination {
++        return @ptrFromInt(@intFromPtr(self) + comptime Factory.protoOffset(Destination));
++    }
++    pub fn acquireRef(self: *Node) void {
++        self._audio.acquireRef();
++    }
++    pub fn releaseRef(self: *Node, page: *Page) void {
++        self._audio.releaseRef(page);
++    }
++    fn getContext(self: *const Node, exec: *js.Execution) !*Audio {
++        try self._audio.linkWrappers(exec.js.local.?);
++        return self._audio;
++    }
++    fn getInputs(_: *const Node) u32 {
++        return 1;
++    }
++    fn getOutputs(_: *const Node) u32 {
++        return 0;
++    }
++    fn getChannels(self: *const Node) u32 {
++        return self._channels;
++    }
++    fn setChannels(self: *Node, count: u32) !void {
++        if (count == 0) return error.NotSupported;
++        if (count > 2) return error.IndexSizeError;
++        self._channels = count;
++    }
++    fn getMode(self: *const Node) []const u8 {
++        return self._mode;
++    }
++    fn setMode(self: *Node, value: []const u8) void {
++        inline for (.{ "max", "clamped-max", "explicit" }) |mode| {
++            if (std.mem.eql(u8, value, mode)) self._mode = mode;
++        }
++    }
++    fn getInterpretation(self: *const Node) []const u8 {
++        return self._interpretation;
++    }
++    fn setInterpretation(self: *Node, value: []const u8) void {
++        inline for (.{ "speakers", "discrete" }) |mode| {
++            if (std.mem.eql(u8, value, mode)) self._interpretation = mode;
++        }
++    }
++    fn connect(self: *Node, destination: *Node, _: ?u32, _: ?u32) !*Node {
++        if (self._audio != destination._audio) return error.InvalidAccessError;
++        // The destination is a sink, so no output index can be connected.
++        return error.IndexSizeError;
++    }
++    fn disconnect(_: *Node, destination: ?js.Value, _: ?u32, _: ?u32) !void {
++        const value = destination orelse return;
++        if (value.isNumber()) return error.IndexSizeError;
++        _ = try value.toZig(*Node);
++        return error.InvalidAccessError;
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Node);
++        pub const Meta = struct {
++            pub const name = "AudioNode";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const context = bridge.accessor(getContext, null, .{});
++        pub const numberOfInputs = bridge.accessor(getInputs, null, .{});
++        pub const numberOfOutputs = bridge.accessor(getOutputs, null, .{});
++        pub const channelCount = bridge.accessor(getChannels, setChannels, .{});
++        pub const channelCountMode = bridge.accessor(getMode, setMode, .{});
++        pub const channelInterpretation = bridge.accessor(getInterpretation, setInterpretation, .{});
++        pub const connect = bridge.function(Node.connect, .{});
++        pub const disconnect = bridge.function(Node.disconnect, .{});
++    };
++};
++
++pub const Destination = struct {
++    pub const Proto = Node;
++    _proto: *Node,
++    fn getMaxChannels(_: *const Destination) u32 {
++        return 2;
++    }
++    fn creationContext(self: *const Destination, local: *const js.Local) *const js.v8.Context {
++        return self._proto._audio.creationContext(local);
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Destination);
++        pub const Meta = struct {
++            pub const name = "AudioDestinationNode";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub const creation_context = Destination.creationContext;
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const maxChannelCount = bridge.accessor(getMaxChannels, null, .{});
++    };
++};
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index 74a72b4..fc78d77 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -68,6 +68,7 @@ const MediaDevices = @import("MediaDevices.zig");
+ const SpeechSynthesis = @import("SpeechSynthesis.zig");
+ const SpeechSynthesisUtterance = @import("SpeechSynthesisUtterance.zig");
+ const VideoDecoder = @import("VideoDecoder.zig");
++const AudioContext = @import("AudioContext.zig");
+ 
+ const EventTarget = @This();
+ 
+@@ -81,6 +82,8 @@ _type: Type align(8),
+ 
+ pub const Type = enum(u8) {
+     abort_signal,
++    audio_node,
++    base_audio_context,
+     battery_manager,
+     broadcast_channel,
+     cookie_store,
+@@ -123,6 +126,8 @@ pub const Type = enum(u8) {
+ pub fn Subtype(comptime tag: Type) type {
+     return switch (tag) {
+         .abort_signal => AbortSignal,
++        .audio_node => AudioContext.Node,
++        .base_audio_context => AudioContext.Base,
+         .battery_manager => BatteryManager,
+         .broadcast_channel => BroadcastChannel,
+         .cookie_store => CookieStore,
+@@ -222,6 +227,10 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
+     }
+ 
+     switch (self._type) {
++        inline .audio_node, .base_audio_context => |tag| {
++            try self.subtype(Subtype(tag))._audio.dispatchAt(self, event, exec);
++            return !event._cancelable or !event._prevent_default;
++        },
+         inline .speech_synthesis, .speech_synthesis_utterance, .video_decoder => |tag| {
+             try self.subtype(Subtype(tag)).dispatch(event, exec);
+             return !event._cancelable or !event._prevent_default;
+@@ -341,6 +350,7 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
+         },
+         .speech_synthesis_utterance => return self.subtype(SpeechSynthesisUtterance).registerListener(typ, em_callback, options, exec),
+         .video_decoder => return self.subtype(VideoDecoder).registerListener(typ, em_callback, options, exec),
++        inline .audio_node, .base_audio_context => |tag| return self.subtype(Subtype(tag))._audio.registerListenerAt(self, typ, em_callback, options, exec),
+         else => {},
+     }
+     return exec.registerListener(self, typ, em_callback, options);
+@@ -390,6 +400,10 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
+         return;
+     }
+     switch (self._type) {
++        inline .audio_node, .base_audio_context => |tag| {
++            self.subtype(Subtype(tag))._audio.removeListenerAt(self, typ, em_callback, use_capture, exec);
++            return;
++        },
+         inline .speech_synthesis, .speech_synthesis_utterance, .video_decoder => |tag| {
+             self.subtype(Subtype(tag))._events.remove(self, typ, em_callback, use_capture);
+             return;
+@@ -414,6 +428,8 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         .worker_global_scope => writer.writeAll("<WorkerGlobalScope>"),
+         .xhr => writer.writeAll("<XMLHttpRequestEventTarget>"),
+         .abort_signal => writer.writeAll("<AbortSignal>"),
++        .audio_node => writer.writeAll("<AudioDestinationNode>"),
++        .base_audio_context => writer.writeAll("<AudioContext>"),
+         .battery_manager => writer.writeAll("<BatteryManager>"),
+         .media_devices => writer.writeAll("<MediaDevices>"),
+         .media_query_list => writer.writeAll("<MediaQueryList>"),
+@@ -442,6 +458,8 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+ pub fn toString(self: *EventTarget) []const u8 {
+     return switch (self._type) {
+         .abort_signal => return "[object AbortSignal]",
++        .audio_node => return "[object AudioDestinationNode]",
++        .base_audio_context => return "[object AudioContext]",
+         .battery_manager => return "[object BatteryManager]",
+         .broadcast_channel => return "[object BroadcastChannel]",
+         .cookie_store => return "[object CookieStore]",
+diff --git a/src/browser/webapi/WebShare.zig b/src/browser/webapi/WebShare.zig
+index b62950b..d55fff1 100644
+--- a/src/browser/webapi/WebShare.zig
++++ b/src/browser/webapi/WebShare.zig
+@@ -310,6 +310,7 @@ pub fn notifyActivation(frame: *Frame, event: *Event) void {
+     while (ancestor) |current| : (ancestor = current.parent) {
+         current.window._navigator._share_activation_ms = now;
+         current.window._navigator._speech_has_activation = true;
++        @import("AudioContext.zig").notifyActivation(current.js);
+     }
+     activateSameOrigin(root(frame), frame, now);
+ }
+@@ -318,6 +319,7 @@ fn activateSameOrigin(frame: *Frame, source: *Frame, now: u64) void {
+     if (sameOrigin(frame, source)) {
+         frame.window._navigator._share_activation_ms = now;
+         frame.window._navigator._speech_has_activation = true;
++        @import("AudioContext.zig").notifyActivation(frame.js);
+     }
+     for (frame.child_frames.items) |child| activateSameOrigin(child, source, now);
+ }

@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 20 Oct 2026 12:41:01 -0300
+Subject: [PATCH] css: support fractional media-query lengths
+
+Alo Yoga BR queries (min-width: 64.1rem) to select its desktop header.
+The integer-only length parser rejected the fractional threshold, selecting
+its mobile search control even at the 1100px desktop viewport and causing
+the compatibility search-trigger check to time out.
+
+Parse CSS numbers including fractions and exponents for px/em/rem and
+compare dimensions without rounding the threshold. Retain the existing
+u32 pixel ceiling and invalid/negative-length rejection. Update the
+existing decimal-length test to expect the newly supported behavior.
+---
+ src/browser/css/MediaQuery.zig | 56 +++++++++++++++++++++-------------
+ 1 file changed, 35 insertions(+), 21 deletions(-)
+
+diff --git a/src/browser/css/MediaQuery.zig b/src/browser/css/MediaQuery.zig
+index 4923090..4c2adec 100644
+--- a/src/browser/css/MediaQuery.zig
++++ b/src/browser/css/MediaQuery.zig
+@@ -31,7 +31,7 @@
+ //!               `orientation` (portrait | landscape),
+ //!               `pointer` / `any-pointer` (fine),
+ //!               `hover` / `any-hover` (hover).
+-//!   - Length values: `<int>px`, `<int>em` (1em = 16px), `<int>rem`,
++//!   - Length values: `<number>px`, `<number>em` (1em = 16px), `<number>rem`,
+ //!     and bare `0`.
+ //!   - Operators: `,` (OR), `and`, `not`, `only`.
+ //!
+@@ -299,8 +299,8 @@ fn evalNameValue(name: []const u8, value: []const u8, viewport: Viewport) bool {
+     const lower_name = std.ascii.lowerString(&buf, name);
+     const lname = stripDevice(lower_name);
+     const device = lname.len != lower_name.len;
+-    const width = if (device) viewport.screen_width orelse viewport.width else viewport.width;
+-    const height = if (device) viewport.screen_height orelse viewport.height else viewport.height;
++    const width: f64 = @floatFromInt(if (device) viewport.screen_width orelse viewport.width else viewport.width);
++    const height: f64 = @floatFromInt(if (device) viewport.screen_height orelse viewport.height else viewport.height);
+     if (std.mem.eql(u8, lname, "min-width")) {
+         const px = parseLengthPx(value) orelse return false;
+         return width >= px;
+@@ -358,10 +358,9 @@ fn evalBoolean(name: []const u8, viewport: Viewport) bool {
+     return false;
+ }
+ 
+-/// Parse `<int>px`, `<int>em` (1em=16px), `<int>rem`, or bare `0`.
+-/// Negative lengths are rejected per the Media Queries spec (`<length>` in
+-/// media features may not be negative). Returns null on any other form.
+-fn parseLengthPx(value: []const u8) ?u32 {
++/// Parse CSS numbers with px, em, or rem units (1em=16px), or unitless zero.
++/// Negative lengths and values beyond the existing u32 pixel limit are rejected.
++fn parseLengthPx(value: []const u8) ?f64 {
+     const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+     if (trimmed.len == 0) return null;
+     if (trimmed[0] == '-') return null;
+@@ -370,21 +369,36 @@ fn parseLengthPx(value: []const u8) ?u32 {
+     if (i < trimmed.len and trimmed[i] == '+') i += 1;
+     const num_start = i;
+     while (i < trimmed.len and std.ascii.isDigit(trimmed[i])) i += 1;
+-    if (i == num_start) return null;
++    var has_digits = i > num_start;
++    if (i + 1 < trimmed.len and trimmed[i] == '.' and std.ascii.isDigit(trimmed[i + 1])) {
++        i += 1;
++        while (i < trimmed.len and std.ascii.isDigit(trimmed[i])) i += 1;
++        has_digits = true;
++    }
++    if (!has_digits) return null;
++
++    if (i < trimmed.len and (trimmed[i] == 'e' or trimmed[i] == 'E')) {
++        var end = i + 1;
++        if (end < trimmed.len and (trimmed[end] == '+' or trimmed[end] == '-')) end += 1;
++        const exponent_start = end;
++        while (end < trimmed.len and std.ascii.isDigit(trimmed[end])) end += 1;
++        if (end > exponent_start) i = end;
++    }
+ 
+-    const num = std.fmt.parseInt(u32, trimmed[num_start..i], 10) catch return null;
++    const num = std.fmt.parseFloat(f64, trimmed[num_start..i]) catch return null;
+     const unit = std.mem.trim(u8, trimmed[i..], &std.ascii.whitespace);
+ 
+     if (unit.len == 0) {
+         return if (num == 0) 0 else null;
+     }
+-    if (std.ascii.eqlIgnoreCase(unit, "px")) return num;
+-    // `em` / `rem`: 1em = 16px. `std.math.mul` returns an error on u32 overflow
+-    // (e.g. `268435456em` would otherwise wrap or panic in debug); treat that
+-    // as an unparseable length so the query fails closed per MQ4.
+-    if (std.ascii.eqlIgnoreCase(unit, "em")) return std.math.mul(u32, num, 16) catch null;
+-    if (std.ascii.eqlIgnoreCase(unit, "rem")) return std.math.mul(u32, num, 16) catch null;
+-    return null;
++    const px = if (std.ascii.eqlIgnoreCase(unit, "px"))
++        num
++    else if (std.ascii.eqlIgnoreCase(unit, "em") or std.ascii.eqlIgnoreCase(unit, "rem"))
++        num * 16
++    else
++        return null;
++    if (!std.math.isFinite(px) or px > std.math.maxInt(u32)) return null;
++    return px;
+ }
+ 
+ const testing = std.testing;
+@@ -646,11 +660,11 @@ test "MediaQuery: range syntax is unsupported (fails closed)" {
+     try testing.expect(!matches("(600px <= width <= 1200px)", v));
+ }
+ 
+-test "MediaQuery: decimal lengths are rejected" {
++test "MediaQuery: decimal lengths are accepted" {
+     const v = Viewport.default;
+-    try testing.expect(!matches("(min-width: 600.5px)", v));
+-    try testing.expect(!matches("(min-width: 0.5em)", v));
+-    try testing.expect(!matches("(width: 1920.0px)", v));
++    try testing.expect(matches("(min-width: 600.5px)", v));
++    try testing.expect(matches("(min-width: 0.5em)", v));
++    try testing.expect(matches("(width: 1100.0px)", v));
+ }
+ 
+ test "MediaQuery: whitespace-tight and -loose features" {
+@@ -677,7 +691,7 @@ test "MediaQuery: u32 boundaries on length" {
+     const v = Viewport.default;
+     // u32 max parses; the viewport doesn't reach it.
+     try testing.expect(!matches("(min-width: 4294967295px)", v));
+-    // Beyond u32 max overflows parseInt and fails closed.
++    // Beyond the supported u32 pixel limit fails closed.
+     try testing.expect(!matches("(min-width: 4294967296px)", v));
+     try testing.expect(!matches("(min-width: 9999999999px)", v));
+ }

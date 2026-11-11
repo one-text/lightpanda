@@ -1,0 +1,1176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 15 Oct 2026 03:45:37 -0300
+Subject: [PATCH] webapi: mock Mac Chrome speech synthesis with native bindings
+
+Expose Window-only SpeechSynthesis, SpeechSynthesisVoice,
+SpeechSynthesisUtterance, SpeechSynthesisEvent and SpeechSynthesisErrorEvent
+through the native bridge. Add a stable per-Window synthesis controller,
+asynchronous initial voice loading and voiceschanged, native readonly voice
+metadata and WebIDL-like construction, conversions and range clamping.
+
+Use a fixed English-US macOS 26.3.1 persona inventory: 23 Apple compact/local
+voices and 19 Google remote voices, with Samantha as the default. This is a
+synthetic representative inventory, not a measured exhaustive macOS install
+or a query of host OS voices. It does not change the reduced UA or Client
+Hint platform-version policy in earlier patches, or any Neo hardware values.
+
+Simulate FIFO utterance start/end/error and pause/resume/cancel using the
+existing scheduler, with sticky trusted-input activation, native event
+instances, insertion-ordered attribute handlers, and cancellation elapsed
+time. Duration is synthetic (30 ms per UTF-16 code unit divided by rate,
+clamped to 20-2000 ms); no word-boundary or mark precision is fabricated.
+
+Keep queued utterances and event-referenced utterances alive, allow unused
+utterances and callback cycles to be collected, and detach queues on frame
+teardown and iframe disconnection. Handle scheduler allocation failures
+without dangling/double-released persistent handles. Reuse existing event,
+identity/finalizer, scheduler and private-property infrastructure.
+
+Scope: silent API mock only. No PCM, audio playback, speech engine, OS voice
+installation, network TTS, recognition, or decoding functionality. Google
+voices are metadata, not calls to Google. The deterministic inventory,
+synthetic duration and incomplete platform-engine behavior remain observable.
+Do not change benchmark assertions or enable iframe/worker loading defaults.
+
+References:
+https://webaudio.github.io/web-speech-api/#tts-section
+https://chromium.googlesource.com/chromium/src/+/main/third_party/blink/renderer/modules/speech/speech_synthesis.idl
+https://chromium.googlesource.com/chromium/src/+/main/third_party/blink/renderer/modules/speech/speech_synthesis_utterance.idl
+https://chromium.googlesource.com/chromium/src/+/main/third_party/blink/renderer/modules/speech/speech_synthesis_event.idl
+https://chromium.googlesource.com/chromium/src/+/main/third_party/blink/renderer/modules/speech/speech_synthesis_error_event.idl
+
+Validation before export: existing upstream tests 1658/1658; temporary CDP
+API diagnostics 107/107 and four navigation teardown cases. Diagnostics
+cover shape, native functions, conversions, activation, loading, FIFO,
+reentrant cancellation and end-handler pausing, pause/resume, cancellation
+timing, event identity, GC survival and reclamation (including callback
+cycles), iframe disconnection, worker absence and navigation teardown.
+One reviewer pass completed and findings addressed. No new unit tests.
+Allocation-failure cleanup was inspected, not fault-injected.
+---
+ src/browser/Frame.zig                         |   2 +
+ src/browser/js/Env.zig                        |   3 +
+ src/browser/js/bridge.zig                     |   4 +
+ src/browser/webapi/Event.zig                  |   3 +
+ src/browser/webapi/EventTarget.zig            |  34 ++
+ src/browser/webapi/Navigator.zig              |   2 +
+ src/browser/webapi/SpeechSynthesis.zig        | 389 ++++++++++++++++++
+ .../webapi/SpeechSynthesisUtterance.zig       | 160 +++++++
+ src/browser/webapi/SpeechSynthesisVoice.zig   |  99 +++++
+ src/browser/webapi/WebShare.zig               |   6 +-
+ src/browser/webapi/Window.zig                 |  10 +
+ .../webapi/event/SpeechSynthesisEvent.zig     | 166 ++++++++
+ 12 files changed, 877 insertions(+), 1 deletion(-)
+ create mode 100644 src/browser/webapi/SpeechSynthesis.zig
+ create mode 100644 src/browser/webapi/SpeechSynthesisUtterance.zig
+ create mode 100644 src/browser/webapi/SpeechSynthesisVoice.zig
+ create mode 100644 src/browser/webapi/event/SpeechSynthesisEvent.zig
+
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index 63451d1..0c74714 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -482,6 +482,7 @@ pub fn deinit(self: *Frame) void {
+         cs.detach();
+     }
+ 
++    if (self.window._speech_synthesis) |speech| speech.detach();
+     self.window._navigator.detachPdf();
+     if (self.window._navigator._service_worker) |container| {
+         container.detach();
+@@ -549,6 +550,7 @@ pub fn deinit(self: *Frame) void {
+ }
+ 
+ pub fn detachPdf(self: *Frame) void {
++    if (self.window._speech_synthesis) |speech| speech.detach();
+     self.window._navigator.detachPdf();
+     for (self.child_frames.items) |child| child.detachPdf();
+ }
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 22a5ae0..7fa47f0 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -1026,6 +1026,7 @@ const PrivateSymbols = struct {
+     get_battery: Private,
+     network_information: Private,
+     chrome_result: Private,
++    speech_callbacks: Private,
+ 
+     fn init(isolate: *v8.Isolate) PrivateSymbols {
+         return .{
+@@ -1033,6 +1034,7 @@ const PrivateSymbols = struct {
+             .get_battery = Private.init(isolate, "get_battery"),
+             .network_information = Private.init(isolate, "network_information"),
+             .chrome_result = Private.init(isolate, "chrome_result"),
++            .speech_callbacks = Private.init(isolate, "speech_callbacks"),
+         };
+     }
+ 
+@@ -1041,6 +1043,7 @@ const PrivateSymbols = struct {
+         self.get_battery.deinit();
+         self.network_information.deinit();
+         self.chrome_result.deinit();
++        self.speech_callbacks.deinit();
+     }
+ };
+ 
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 80eb5de..efeaf15 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1029,6 +1029,10 @@ pub const SubType = enum {
+ 
+ // APIs for Page/Window contexts. Used by Snapshot.zig for Page snapshot creation.
+ pub const PageJsApis = flattenTypes(&.{
++    @import("../webapi/SpeechSynthesis.zig"),
++    @import("../webapi/SpeechSynthesisVoice.zig"),
++    @import("../webapi/SpeechSynthesisUtterance.zig"),
++    @import("../webapi/event/SpeechSynthesisEvent.zig"),
+     @import("../webapi/BatteryManager.zig"),
+     @import("../webapi/MediaDevices.zig"),
+     @import("../webapi/MediaDeviceInfo.zig"),
+diff --git a/src/browser/webapi/Event.zig b/src/browser/webapi/Event.zig
+index 05dedea..31b6cfb 100644
+--- a/src/browser/webapi/Event.zig
++++ b/src/browser/webapi/Event.zig
+@@ -83,6 +83,7 @@ const EventPhase = enum(u8) {
+ 
+ pub const Type = union(enum) {
+     generic,
++    speech_synthesis_event: *@import("event/SpeechSynthesisEvent.zig"),
+     error_event: *@import("event/ErrorEvent.zig"),
+     custom_event: *@import("event/CustomEvent.zig"),
+     message_event: *@import("event/MessageEvent.zig"),
+@@ -173,6 +174,7 @@ pub fn acquireRef(self: *Event) void {
+ }
+ 
+ pub fn deinit(self: *Event, _: *Page) void {
++    if (self._type == .speech_synthesis_event) self._type.speech_synthesis_event._keepalive.release();
+     self._arena.release();
+ }
+ 
+@@ -200,6 +202,7 @@ pub fn relatedTargetPtr(self: *Event) ?*?*EventTarget {
+ pub fn is(self: *Event, comptime T: type) ?*T {
+     switch (self._type) {
+         .generic => return if (T == Event) self else null,
++        .speech_synthesis_event => |e| return e.is(T),
+         .error_event => |e| return if (T == @import("event/ErrorEvent.zig")) e else null,
+         .custom_event => |e| return if (T == @import("event/CustomEvent.zig")) e else null,
+         .message_event => |e| return if (T == @import("event/MessageEvent.zig")) e else null,
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index 5d1c1bf..ded0f61 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -65,6 +65,9 @@ const BatteryManager = @import("BatteryManager.zig");
+ const NetworkInformation = @import("NetworkInformation.zig");
+ const MediaDevices = @import("MediaDevices.zig");
+ 
++const SpeechSynthesis = @import("SpeechSynthesis.zig");
++const SpeechSynthesisUtterance = @import("SpeechSynthesisUtterance.zig");
++
+ const EventTarget = @This();
+ 
+ pub const _prototype_root = true;
+@@ -102,6 +105,8 @@ pub const Type = enum(u8) {
+     service_worker_container,
+     service_worker_registration,
+     shared_worker,
++    speech_synthesis,
++    speech_synthesis_utterance,
+     text_track_cue,
+     visual_viewport,
+     websocket,
+@@ -141,6 +146,8 @@ pub fn Subtype(comptime tag: Type) type {
+         .service_worker_container => ServiceWorkerContainer,
+         .service_worker_registration => ServiceWorkerRegistration,
+         .shared_worker => SharedWorker,
++        .speech_synthesis => SpeechSynthesis,
++        .speech_synthesis_utterance => SpeechSynthesisUtterance,
+         .text_track_cue => TextTrackCue,
+         .visual_viewport => VisualViewport,
+         .websocket => WebSocket,
+@@ -211,6 +218,14 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
+         return !event._cancelable or !event._prevent_default;
+     }
+ 
++    switch (self._type) {
++        inline .speech_synthesis, .speech_synthesis_utterance => |tag| {
++            try self.subtype(Subtype(tag)).dispatch(event, exec);
++            return !event._cancelable or !event._prevent_default;
++        },
++        else => {},
++    }
++
+     switch (exec.js.global) {
+         .frame => |frame| {
+             event.acquireRef();
+@@ -316,6 +331,14 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
+         _ = try self.subtype(NetworkInformation)._events.register(self, typ, em_callback, options);
+         return;
+     }
++    switch (self._type) {
++        .speech_synthesis => {
++            _ = try self.subtype(SpeechSynthesis)._events.register(self, typ, em_callback, options);
++            return;
++        },
++        .speech_synthesis_utterance => return self.subtype(SpeechSynthesisUtterance).registerListener(typ, em_callback, options, exec),
++        else => {},
++    }
+     return exec.registerListener(self, typ, em_callback, options);
+ }
+ 
+@@ -362,6 +385,13 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
+         self.subtype(NetworkInformation)._events.remove(self, typ, em_callback, use_capture);
+         return;
+     }
++    switch (self._type) {
++        inline .speech_synthesis, .speech_synthesis_utterance => |tag| {
++            self.subtype(Subtype(tag))._events.remove(self, typ, em_callback, use_capture);
++            return;
++        },
++        else => {},
++    }
+     exec.removeListener(self, typ, em_callback, use_capture);
+ }
+ 
+@@ -375,6 +405,8 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         .service_worker_container => writer.writeAll("<ServiceWorkerContainer>"),
+         .service_worker_registration => writer.writeAll("<ServiceWorkerRegistration>"),
+         .shared_worker => writer.writeAll("<SharedWorker>"),
++        .speech_synthesis => writer.writeAll("<SpeechSynthesis>"),
++        .speech_synthesis_utterance => writer.writeAll("<SpeechSynthesisUtterance>"),
+         .worker_global_scope => writer.writeAll("<WorkerGlobalScope>"),
+         .xhr => writer.writeAll("<XMLHttpRequestEventTarget>"),
+         .abort_signal => writer.writeAll("<AbortSignal>"),
+@@ -430,6 +462,8 @@ pub fn toString(self: *EventTarget) []const u8 {
+         .service_worker_container => return "[object ServiceWorkerContainer]",
+         .service_worker_registration => return "[object ServiceWorkerRegistration]",
+         .shared_worker => return "[object SharedWorker]",
++        .speech_synthesis => return "[object SpeechSynthesis]",
++        .speech_synthesis_utterance => return "[object SpeechSynthesisUtterance]",
+         .text_track_cue => return "[object TextTrackCue]",
+         .visual_viewport => return "[object VisualViewport]",
+         .websocket => return "[object WebSocket]",
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index fc6318c..2b62a28 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -60,6 +60,7 @@ _service_worker: ?*ServiceWorkerContainer = null,
+ _media_devices: ?*MediaDevices = null,
+ _share_pending: bool = false,
+ _share_activation_ms: ?u64 = null,
++_speech_has_activation: bool = false,
+ 
+ pub const init: Navigator = .{};
+ 
+@@ -196,6 +197,7 @@ fn getPdfViewerEnabled(_: *const Navigator) bool {
+ pub fn detachPdf(self: *Navigator) void {
+     self._pdf_detached = true;
+     self._share_activation_ms = null;
++    self._speech_has_activation = false;
+     if (self._plugins) |plugins| plugins._frame = null;
+ }
+ 
+diff --git a/src/browser/webapi/SpeechSynthesis.zig b/src/browser/webapi/SpeechSynthesis.zig
+new file mode 100644
+index 0000000..583fe77
+--- /dev/null
++++ b/src/browser/webapi/SpeechSynthesis.zig
+@@ -0,0 +1,389 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Frame = @import("../Frame.zig");
++const Event = @import("Event.zig");
++const EventTarget = @import("EventTarget.zig");
++const EventManagerBase = @import("../EventManagerBase.zig");
++const Voice = @import("SpeechSynthesisVoice.zig");
++const Utterance = @import("SpeechSynthesisUtterance.zig");
++const SpeechEvent = @import("event/SpeechSynthesisEvent.zig");
++const Speech = @This();
++
++pub const Proto = EventTarget;
++_proto: *EventTarget,
++_frame: *Frame,
++_events: EventManagerBase,
++_handlers: [1]Handler = undefined,
++_voices: [Voice.inventory.len]*Voice = undefined,
++_loading: bool = false,
++_loaded: bool = false,
++_paused: bool = false,
++_detached: bool = false,
++_queue: std.DoublyLinkedList = .{},
++_current: ?*Entry = null,
++_generation: u64 = 0,
++
++pub fn init(frame: *Frame) !*Speech {
++    const self = try frame._factory.eventTarget(Speech{
++        ._proto = undefined,
++        ._frame = frame,
++        ._events = .init(frame.arena),
++    });
++    self._handlers[0] = .{ .target = self._proto, .events = &self._events, .name = "voiceschanged" };
++    for (Voice.inventory, 0..) |data, i| {
++        const voice = try frame.arena.create(Voice);
++        voice.* = .{ ._navigator = frame.window._navigator, ._data = data };
++        self._voices[i] = voice;
++    }
++    return self;
++}
++pub fn creationContext(self: *const Speech, local: *const js.Local) *const js.v8.Context {
++    return self._frame.window._navigator.creationContext(local);
++}
++pub fn dispatch(self: *Speech, event: *Event, exec: *js.Execution) !void {
++    try dispatchDirect(self._proto, &self._events, event, exec);
++}
++fn getVoices(self: *Speech) ![]const *Voice {
++    if (!self._loaded) {
++        if (!self._loading and !self._detached) {
++            try self.schedule(.voices, null, 0, null);
++            self._loading = true;
++        }
++        return &.{};
++    }
++    return &self._voices;
++}
++fn getPending(self: *const Speech) bool {
++    return self._queue.first != null;
++}
++fn getSpeaking(self: *const Speech) bool {
++    return self._current != null;
++}
++fn getPaused(self: *const Speech) bool {
++    return self._paused;
++}
++
++const Entry = struct {
++    node: std.DoublyLinkedList.Node = .{},
++    utterance: *Utterance,
++    root: ?js.Value.Global,
++    started: bool = false,
++    start_ms: u64 = 0,
++    active_ms: u64 = 0,
++    remaining_ms: u32 = 0,
++    char_count: u32 = 0,
++
++    fn release(self: *Entry) void {
++        if (self.root) |root| root.release();
++        self.root = null;
++    }
++};
++
++fn speak(self: *Speech, utterance: *Utterance, exec: *js.Execution) !void {
++    if (self._detached) return;
++    const entry = try self._frame.arena.create(Entry);
++    entry.* = .{ .utterance = utterance, .root = null };
++    entry.root = try (try exec.js.local.?.zigValueToJs(utterance, .{})).persist();
++    // Desktop Chrome requires sticky user activation, not a transient grant.
++    if (!self._frame.window._navigator._speech_has_activation) {
++        self.schedule(.failure, entry, 0, .@"not-allowed") catch |err| {
++            entry.release();
++            return err;
++        };
++        return;
++    }
++    self._queue.append(&entry.node);
++    try self.startNext();
++}
++fn startNext(self: *Speech) !void {
++    if (self._detached or self._paused or self._current != null) return;
++    const node = self._queue.popFirst() orelse return;
++    const entry: *Entry = @fieldParentPtr("node", node);
++    self._current = entry;
++    self._generation +%= 1;
++    self.schedule(.pump, entry, 0, null) catch |err| {
++        self._current = null;
++        entry.release();
++        return err;
++    };
++}
++fn cancel(self: *Speech) !void {
++    self._generation +%= 1;
++    const current = self._current;
++    self._current = null;
++    var queue = self._queue;
++    self._queue = .{};
++    var failure: ?anyerror = null;
++    if (current) |entry| {
++        if (entry.started and !self._paused) entry.active_ms += lp.datetime.milliTimestamp(.boot) - entry.start_ms;
++        self.schedule(.failure, entry, 0, if (entry.started) .interrupted else .canceled) catch |err| {
++            entry.release();
++            failure = err;
++        };
++    }
++    while (queue.popFirst()) |node| {
++        const entry: *Entry = @fieldParentPtr("node", node);
++        self.schedule(.failure, entry, 0, .canceled) catch |err| {
++            entry.release();
++            failure = err;
++        };
++    }
++    if (failure) |err| return err;
++}
++fn pause(self: *Speech) !void {
++    if (self._paused or self._detached) return;
++    self._paused = true;
++    self._generation +%= 1;
++    const entry = self._current orelse return;
++    if (entry.started) {
++        const elapsed = lp.datetime.milliTimestamp(.boot) - entry.start_ms;
++        const used = @min(elapsed, entry.remaining_ms);
++        entry.remaining_ms -= @intCast(used);
++        entry.active_ms += used;
++        try self.schedule(.pause, entry, 0, null);
++    }
++}
++fn @"resume"(self: *Speech) !void {
++    if (!self._paused) return;
++    self._paused = false;
++    self._generation +%= 1;
++    if (self._current) |entry| {
++        entry.start_ms = lp.datetime.milliTimestamp(.boot);
++        if (entry.started) try self.schedule(.@"resume", entry, 0, null);
++        try self.schedule(.pump, entry, if (entry.started) entry.remaining_ms else 0, null);
++    } else try self.startNext();
++}
++
++pub fn detach(self: *Speech) void {
++    self._detached = true;
++    self._generation +%= 1;
++    if (self._current) |entry| entry.release();
++    self._current = null;
++    while (self._queue.popFirst()) |node| {
++        const entry: *Entry = @fieldParentPtr("node", node);
++        entry.release();
++    }
++}
++
++const Kind = enum { voices, pump, pause, @"resume", failure };
++fn schedule(self: *Speech, kind: Kind, entry: ?*Entry, delay: u32, code: ?SpeechEvent.Code) !void {
++    const exec = &self._frame.js.execution;
++    const arena = try exec.getArena(.tiny, "SpeechSynthesis.task");
++    errdefer arena.release();
++    const task = try arena.create(Task);
++    task.* = .{ .speech = self, .arena = arena, .kind = kind, .entry = entry, .generation = self._generation, .code = code };
++    try exec.js.scheduler.add(task, Task.run, delay, .{
++        .name = "SpeechSynthesis",
++        .finalizer = Task.finalize,
++    });
++}
++
++const Task = struct {
++    speech: *Speech,
++    arena: *lp.Arena,
++    kind: Kind,
++    entry: ?*Entry,
++    generation: u64,
++    code: ?SpeechEvent.Code,
++
++    fn finalize(ctx: *anyopaque) void {
++        const task: *Task = @ptrCast(@alignCast(ctx));
++        if (task.kind == .failure) if (task.entry) |entry| {
++            entry.release();
++        };
++        task.arena.release();
++    }
++    fn run(ctx: *anyopaque) !?u32 {
++        const task: *Task = @ptrCast(@alignCast(ctx));
++        defer finalize(ctx);
++        const self = task.speech;
++        if (self._detached) return null;
++        var scope: js.Local.Scope = undefined;
++        self._frame.js.localScope(&scope);
++        defer scope.deinit();
++        const exec = &self._frame.js.execution;
++        defer scope.local.runMicrotasks();
++
++        if (task.kind == .voices) {
++            self._loaded = true;
++            self._loading = false;
++            const event = try Event.init("voiceschanged", null, exec.page);
++            event._is_trusted = true;
++            try self.dispatch(event, exec);
++            return null;
++        }
++        const entry = task.entry.?;
++        if (task.kind == .failure) {
++            const event = try SpeechEvent.create(SpeechEvent.ErrorEvent, "error", SpeechEvent.ErrorEvent.Options{
++                .utterance = entry.utterance,
++                .@"error" = scope.local.newString(@tagName(task.code.?)).toValue(),
++                .elapsedTime = @as(f32, @floatFromInt(entry.active_ms)) / 1000,
++            }, true, exec, &scope.local);
++            try entry.utterance.dispatch(event.asEvent(), exec);
++            return null;
++        }
++        if (self._current != entry) return null;
++        if (task.kind == .pause or task.kind == .@"resume") {
++            try emit(entry, if (task.kind == .pause) "pause" else "resume", false, exec, &scope.local);
++            return null;
++        }
++        if (task.generation != self._generation or self._paused) return null;
++        if (!entry.started) {
++            entry.started = true;
++            entry.start_ms = lp.datetime.milliTimestamp(.boot);
++            // Synthetic duration only: no PCM, phonemes, marks or word boundaries.
++            entry.char_count = @intCast(scope.local.newString(entry.utterance._text).len());
++            const duration = @as(f64, @floatFromInt(entry.char_count)) * 30 / entry.utterance._rate;
++            entry.remaining_ms = @intFromFloat(std.math.clamp(duration, 20, 2000));
++            self.schedule(.pump, entry, entry.remaining_ms, null) catch |err| {
++                self._current = null;
++                entry.release();
++                return err;
++            };
++            try emit(entry, "start", false, exec, &scope.local);
++        } else {
++            entry.active_ms += lp.datetime.milliTimestamp(.boot) - entry.start_ms;
++            self._current = null;
++            defer entry.release();
++            try emit(entry, "end", true, exec, &scope.local);
++            try self.startNext();
++        }
++        return null;
++    }
++};
++fn emit(entry: *Entry, typ: []const u8, finished: bool, exec: *js.Execution, local: *const js.Local) !void {
++    const event = try SpeechEvent.create(SpeechEvent, typ, SpeechEvent.Options{
++        .utterance = entry.utterance,
++        .charIndex = if (finished) entry.char_count else 0,
++        .elapsedTime = @as(f32, @floatFromInt(entry.active_ms)) / 1000,
++    }, true, exec, local);
++    try entry.utterance.dispatch(event.asEvent(), exec);
++}
++
++// Attribute listeners keep their insertion position when replaced.
++pub const Handler = struct {
++    target: *EventTarget,
++    events: *EventManagerBase,
++    name: []const u8,
++    callback: ?js.Object.Global = null,
++    listener: ?js.Function.Global = null,
++    registration: ?js.Function.Global = null,
++    weak: bool = false,
++
++    fn set(self: *Handler, value: js.Value, exec: *js.Execution) !void {
++        const local = exec.js.local.?;
++        const callback = if (value.isObject())
++            try (js.Object{ .local = local, .handle = @ptrCast(value.handle) }).persist()
++        else
++            null;
++        errdefer if (callback) |cb| cb.release();
++        if (self.weak) {
++            const data = try callbackData(self.target, local);
++            if (!(data.defineOwnProperty(self.name, value, 0) orelse false)) return error.JsException;
++            if (callback) |cb| js.v8.v8__Global__SetWeak(&cb.slot.handle);
++        }
++        if (self.callback == null and callback != null) {
++            if (self.listener == null) self.listener = try local.newCallback(Handler.invoke, self).persist();
++            if (try self.events.register(self.target, self.name, .{ .function = self.listener.?.local(local) }, .{})) |listener| {
++                self.registration = listener.function.value;
++            }
++        } else if (self.callback != null and callback == null) {
++            self.events.remove(self.target, self.name, .{ .function = self.listener.?.local(local) }, false);
++            if (self.registration) |registration| registration.release();
++            self.registration = null;
++        }
++        if (self.callback) |old| old.release();
++        self.callback = callback;
++    }
++    pub fn deinit(self: *Handler) void {
++        if (self.callback) |callback| callback.release();
++        if (self.listener) |listener| listener.release();
++        if (self.registration) |registration| registration.release();
++    }
++    fn invoke(self: *Handler, event: *Event, exec: *js.Execution) !void {
++        const callback = self.callback orelse return;
++        const object = callback.local(exec.js.local.?);
++        if (!object.toValue().isFunction()) return exec.js.local.?.typeError("The event handler is not callable");
++        const function = js.Function{ .local = exec.js.local.?, .handle = @ptrCast(object.handle) };
++        const result = try function.callWithThisRethrow(js.Value, self.target, .{event});
++        if (result.isBoolean() and result.isFalse()) event.preventDefault();
++    }
++};
++// JS owns callback edges so closures referring to their utterance form a
++// collectible JS cycle rather than a permanent native persistent root.
++pub fn callbackData(target: *EventTarget, local: *const js.Local) !js.Object {
++    const owner = try local.zigValueToJs(target, .{});
++    const key: *const js.v8.Private = @ptrCast(js.v8.v8__Global__Get(&local.ctx.env.private_symbols.speech_callbacks.handle, local.isolate.handle).?);
++    if (js.v8.v8__Object__GetPrivate(@ptrCast(owner.handle), local.handle, key)) |value| {
++        const wrapped = js.Value{ .local = local, .handle = @ptrCast(value) };
++        if (wrapped.isObject()) return .{ .local = local, .handle = @ptrCast(value) };
++    }
++    const data = local.newObject();
++    var saved: js.v8.MaybeBool = undefined;
++    js.v8.v8__Object__SetPrivate(@ptrCast(owner.handle), local.handle, key, @ptrCast(data.handle), &saved);
++    if (!saved.has_value or !saved.value) return error.JsException;
++    return data;
++}
++pub fn Binding(comptime T: type, comptime index: usize) type {
++    return struct {
++        pub fn get(self: *const T) ?js.Object.Global {
++            return self._handlers[index].callback;
++        }
++        pub fn set(self: *T, value: js.Value, exec: *js.Execution) !void {
++            try self._handlers[index].set(value, exec);
++        }
++    };
++}
++pub fn dispatchDirect(target: *EventTarget, events: *EventManagerBase, event: *Event, exec: *js.Execution) !void {
++    event.acquireRef();
++    defer event.releaseRef(exec.page);
++    event._target = target;
++    event._dispatch_target = target;
++    event._event_phase = .at_target;
++    defer {
++        event._event_phase = .none;
++        event._current_target = null;
++        event._dispatch_target = null;
++        event._stop_propagation = false;
++        event._stop_immediate_propagation = false;
++        event._in_passive_listener = false;
++    }
++    try events.dispatchDirect(exec.call_arena, exec.js, target, event, null, exec.page, .{ .run_microtasks = false });
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Speech);
++    pub const Meta = struct {
++        pub const name = "SpeechSynthesis";
++        pub const creation_context = Speech.creationContext;
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const pending = bridge.accessor(getPending, null, .{});
++    pub const speaking = bridge.accessor(getSpeaking, null, .{});
++    pub const paused = bridge.accessor(getPaused, null, .{});
++    pub const onvoiceschanged = bridge.accessor(Binding(Speech, 0).get, Binding(Speech, 0).set, .{});
++    pub const getVoices = bridge.function(Speech.getVoices, .{});
++    pub const speak = bridge.function(Speech.speak, .{});
++    pub const cancel = bridge.function(Speech.cancel, .{});
++    pub const pause = bridge.function(Speech.pause, .{});
++    pub const @"resume" = bridge.function(Speech.@"resume", .{});
++};
+diff --git a/src/browser/webapi/SpeechSynthesisUtterance.zig b/src/browser/webapi/SpeechSynthesisUtterance.zig
+new file mode 100644
+index 0000000..07de2c3
+--- /dev/null
++++ b/src/browser/webapi/SpeechSynthesisUtterance.zig
+@@ -0,0 +1,160 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const Page = @import("../Page.zig");
++const Navigator = @import("Navigator.zig");
++const js = @import("../js/js.zig");
++const Frame = @import("../Frame.zig");
++const Event = @import("Event.zig");
++const EventTarget = @import("EventTarget.zig");
++const EventManagerBase = @import("../EventManagerBase.zig");
++const Voice = @import("SpeechSynthesisVoice.zig");
++const Speech = @import("SpeechSynthesis.zig");
++const Utterance = @This();
++
++pub const Proto = EventTarget;
++_proto: *EventTarget,
++_arena: *lp.Arena,
++_rc: lp.RC = .{},
++_navigator: *Navigator,
++_listener_roots: std.ArrayList(*js.GlobalSlot) = .empty,
++_text: []const u8,
++_lang: []const u8 = "",
++_voice: ?*Voice = null,
++_volume: f32 = 1,
++_rate: f32 = 1,
++_pitch: f32 = 1,
++_events: EventManagerBase,
++_handlers: [7]Speech.Handler = undefined,
++
++pub fn init(text: ?js.Value, frame: *Frame) !*Utterance {
++    const value = if (text) |v| if (v.isUndefined()) "" else try domString(v) else "";
++    const arena = try frame.getArena(.small, "SpeechSynthesisUtterance");
++    errdefer arena.release();
++    const self = try frame._factory.eventTargetWithAllocator(arena.allocator(), Utterance{
++        ._proto = undefined,
++        ._arena = arena,
++        ._navigator = frame.window._navigator,
++        ._text = try arena.dupe(u8, value),
++        ._events = .init(arena.allocator()),
++    });
++    inline for (.{ "start", "end", "error", "pause", "resume", "mark", "boundary" }, 0..) |name, i| {
++        self._handlers[i] = .{ .target = self._proto, .events = &self._events, .name = name, .weak = true };
++    }
++    return self;
++}
++pub fn acquireRef(self: *Utterance) void {
++    self._rc.acquire();
++}
++pub fn releaseRef(self: *Utterance, page: *Page) void {
++    self._rc.release(self, page);
++}
++pub fn deinit(self: *Utterance, _: *Page) void {
++    for (&self._handlers) |*handler| handler.deinit();
++    for (self._listener_roots.items) |slot| slot.release();
++    self._arena.release();
++}
++
++pub fn registerListener(self: *Utterance, typ: []const u8, callback: EventManagerBase.Callback, options: EventManagerBase.RegisterOptions, exec: *js.Execution) !void {
++    try self._listener_roots.ensureUnusedCapacity(self._arena.allocator(), 1);
++    const listener = (try self._events.register(self._proto, typ, callback, options)) orelse return;
++    const slot = switch (listener.function) {
++        .value => |value| value.slot,
++        .object => |value| value.slot,
++        .string => unreachable,
++    };
++    errdefer {
++        self._events.remove(self._proto, typ, callback, options.capture);
++        slot.release();
++    }
++    const value = switch (callback) {
++        .function => |f| js.Value{ .local = f.local, .handle = @ptrCast(f.handle) },
++        .object => |o| o.toValue(),
++    };
++    const data = try Speech.callbackData(self._proto, exec.js.local.?);
++    var buf: [32]u8 = undefined;
++    const key = try std.fmt.bufPrint(&buf, "listener{d}", .{self._listener_roots.items.len});
++    if (!(data.defineOwnProperty(key, value, 0) orelse false)) return error.JsException;
++    js.v8.v8__Global__SetWeak(&slot.handle);
++    self._listener_roots.appendAssumeCapacity(slot);
++}
++
++pub fn creationContext(self: *const Utterance, local: *const js.Local) *const js.v8.Context {
++    return self._navigator.creationContext(local);
++}
++pub fn dispatch(self: *Utterance, event: *Event, exec: *js.Execution) !void {
++    try Speech.dispatchDirect(self._proto, &self._events, event, exec);
++}
++fn getText(self: *const Utterance) []const u8 {
++    return self._text;
++}
++fn setText(self: *Utterance, value: js.Value) !void {
++    self._text = try self._arena.dupe(u8, try domString(value));
++}
++fn getLang(self: *const Utterance) []const u8 {
++    return self._lang;
++}
++fn setLang(self: *Utterance, value: js.Value) !void {
++    self._lang = try self._arena.dupe(u8, try domString(value));
++}
++pub fn domString(value: js.Value) ![]const u8 {
++    if (value.isSymbol()) return error.TypeError;
++    return value.toStringSlice();
++}
++fn getVoice(self: *const Utterance) ?*Voice {
++    return self._voice;
++}
++fn setVoice(self: *Utterance, value: js.Nullable(*Voice)) void {
++    self._voice = value.value;
++}
++
++fn Number(comptime field: []const u8, comptime min: f32, comptime max: f32) type {
++    return struct {
++        fn get(self: *const Utterance) f32 {
++            return @field(self, field);
++        }
++        fn set(self: *Utterance, value: f32) !void {
++            if (!std.math.isFinite(value)) return error.TypeError;
++            @field(self, field) = std.math.clamp(value, min, max);
++        }
++    };
++}
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Utterance);
++    pub const Meta = struct {
++        pub const name = "SpeechSynthesisUtterance";
++        pub const creation_context = Utterance.creationContext;
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(Utterance.init, .{});
++    pub const text = bridge.accessor(getText, setText, .{});
++    pub const lang = bridge.accessor(getLang, setLang, .{});
++    pub const voice = bridge.accessor(getVoice, setVoice, .{});
++    pub const volume = bridge.accessor(Number("_volume", 0, 1).get, Number("_volume", 0, 1).set, .{});
++    pub const rate = bridge.accessor(Number("_rate", 0.1, 10).get, Number("_rate", 0.1, 10).set, .{});
++    pub const pitch = bridge.accessor(Number("_pitch", 0, 2).get, Number("_pitch", 0, 2).set, .{});
++    pub const onstart = bridge.accessor(Speech.Binding(Utterance, 0).get, Speech.Binding(Utterance, 0).set, .{});
++    pub const onend = bridge.accessor(Speech.Binding(Utterance, 1).get, Speech.Binding(Utterance, 1).set, .{});
++    pub const onerror = bridge.accessor(Speech.Binding(Utterance, 2).get, Speech.Binding(Utterance, 2).set, .{});
++    pub const onpause = bridge.accessor(Speech.Binding(Utterance, 3).get, Speech.Binding(Utterance, 3).set, .{});
++    pub const onresume = bridge.accessor(Speech.Binding(Utterance, 4).get, Speech.Binding(Utterance, 4).set, .{});
++    pub const onmark = bridge.accessor(Speech.Binding(Utterance, 5).get, Speech.Binding(Utterance, 5).set, .{});
++    pub const onboundary = bridge.accessor(Speech.Binding(Utterance, 6).get, Speech.Binding(Utterance, 6).set, .{});
++};
+diff --git a/src/browser/webapi/SpeechSynthesisVoice.zig b/src/browser/webapi/SpeechSynthesisVoice.zig
+new file mode 100644
+index 0000000..5ebdf33
+--- /dev/null
++++ b/src/browser/webapi/SpeechSynthesisVoice.zig
+@@ -0,0 +1,99 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const js = @import("../js/js.zig");
++const Navigator = @import("Navigator.zig");
++const Voice = @This();
++
++_navigator: *Navigator,
++_data: Data,
++
++pub const Data = struct {
++    name: []const u8,
++    lang: []const u8,
++    uri: []const u8,
++    local: bool = true,
++    default: bool = false,
++};
++
++// Synthetic English-US default-install inventory, not a host OS query.
++// Apple compact voices plus Chrome's remote voices; no optional downloads.
++pub const inventory = [_]Data{
++    .{ .name = "Samantha", .lang = "en-US", .uri = "com.apple.voice.compact.en-US.Samantha", .default = true },
++    .{ .name = "Alex", .lang = "en-US", .uri = "com.apple.speech.synthesis.voice.Alex" },
++    .{ .name = "Daniel", .lang = "en-GB", .uri = "com.apple.voice.compact.en-GB.Daniel" },
++    .{ .name = "Karen", .lang = "en-AU", .uri = "com.apple.voice.compact.en-AU.Karen" },
++    .{ .name = "Moira", .lang = "en-IE", .uri = "com.apple.voice.compact.en-IE.Moira" },
++    .{ .name = "Fiona", .lang = "en-scotland", .uri = "com.apple.voice.compact.en-GB.Fiona" },
++    .{ .name = "Tessa", .lang = "en-ZA", .uri = "com.apple.voice.compact.en-ZA.Tessa" },
++    .{ .name = "Thomas", .lang = "fr-FR", .uri = "com.apple.voice.compact.fr-FR.Thomas" },
++    .{ .name = "Anna", .lang = "de-DE", .uri = "com.apple.voice.compact.de-DE.Anna" },
++    .{ .name = "Monica", .lang = "es-ES", .uri = "com.apple.voice.compact.es-ES.Monica" },
++    .{ .name = "Paulina", .lang = "es-MX", .uri = "com.apple.voice.compact.es-MX.Paulina" },
++    .{ .name = "Alice", .lang = "it-IT", .uri = "com.apple.voice.compact.it-IT.Alice" },
++    .{ .name = "Luciana", .lang = "pt-BR", .uri = "com.apple.voice.compact.pt-BR.Luciana" },
++    .{ .name = "Joana", .lang = "pt-PT", .uri = "com.apple.voice.compact.pt-PT.Joana" },
++    .{ .name = "Xander", .lang = "nl-NL", .uri = "com.apple.voice.compact.nl-NL.Xander" },
++    .{ .name = "Milena", .lang = "ru-RU", .uri = "com.apple.voice.compact.ru-RU.Milena" },
++    .{ .name = "Zosia", .lang = "pl-PL", .uri = "com.apple.voice.compact.pl-PL.Zosia" },
++    .{ .name = "Lekha", .lang = "hi-IN", .uri = "com.apple.voice.compact.hi-IN.Lekha" },
++    .{ .name = "Kyoko", .lang = "ja-JP", .uri = "com.apple.voice.compact.ja-JP.Kyoko" },
++    .{ .name = "Yuna", .lang = "ko-KR", .uri = "com.apple.voice.compact.ko-KR.Yuna" },
++    .{ .name = "Tingting", .lang = "zh-CN", .uri = "com.apple.voice.compact.zh-CN.Tingting" },
++    .{ .name = "Sinji", .lang = "zh-HK", .uri = "com.apple.voice.compact.zh-HK.Sinji" },
++    .{ .name = "Meijia", .lang = "zh-TW", .uri = "com.apple.voice.compact.zh-TW.Meijia" },
++} ++ google: {
++    const names = .{ "Google Deutsch", "Google US English", "Google UK English Female", "Google UK English Male", "Google español", "Google español de Estados Unidos", "Google français", "Google हिन्दी", "Google Bahasa Indonesia", "Google italiano", "Google 日本語", "Google 한국의", "Google Nederlands", "Google polski", "Google português do Brasil", "Google русский", "Google 普通话（中国大陆）", "Google 粤語（香港）", "Google 國語（臺灣）" };
++    const langs = .{ "de-DE", "en-US", "en-GB", "en-GB", "es-ES", "es-US", "fr-FR", "hi-IN", "id-ID", "it-IT", "ja-JP", "ko-KR", "nl-NL", "pl-PL", "pt-BR", "ru-RU", "zh-CN", "zh-HK", "zh-TW" };
++    var values: [names.len]Data = undefined;
++    for (names, langs, 0..) |name, lang, i| values[i] = .{ .name = name, .lang = lang, .uri = name, .local = false };
++    break :google values;
++};
++
++pub fn creationContext(self: *const Voice, local: *const js.Local) *const js.v8.Context {
++    return self._navigator.creationContext(local);
++}
++fn getName(self: *const Voice) []const u8 {
++    return self._data.name;
++}
++fn getLang(self: *const Voice) []const u8 {
++    return self._data.lang;
++}
++fn getURI(self: *const Voice) []const u8 {
++    return self._data.uri;
++}
++fn getLocal(self: *const Voice) bool {
++    return self._data.local;
++}
++fn getDefault(self: *const Voice) bool {
++    return self._data.default;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Voice);
++    pub const Meta = struct {
++        pub const name = "SpeechSynthesisVoice";
++        pub const creation_context = Voice.creationContext;
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const voiceURI = bridge.accessor(getURI, null, .{});
++    pub const name = bridge.accessor(getName, null, .{});
++    pub const lang = bridge.accessor(getLang, null, .{});
++    pub const localService = bridge.accessor(getLocal, null, .{});
++    pub const default = bridge.accessor(getDefault, null, .{});
++};
+diff --git a/src/browser/webapi/WebShare.zig b/src/browser/webapi/WebShare.zig
+index cbc1de9..b62950b 100644
+--- a/src/browser/webapi/WebShare.zig
++++ b/src/browser/webapi/WebShare.zig
+@@ -309,12 +309,16 @@ pub fn notifyActivation(frame: *Frame, event: *Event) void {
+     var ancestor: ?*Frame = frame;
+     while (ancestor) |current| : (ancestor = current.parent) {
+         current.window._navigator._share_activation_ms = now;
++        current.window._navigator._speech_has_activation = true;
+     }
+     activateSameOrigin(root(frame), frame, now);
+ }
+ 
+ fn activateSameOrigin(frame: *Frame, source: *Frame, now: u64) void {
+-    if (sameOrigin(frame, source)) frame.window._navigator._share_activation_ms = now;
++    if (sameOrigin(frame, source)) {
++        frame.window._navigator._share_activation_ms = now;
++        frame.window._navigator._speech_has_activation = true;
++    }
+     for (frame.child_frames.items) |child| activateSameOrigin(child, source, now);
+ }
+ 
+diff --git a/src/browser/webapi/Window.zig b/src/browser/webapi/Window.zig
+index 3372b3a..ccbce11 100644
+--- a/src/browser/webapi/Window.zig
++++ b/src/browser/webapi/Window.zig
+@@ -53,6 +53,7 @@ const Selection = @import("Selection.zig");
+ const Timers = @import("Timers.zig");
+ const Scheduler = @import("Scheduler.zig");
+ const Notification = @import("../../Notification.zig");
++const SpeechSynthesis = @import("SpeechSynthesis.zig");
+ 
+ const log = lp.log;
+ 
+@@ -77,6 +78,7 @@ _model_context: ModelContext = .init,
+ _screen: *Screen,
+ _visual_viewport: *VisualViewport,
+ _performance: *Performance,
++_speech_synthesis: ?*SpeechSynthesis = null,
+ _cookie_store: ?*CookieStore = null,
+ _idb_factory: ?*idb.IDBFactory = null,
+ _caches: ?*CacheStorage = null,
+@@ -281,6 +283,13 @@ pub fn getModelContext(self: *Window) *ModelContext {
+     return &self._model_context;
+ }
+ 
++fn getSpeechSynthesis(self: *Window) !*SpeechSynthesis {
++    if (self._speech_synthesis) |speech| return speech;
++    const speech = try SpeechSynthesis.init(self._frame);
++    self._speech_synthesis = speech;
++    return speech;
++}
++
+ fn getScreen(self: *Window) *Screen {
+     return self._screen;
+ }
+@@ -1237,6 +1246,7 @@ pub const JsApi = struct {
+     pub const parent = bridge.accessor(Window.getParent, Window.setParent, .{});
+     pub const navigator = bridge.accessor(Window.getNavigator, null, .{});
+     pub const scheduler = bridge.accessor(Window.getScheduler, null, .{});
++    pub const speechSynthesis = bridge.accessor(Window.getSpeechSynthesis, null, .{});
+     pub const screen = bridge.accessor(Window.getScreen, Window.setScreen, .{});
+     pub const visualViewport = bridge.accessor(Window.getVisualViewport, Window.setVisualViewport, .{});
+     pub const performance = bridge.accessor(Window.getPerformance, Window.setPerformance, .{});
+diff --git a/src/browser/webapi/event/SpeechSynthesisEvent.zig b/src/browser/webapi/event/SpeechSynthesisEvent.zig
+new file mode 100644
+index 0000000..000e1e3
+--- /dev/null
++++ b/src/browser/webapi/event/SpeechSynthesisEvent.zig
+@@ -0,0 +1,166 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../../js/js.zig");
++const Page = @import("../../Page.zig");
++const Factory = @import("../../Factory.zig");
++const Event = @import("../Event.zig");
++const Utterance = @import("../SpeechSynthesisUtterance.zig");
++const SpeechEvent = @This();
++
++pub fn registerTypes() []const type {
++    return &.{ SpeechEvent, ErrorEvent };
++}
++
++pub const Proto = Event;
++_proto: *Event,
++_type: union(enum) { generic, error_event: *ErrorEvent } = .generic,
++_utterance: *Utterance,
++_keepalive: js.Value.Global,
++_char_index: u32,
++_char_length: u32,
++_elapsed: f32,
++_name: []const u8,
++
++pub const Options = Event.inheritOptions(SpeechEvent, struct {
++    charIndex: u32 = 0,
++    charLength: u32 = 0,
++    elapsedTime: f32 = 0,
++    name: ?js.Value = null,
++    utterance: *Utterance,
++});
++
++pub fn init(typ: js.Value, opts: Options, exec: *js.Execution) !*SpeechEvent {
++    return create(SpeechEvent, try Utterance.domString(typ), opts, false, exec, exec.js.local.?);
++}
++
++pub fn create(comptime T: type, typ: []const u8, opts: anytype, trusted: bool, exec: *js.Execution, local: *const js.Local) !*T {
++    if (!std.math.isFinite(opts.elapsedTime)) return error.TypeError;
++    const arena = try exec.getArena(.tiny, "SpeechSynthesisEvent");
++    errdefer arena.release();
++    const value = try local.zigValueToJs(opts.utterance, .{});
++    const keepalive = try value.persist();
++    errdefer keepalive.release();
++    const base = Event{
++        ._arena = arena,
++        ._type = .generic,
++        ._type_string = try lp.String.init(arena.allocator(), typ, .{}),
++        ._time_stamp = @import("../Performance.zig").highResTimestamp(),
++    };
++    const data = SpeechEvent{
++        ._proto = undefined,
++        ._utterance = opts.utterance,
++        ._keepalive = keepalive,
++        ._char_index = opts.charIndex,
++        ._char_length = opts.charLength,
++        ._elapsed = opts.elapsedTime,
++        ._name = try arena.dupe(u8, if (opts.name) |name| try Utterance.domString(name) else ""),
++    };
++    const result = if (T == SpeechEvent)
++        try Factory.chainedWithAllocator(arena.allocator(), .{ base, data })
++    else
++        try Factory.chainedWithAllocator(arena.allocator(), .{ base, data, ErrorEvent{ ._proto = undefined, ._error = std.meta.stringToEnum(Code, try Utterance.domString(opts.@"error")) orelse return error.TypeError } });
++    const parent = if (T == SpeechEvent) result else result._proto;
++    parent._proto._type = .{ .speech_synthesis_event = parent };
++    if (T == ErrorEvent) parent._type = .{ .error_event = result };
++    Event.populatePrototypes(result, opts, trusted);
++    return result;
++}
++
++pub fn asEvent(self: *SpeechEvent) *Event {
++    return self._proto;
++}
++pub fn is(self: *SpeechEvent, comptime T: type) ?*T {
++    if (T == SpeechEvent) return self;
++    if (T == ErrorEvent and self._type == .error_event) return self._type.error_event;
++    return null;
++}
++fn getUtterance(self: *const SpeechEvent) *Utterance {
++    return self._utterance;
++}
++fn getCharIndex(self: *const SpeechEvent) u32 {
++    return self._char_index;
++}
++fn getCharLength(self: *const SpeechEvent) u32 {
++    return self._char_length;
++}
++fn getElapsed(self: *const SpeechEvent) f32 {
++    return self._elapsed;
++}
++fn getName(self: *const SpeechEvent) []const u8 {
++    return self._name;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(SpeechEvent);
++    pub const Meta = struct {
++        pub const name = "SpeechSynthesisEvent";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(SpeechEvent.init, .{});
++    pub const utterance = bridge.accessor(getUtterance, null, .{});
++    pub const charIndex = bridge.accessor(getCharIndex, null, .{});
++    pub const charLength = bridge.accessor(getCharLength, null, .{});
++    pub const elapsedTime = bridge.accessor(getElapsed, null, .{});
++    pub const name = bridge.accessor(getName, null, .{});
++};
++
++pub const Code = enum {
++    canceled,
++    interrupted,
++    @"audio-busy",
++    @"audio-hardware",
++    network,
++    @"synthesis-unavailable",
++    @"synthesis-failed",
++    @"language-unavailable",
++    @"voice-unavailable",
++    @"text-too-long",
++    @"invalid-argument",
++    @"not-allowed",
++};
++
++pub const ErrorEvent = struct {
++    pub const Proto = SpeechEvent;
++    _proto: *SpeechEvent,
++    _error: Code,
++    pub const Options = Event.inheritOptions(ErrorEvent, struct { @"error": js.Value });
++
++    pub fn init(typ: js.Value, opts: ErrorEvent.Options, exec: *js.Execution) !*ErrorEvent {
++        return SpeechEvent.create(ErrorEvent, try Utterance.domString(typ), opts, false, exec, exec.js.local.?);
++    }
++    pub fn asEvent(self: *ErrorEvent) *Event {
++        return self._proto._proto;
++    }
++    fn getError(self: *const ErrorEvent) []const u8 {
++        return @tagName(self._error);
++    }
++
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(ErrorEvent);
++        pub const Meta = struct {
++            pub const name = "SpeechSynthesisErrorEvent";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const constructor = bridge.constructor(ErrorEvent.init, .{});
++        pub const @"error" = bridge.accessor(getError, null, .{});
++    };
++};

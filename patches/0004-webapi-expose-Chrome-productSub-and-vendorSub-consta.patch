@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 13 Oct 2026 13:49:41 -0300
+Subject: [PATCH] webapi: expose Chrome productSub and vendorSub constants
+
+Add Window-only native Navigator accessors returning Chrome's frozen
+productSub "20030107" and empty vendorSub string. Use the existing
+bridge to preserve prototype descriptors, native getter behavior, and
+receiver checks. WorkerNavigator remains unchanged, matching Blink's
+Window-only exposure. No UA, platform, client hints, or tests are changed.
+
+References:
+https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/blink/renderer/core/frame/navigator_id.idl
+https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/blink/renderer/core/frame/navigator_id.cc
+---
+ src/browser/webapi/Navigator.zig | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index 82bbf27..ca36bda 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -109,10 +109,18 @@ pub fn getVendor(_: *const Navigator) []const u8 {
+     return "Google Inc.";
+ }
+ 
++fn getVendorSub(_: *const Navigator) []const u8 {
++    return "";
++}
++
+ pub fn getProduct(_: *const Navigator) []const u8 {
+     return "Gecko";
+ }
+ 
++fn getProductSub(_: *const Navigator) []const u8 {
++    return "20030107";
++}
++
+ fn getWebdriver(_: *const Navigator) bool {
+     return false;
+ }
+@@ -315,7 +323,9 @@ pub const JsApi = struct {
+     pub const deviceMemory = bridge.accessor(Navigator.getDeviceMemory, null, .{});
+     pub const maxTouchPoints = bridge.accessor(Navigator.getMaxTouchPoints, null, .{});
+     pub const vendor = bridge.accessor(Navigator.getVendor, null, .{});
++    pub const vendorSub = bridge.accessor(Navigator.getVendorSub, null, .{});
+     pub const product = bridge.accessor(Navigator.getProduct, null, .{});
++    pub const productSub = bridge.accessor(Navigator.getProductSub, null, .{});
+     pub const webdriver = bridge.accessor(Navigator.getWebdriver, null, .{});
+     pub const doNotTrack = bridge.accessor(Navigator.getDoNotTrack, null, .{});
+     pub const globalPrivacyControl = bridge.accessor(Navigator.getGlobalPrivacyControl, null, .{});

@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 29 Oct 2026 12:41:02 -0300
+Subject: [PATCH] http: align navigation Accept and desktop mobile hint
+ defaults
+
+Match the document-navigation Accept value measured from local Chrome
+154.0.8037.97. Keep fetch/XHR defaults and explicit Accept overrides unchanged.
+This mimics advertised preferences; it does not add image decoders or signed
+exchange processing.
+
+Send the fixed desktop Sec-CH-UA-Mobile: ?0 on potentially trustworthy requests,
+consistent with navigator.userAgentData.mobile = false. Use the existing
+per-attempt client-hint path to recompute presence after redirects and CDP URL
+or header replacement, before opt-in/owner checks. Remove it on untrustworthy
+or internal requests rather than adding another unconditional baseline hint.
+
+Keep Priority out: fresh recorder captures show u=0, i on Chrome HTTP/2
+navigations but no Priority on HTTP/1.1. Correct protocol-dependent generation,
+header ordering and compression remain separate transport/capability work.
+Leave full-version opt-in behavior, UA identity, TLS and HTTP/2 settings alone.
+
+Validation: existing 1658 upstream tests; three fresh Chrome and candidate
+processes per HTTP/2 and HTTP/1.1 root-page workload, including recorder fetch
+follow-ups; CLI/CDP Accept and Priority overrides; author fetch headers; HTTP
+trustworthiness and upgrade/downgrade redirects; unchanged baseline metadata.
+---
+ src/Config.zig             | 2 +-
+ src/network/HttpClient.zig | 6 +++++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/Config.zig b/src/Config.zig
+index f0079d1..7ee1852 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -1036,7 +1036,7 @@ pub const HttpHeaders = struct {
+     const default_locale: [:0]const u8 = "en-US";
+ 
+     // Document-navigation Accept value Chrome sends.
+-    pub const navigation_accept: [:0]const u8 = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
++    pub const navigation_accept: [:0]const u8 = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
+ 
+     user_agent: [:0]const u8, // Effective User-Agent value
+ 
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index 5445223..badc635 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -1322,7 +1322,11 @@ fn setClientHintHeaders(transfer: *Transfer) !void {
+         }
+     }
+ 
+-    if (transfer.req.internal or !URL.isPotentiallyTrustworthy(transfer.req.url)) return;
++    if (transfer.req.internal or !URL.isPotentiallyTrustworthy(transfer.req.url)) {
++        transfer.removeHeader("Sec-Ch-Ua-Mobile");
++        return;
++    }
++    try transfer.setHeader("Sec-Ch-Ua-Mobile", "?0", .{ .source = .fixed });
+     const owner = transfer.owner orelse return;
+     const hints = owner.client_hints orelse return;
+     if (transfer.req.resource_type != .document or owner.parent != null) {

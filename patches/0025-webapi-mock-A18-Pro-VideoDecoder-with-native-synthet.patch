@@ -1,0 +1,1071 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 15 Oct 2026 18:41:17 -0300
+Subject: [PATCH] webapi: mock A18 Pro VideoDecoder with native synthetic
+ frames
+
+Expose secure-Window and DedicatedWorker VideoDecoder, EncodedVideoChunk,
+VideoFrame and VideoColorSpace through native bindings. Keep SharedWorker
+and ServiceWorker exposure absent and preserve resource-loading defaults.
+
+Advertise a conservative synthetic H.264 avc1/avc3 baseline/main/extended/
+high capability through isConfigSupported, including the benchmark's
+avc1.640028 1920x1080 prefer-hardware query. Clone recognized configuration
+and description values, reject malformed configurations and report valid
+unsupported codecs/configurations as unsupported. This is a persona policy,
+not a measurement of host hardware or an exhaustive Apple codec inventory.
+
+Model the decoder's constructor, callbacks, EventTarget surface, configured/
+unconfigured/closed state, decodeQueueSize, dequeue events, FIFO synthetic
+output, flush, reset and close. Snapshot metadata per queued chunk, require
+a key after configuration/reset/flush, reject pending flushes on reset or
+close, and asynchronously close unsupported configurations via the error
+callback. Apply display aspect ratios by increasing presentation dimensions.
+
+Produce one opaque-black RGBA VideoFrame per accepted nonempty chunk with
+its timestamp and duration. Support frame metadata, crop/stride-aware
+allocationSize/copyTo, independent clone/close, and RGBA-buffer/frame
+constructors. EncodedVideoChunk owns a copy of input bytes and supports
+copyTo. VideoColorSpace provides readonly metadata and toJSON.
+
+Reuse existing JS-owned callback/listener storage and dispatch helpers.
+Tasks retain wrappers while pending, events retain their decoder target
+through a private JS edge, callback storage uses own data properties, and
+buffer bytes are resolved after potentially reentrant argument conversion.
+Detach decoders before context scheduler teardown. No new unit tests.
+
+Scope: API mock only. No compressed-bitstream parsing, real H.264 decoding,
+GPU operations, host codec probing, VideoEncoder/AudioDecoder, or WebRTC.
+Decoded pixels are always synthetic. Frame pixel handling is RGBA only;
+other pixel formats, media-element/canvas source constructors, transfer/
+structured-clone semantics, exact WebIDL numeric coercion and full browser
+codec/colorimetry behavior are not implemented. Detached empty chunk/config
+buffers currently follow the existing BufferSource conversion (empty bytes).
+Keep benchmark assertions unchanged and existing patches byte-for-byte.
+
+Validation in development: existing upstream tests 1658/1658; temporary
+CDP diagnostics 85/85, including lifecycle, raw bytes, synthetic pixels,
+callbacks, GC survival, retained targets, reentrant detachment, unsupported
+queued operations, dedicated-worker output, secure/insecure Window and
+worker exposure, SharedWorker absence and navigation teardown. One reviewer
+pass completed; all five reported findings addressed. Exported-stack build,
+upstream suite and benchmark results are recorded in ignored .build artifacts.
+
+References:
+https://www.w3.org/TR/webcodecs/#videodecoder-interface
+https://www.w3.org/TR/webcodecs/#videoframe-interface
+https://www.w3.org/TR/webcodecs/#encodedvideochunk-interface
+https://www.apple.com/macbook-neo/specs/
+---
+ src/browser/js/Context.zig               |  11 +
+ src/browser/js/Env.zig                   |  23 ++
+ src/browser/js/bridge.zig                |   3 +-
+ src/browser/webapi/EncodedVideoChunk.zig |  95 ++++++
+ src/browser/webapi/EventTarget.zig       |  10 +-
+ src/browser/webapi/VideoDecoder.zig      | 384 +++++++++++++++++++++++
+ src/browser/webapi/VideoFrame.zig        | 328 +++++++++++++++++++
+ 7 files changed, 851 insertions(+), 3 deletions(-)
+ create mode 100644 src/browser/webapi/EncodedVideoChunk.zig
+ create mode 100644 src/browser/webapi/VideoDecoder.zig
+ create mode 100644 src/browser/webapi/VideoFrame.zig
+
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index 15ec165..18051b6 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -72,6 +72,9 @@ media_device_bindings: ?struct {
+     interfaces: [3]v8.Global,
+ } = null,
+ 
++video_bindings: ?[4]v8.Global = null,
++video_decoders: std.DoublyLinkedList = .{},
++
+ cpu_profiler: ?*v8.CpuProfiler = null,
+ 
+ heap_profiler: ?*v8.HeapProfiler = null,
+@@ -212,6 +215,10 @@ pub fn deinit(self: *Context) void {
+     const entered = self.enter(&hs);
+     defer entered.exit();
+ 
++    while (self.video_decoders.first) |node| {
++        const decoder: *@import("../webapi/VideoDecoder.zig") = @fieldParentPtr("_context_node", node);
++        decoder.detach();
++    }
+     // this can release objects
+     self.scheduler.deinit();
+ 
+@@ -250,6 +257,9 @@ pub fn deinit(self: *Context) void {
+         v8.v8__Global__Reset(&bindings.define_property);
+         for (&bindings.interfaces) |*binding| v8.v8__Global__Reset(binding);
+     }
++    if (self.video_bindings) |*bindings| {
++        for (bindings) |*binding| v8.v8__Global__Reset(binding);
++    }
+     v8.v8__Global__Reset(&self.object_freeze);
+     v8.v8__Global__Reset(&self.handle);
+     env.isolate.notifyContextDisposed();
+@@ -282,6 +292,7 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
+         if (self.global == .frame) {
+             const global_obj = v8.v8__Context__Global(ls.local.handle).?;
+             const secure = self.execution.isSecureContext();
++            env.setVideoDecoderExposure(self, ls.local.handle, global_obj, secure);
+             env.setBatteryExposure(self, ls.local.handle, global_obj, secure);
+             env.setWebShareExposure(self, ls.local.handle, global_obj, secure);
+             try env.setMediaDevicesExposure(self, ls.local.handle, global_obj, secure);
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 7fa47f0..ce16889 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -440,6 +440,9 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+     }
+     try self.contexts.append(self.allocator, context);
+ 
++    if (comptime !is_frame) {
++        if (global._type == .dedicated) self.setVideoDecoderExposure(context, v8_context, global_obj, global._secure_context);
++    }
+     return context;
+ }
+ 
+@@ -467,6 +470,26 @@ pub fn hideServiceWorker(self: *const Env, comptime is_frame: bool, v8_context:
+     }
+ }
+ 
++pub fn setVideoDecoderExposure(self: *const Env, ctx: *Context, v8_context: *const v8.Context, global_obj: *const v8.Object, secure: bool) void {
++    if (secure == (ctx.video_bindings == null)) return;
++    const isolate = self.isolate.handle;
++    var result: v8.MaybeBool = undefined;
++    if (!secure) ctx.video_bindings = @splat(undefined);
++    inline for (.{ "VideoDecoder", "EncodedVideoChunk", "VideoFrame", "VideoColorSpace" }, 0..) |name, i| {
++        const key = self.isolate.initStringHandle(name);
++        const binding = &ctx.video_bindings.?[i];
++        if (secure) {
++            v8.v8__Object__DefineOwnProperty(global_obj, v8_context, key, v8.v8__Global__Get(binding, isolate), v8.DontEnum, &result);
++            v8.v8__Global__Reset(binding);
++        } else {
++            const value = v8.v8__Object__Get(global_obj, v8_context, key).?;
++            v8.v8__Global__New(isolate, value, binding);
++            v8.v8__Object__Delete(global_obj, v8_context, key, &result);
++        }
++    }
++    if (secure) ctx.video_bindings = null;
++}
++
+ pub fn setBatteryExposure(self: *const Env, ctx: *Context, v8_context: *const v8.Context, global_obj: *const v8.Object, secure: bool) void {
+     if (secure and ctx.battery_bindings == null) return;
+     if (!secure and ctx.battery_bindings != null) return;
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index efeaf15..f20f673 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1030,6 +1030,7 @@ pub const SubType = enum {
+ // APIs for Page/Window contexts. Used by Snapshot.zig for Page snapshot creation.
+ pub const PageJsApis = flattenTypes(&.{
+     @import("../webapi/SpeechSynthesis.zig"),
++    @import("../webapi/VideoDecoder.zig"),
+     @import("../webapi/SpeechSynthesisVoice.zig"),
+     @import("../webapi/SpeechSynthesisUtterance.zig"),
+     @import("../webapi/event/SpeechSynthesisEvent.zig"),
+@@ -1435,7 +1436,7 @@ const worker_extended_apis = worker_common_apis ++ [_]type{
+     @import("../webapi/FileReaderSync.zig"),
+ };
+ 
+-pub const DedicatedWorkerJsApis = flattenTypes(&([_]type{@import("../webapi/DedicatedWorkerGlobalScope.zig")} ++ worker_extended_apis));
++pub const DedicatedWorkerJsApis = flattenTypes(&([_]type{ @import("../webapi/DedicatedWorkerGlobalScope.zig"), @import("../webapi/VideoDecoder.zig") } ++ worker_extended_apis));
+ pub const SharedWorkerJsApis = flattenTypes(&([_]type{@import("../webapi/SharedWorkerGlobalScope.zig")} ++ worker_extended_apis));
+ 
+ pub const ServiceWorkerJsApis = flattenTypes(&([_]type{
+diff --git a/src/browser/webapi/EncodedVideoChunk.zig b/src/browser/webapi/EncodedVideoChunk.zig
+new file mode 100644
+index 0000000..e55fe72
+--- /dev/null
++++ b/src/browser/webapi/EncodedVideoChunk.zig
+@@ -0,0 +1,95 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const Chunk = @This();
++
++_arena: *lp.Arena,
++_rc: lp.RC = .{},
++_type: Type,
++_timestamp: i64,
++_duration: ?u64,
++_data: []const u8,
++
++const Type = enum {
++    key,
++    delta,
++    pub const js_enum_from_string = true;
++};
++const Init = struct {
++    data: js.Value,
++    duration: ?u64 = null,
++    timestamp: i64,
++    type: Type,
++};
++fn init(options: Init, exec: *js.Execution) !*Chunk {
++    // Resolve the bytes only after all dictionary getters have run.
++    const data = try options.data.toZig(js.BufferSource);
++    const arena = try exec.getArena(.small, "EncodedVideoChunk");
++    errdefer arena.release();
++    const self = try arena.create(Chunk);
++    self.* = .{
++        ._arena = arena,
++        ._type = options.type,
++        ._timestamp = options.timestamp,
++        ._duration = options.duration,
++        ._data = try arena.dupe(u8, data.bytes),
++    };
++    return self;
++}
++pub fn acquireRef(self: *Chunk) void {
++    self._rc.acquire();
++}
++pub fn releaseRef(self: *Chunk, page: *Page) void {
++    self._rc.release(self, page);
++}
++pub fn deinit(self: *Chunk, _: *Page) void {
++    self._arena.release();
++}
++fn getType(self: *const Chunk) []const u8 {
++    return @tagName(self._type);
++}
++fn getTimestamp(self: *const Chunk) i64 {
++    return self._timestamp;
++}
++fn getDuration(self: *const Chunk) ?u64 {
++    return self._duration;
++}
++fn getByteLength(self: *const Chunk) usize {
++    return self._data.len;
++}
++fn copyTo(self: *const Chunk, value: js.Value) !void {
++    const destination = try value.toZig(js.BufferSource);
++    if (destination.bytes.len < self._data.len) return error.TypeError;
++    @memcpy(@constCast(destination.bytes[0..self._data.len]), self._data);
++}
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Chunk);
++    pub const Meta = struct {
++        pub const name = "EncodedVideoChunk";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(Chunk.init, .{});
++    pub const @"type" = bridge.accessor(getType, null, .{});
++    pub const timestamp = bridge.accessor(getTimestamp, null, .{});
++    pub const duration = bridge.accessor(getDuration, null, .{});
++    pub const byteLength = bridge.accessor(getByteLength, null, .{});
++    pub const copyTo = bridge.function(Chunk.copyTo, .{});
++};
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index ded0f61..74a72b4 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -67,6 +67,7 @@ const MediaDevices = @import("MediaDevices.zig");
+ 
+ const SpeechSynthesis = @import("SpeechSynthesis.zig");
+ const SpeechSynthesisUtterance = @import("SpeechSynthesisUtterance.zig");
++const VideoDecoder = @import("VideoDecoder.zig");
+ 
+ const EventTarget = @This();
+ 
+@@ -108,6 +109,7 @@ pub const Type = enum(u8) {
+     speech_synthesis,
+     speech_synthesis_utterance,
+     text_track_cue,
++    video_decoder,
+     visual_viewport,
+     websocket,
+     window,
+@@ -149,6 +151,7 @@ pub fn Subtype(comptime tag: Type) type {
+         .speech_synthesis => SpeechSynthesis,
+         .speech_synthesis_utterance => SpeechSynthesisUtterance,
+         .text_track_cue => TextTrackCue,
++        .video_decoder => VideoDecoder,
+         .visual_viewport => VisualViewport,
+         .websocket => WebSocket,
+         .window => Window,
+@@ -219,7 +222,7 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
+     }
+ 
+     switch (self._type) {
+-        inline .speech_synthesis, .speech_synthesis_utterance => |tag| {
++        inline .speech_synthesis, .speech_synthesis_utterance, .video_decoder => |tag| {
+             try self.subtype(Subtype(tag)).dispatch(event, exec);
+             return !event._cancelable or !event._prevent_default;
+         },
+@@ -337,6 +340,7 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
+             return;
+         },
+         .speech_synthesis_utterance => return self.subtype(SpeechSynthesisUtterance).registerListener(typ, em_callback, options, exec),
++        .video_decoder => return self.subtype(VideoDecoder).registerListener(typ, em_callback, options, exec),
+         else => {},
+     }
+     return exec.registerListener(self, typ, em_callback, options);
+@@ -386,7 +390,7 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
+         return;
+     }
+     switch (self._type) {
+-        inline .speech_synthesis, .speech_synthesis_utterance => |tag| {
++        inline .speech_synthesis, .speech_synthesis_utterance, .video_decoder => |tag| {
+             self.subtype(Subtype(tag))._events.remove(self, typ, em_callback, use_capture);
+             return;
+         },
+@@ -419,6 +423,7 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         .navigation => writer.writeAll("<Navigation>"),
+         .screen => writer.writeAll("<Screen>"),
+         .screen_orientation => writer.writeAll("<ScreenOrientation>"),
++        .video_decoder => writer.writeAll("<VideoDecoder>"),
+         .visual_viewport => writer.writeAll("<VisualViewport>"),
+         .file_reader => writer.writeAll("<FileReader>"),
+         .font_face_set => writer.writeAll("<FontFaceSet>"),
+@@ -465,6 +470,7 @@ pub fn toString(self: *EventTarget) []const u8 {
+         .speech_synthesis => return "[object SpeechSynthesis]",
+         .speech_synthesis_utterance => return "[object SpeechSynthesisUtterance]",
+         .text_track_cue => return "[object TextTrackCue]",
++        .video_decoder => return "[object VideoDecoder]",
+         .visual_viewport => return "[object VisualViewport]",
+         .websocket => return "[object WebSocket]",
+         .window => return "[object Window]",
+diff --git a/src/browser/webapi/VideoDecoder.zig b/src/browser/webapi/VideoDecoder.zig
+new file mode 100644
+index 0000000..d943ea0
+--- /dev/null
++++ b/src/browser/webapi/VideoDecoder.zig
+@@ -0,0 +1,384 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const Event = @import("Event.zig");
++const EventTarget = @import("EventTarget.zig");
++const EventManagerBase = @import("../EventManagerBase.zig");
++const Speech = @import("SpeechSynthesis.zig");
++const DOMException = @import("DOMException.zig");
++const VideoFrame = @import("VideoFrame.zig");
++const Chunk = @import("EncodedVideoChunk.zig");
++const Decoder = @This();
++
++pub fn registerTypes() []const type {
++    return &.{ Decoder, Chunk, VideoFrame, VideoFrame.ColorSpace };
++}
++
++pub const Proto = EventTarget;
++_proto: *EventTarget,
++_arena: *lp.Arena,
++_rc: lp.RC = .{},
++_context: ?*js.Context,
++_context_node: std.DoublyLinkedList.Node = .{},
++_events: EventManagerBase,
++_handlers: [1]Speech.Handler = undefined,
++_listener_roots: std.ArrayList(*js.GlobalSlot) = .empty,
++_state: State = .unconfigured,
++_queue_size: u32 = 0,
++_generation: u64 = 0,
++_key_required: bool = true,
++_width: u32 = 1920,
++_height: u32 = 1080,
++_display_width: u32 = 1920,
++_display_height: u32 = 1080,
++_flushes: std.DoublyLinkedList = .{},
++
++const State = enum { unconfigured, configured, closed };
++const HardwareAcceleration = enum {
++    @"no-preference",
++    @"prefer-hardware",
++    @"prefer-software",
++    pub const js_enum_from_string = true;
++};
++const Config = struct {
++    codec: []const u8,
++    codedHeight: ?u32 = null,
++    codedWidth: ?u32 = null,
++    description: ?js.Value = null,
++    displayAspectHeight: ?u32 = null,
++    displayAspectWidth: ?u32 = null,
++    hardwareAcceleration: HardwareAcceleration = .@"no-preference",
++    optimizeForLatency: bool = false,
++};
++const Init = struct { @"error": js.Function, output: js.Function };
++
++fn validate(config: Config) !void {
++    if (config.codec.len == 0 or std.mem.indexOfAny(u8, config.codec, " \t\r\n,") != null) return error.TypeError;
++    inline for (.{ config.codedWidth, config.codedHeight, config.displayAspectWidth, config.displayAspectHeight }) |dimension| {
++        if (dimension != null and dimension.? == 0) return error.TypeError;
++    }
++    if (config.description) |value| _ = try value.toZig(js.BufferSource);
++    if ((config.displayAspectWidth == null) != (config.displayAspectHeight == null)) return error.TypeError;
++}
++
++fn supported(config: Config) bool {
++    // Synthetic A18 Pro H.264 capability, not a query of the host's codecs.
++    const codec = config.codec;
++    if (codec.len != 11 or (!std.mem.startsWith(u8, codec, "avc1.") and !std.mem.startsWith(u8, codec, "avc3."))) return false;
++    const profile = std.fmt.parseUnsigned(u8, codec[5..7], 16) catch return false;
++    _ = std.fmt.parseUnsigned(u8, codec[7..9], 16) catch return false;
++    const level = std.fmt.parseUnsigned(u8, codec[9..11], 16) catch return false;
++    if (profile != 0x42 and profile != 0x4d and profile != 0x58 and profile != 0x64) return false;
++    const levels = [_]u8{ 9, 10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52 };
++    if (std.mem.indexOfScalar(u8, &levels, level) == null) return false;
++    const width = config.codedWidth orelse 1920;
++    const height = config.codedHeight orelse 1080;
++    return width <= 4096 and height <= 4096 and @as(u64, width) * height <= 4096 * 2304;
++}
++
++fn isConfigSupported(config: Config, exec: *js.Execution) !js.Promise {
++    try validate(config);
++    const local = exec.js.local.?;
++    const result = local.newObject();
++    const normalized = local.newObject();
++    _ = try normalized.set("codec", config.codec, .{});
++    inline for (.{ "codedWidth", "codedHeight", "displayAspectWidth", "displayAspectHeight" }) |field| {
++        if (@field(config, field)) |value| _ = try normalized.set(field, value, .{});
++    }
++    _ = try normalized.set("hardwareAcceleration", @tagName(config.hardwareAcceleration), .{});
++    _ = try normalized.set("optimizeForLatency", config.optimizeForLatency, .{});
++    if (config.description) |value| {
++        const description = try value.toZig(js.BufferSource);
++        _ = try normalized.set("description", js.ArrayBuffer{ .values = description.bytes }, .{});
++    }
++    _ = try result.set("supported", supported(config), .{});
++    _ = try result.set("config", normalized, .{});
++    const resolver = js.PromiseResolver.init(local);
++    try resolver.resolveValue(result.toValue());
++    return resolver.promise();
++}
++
++fn init(options: Init, exec: *js.Execution) !*Decoder {
++    const arena = try exec.getArena(.small, "VideoDecoder");
++    const self = exec._factory.eventTargetWithAllocator(arena.allocator(), Decoder{
++        ._proto = undefined,
++        ._arena = arena,
++        ._context = exec.js,
++        ._events = .init(arena.allocator()),
++    }) catch |err| {
++        arena.release();
++        return err;
++    };
++    self._handlers[0] = .{ .target = self._proto, .events = &self._events, .name = "dequeue", .weak = true };
++    exec.js.video_decoders.append(&self._context_node);
++    // Reuse JS-owned callback storage: closures capturing the decoder remain
++    // collectible, while each queued task roots the wrapper until delivery.
++    const data = try Speech.callbackData(self._proto, exec.js.local.?);
++    const local = exec.js.local.?;
++    if (!(data.defineOwnProperty("output", try local.zigValueToJs(options.output, .{}), 0) orelse false)) return error.JsException;
++    if (!(data.defineOwnProperty("error", try local.zigValueToJs(options.@"error", .{}), 0) orelse false)) return error.JsException;
++    return self;
++}
++
++pub fn acquireRef(self: *Decoder) void {
++    self._rc.acquire();
++}
++pub fn releaseRef(self: *Decoder, page: *Page) void {
++    self._rc.release(self, page);
++}
++pub fn deinit(self: *Decoder, _: *Page) void {
++    if (self._context) |ctx| ctx.video_decoders.remove(&self._context_node);
++    for (&self._handlers) |*handler| handler.deinit();
++    for (self._listener_roots.items) |slot| slot.release();
++    self._arena.release();
++}
++pub fn detach(self: *Decoder) void {
++    if (self._context) |ctx| ctx.video_decoders.remove(&self._context_node);
++    self._context = null;
++    self._state = .closed;
++    self._generation +%= 1;
++    self._queue_size = 0;
++}
++
++pub fn registerListener(self: *Decoder, typ: []const u8, callback: EventManagerBase.Callback, options: EventManagerBase.RegisterOptions, exec: *js.Execution) !void {
++    try self._listener_roots.ensureUnusedCapacity(self._arena.allocator(), 1);
++    const listener = (try self._events.register(self._proto, typ, callback, options)) orelse return;
++    const slot = switch (listener.function) {
++        .value => |value| value.slot,
++        .object => |value| value.slot,
++        .string => unreachable,
++    };
++    errdefer {
++        self._events.remove(self._proto, typ, callback, options.capture);
++        slot.release();
++    }
++    const value = switch (callback) {
++        .function => |f| js.Value{ .local = f.local, .handle = @ptrCast(f.handle) },
++        .object => |o| o.toValue(),
++    };
++    const data = try Speech.callbackData(self._proto, exec.js.local.?);
++    var buf: [32]u8 = undefined;
++    const key = try std.fmt.bufPrint(&buf, "listener{d}", .{self._listener_roots.items.len});
++    if (!(data.defineOwnProperty(key, value, 0) orelse false)) return error.JsException;
++    js.v8.v8__Global__SetWeak(&slot.handle);
++    self._listener_roots.appendAssumeCapacity(slot);
++}
++
++pub fn dispatch(self: *Decoder, event: *Event, exec: *js.Execution) !void {
++    var scope: js.Local.Scope = undefined;
++    exec.js.localScope(&scope);
++    defer scope.deinit();
++    const local = &scope.local;
++    // Event.target is a native pointer; let retained events keep the wrapper
++    // alive through a JS edge rather than a permanent native root.
++    const wrapper = try local.zigValueToJs(event, .{});
++    const owner = try local.zigValueToJs(self, .{});
++    const key: *const js.v8.Private = @ptrCast(js.v8.v8__Global__Get(&local.ctx.env.private_symbols.speech_callbacks.handle, local.isolate.handle).?);
++    var saved: js.v8.MaybeBool = undefined;
++    js.v8.v8__Object__SetPrivate(@ptrCast(wrapper.handle), local.handle, key, owner.handle, &saved);
++    if (!saved.has_value or !saved.value) return error.JsException;
++    try Speech.dispatchDirect(self._proto, &self._events, event, exec);
++}
++fn dequeue(self: *Decoder, exec: *js.Execution) !void {
++    const event = try Event.init("dequeue", null, exec.page);
++    event._is_trusted = true;
++    try self.dispatch(event, exec);
++}
++fn getState(self: *const Decoder) []const u8 {
++    return @tagName(self._state);
++}
++fn getQueueSize(self: *const Decoder) u32 {
++    return self._queue_size;
++}
++fn requireOpen(self: *const Decoder) !void {
++    if (self._state == .closed or self._context == null) return error.InvalidStateError;
++}
++fn configure(self: *Decoder, config: Config, exec: *js.Execution) !void {
++    try self.requireOpen();
++    try validate(config);
++    const coded_width = config.codedWidth orelse 1920;
++    const coded_height = config.codedHeight orelse 1080;
++    var display_width = coded_width;
++    var display_height = coded_height;
++    if (config.displayAspectWidth) |aspect_width| {
++        const aspect_height = config.displayAspectHeight.?;
++        const width = @as(u64, coded_height) * aspect_width / aspect_height;
++        const height = @as(u64, coded_width) * aspect_height / aspect_width;
++        if (width > std.math.maxInt(u32) or height > std.math.maxInt(u32)) return error.TypeError;
++        if (width > coded_width) display_width = @intCast(width) else display_height = @intCast(height);
++    }
++    if (!supported(config)) _ = try self.schedule(.failure, exec, exec.js.local.?);
++    self._width = coded_width;
++    self._height = coded_height;
++    self._display_width = display_width;
++    self._display_height = display_height;
++    self._state = .configured;
++    self._key_required = true;
++}
++fn decode(self: *Decoder, chunk: *Chunk, exec: *js.Execution) !void {
++    if (self._state != .configured or self._context == null) return error.InvalidStateError;
++    if (self._key_required and chunk._type != .key) return error.DataError;
++    if (chunk._data.len == 0) return error.TypeError;
++    const task = try self.schedule(.decode, exec, exec.js.local.?);
++    task.timestamp = chunk._timestamp;
++    task.duration = chunk._duration;
++    task.width = self._width;
++    task.height = self._height;
++    task.display_width = self._display_width;
++    task.display_height = self._display_height;
++    self._key_required = false;
++    self._queue_size += 1;
++}
++fn flush(self: *Decoder, exec: *js.Execution) !js.Promise {
++    if (self._state != .configured or self._context == null) return error.InvalidStateError;
++    const resolver = js.PromiseResolver.init(exec.js.local.?);
++    const global = try resolver.persist();
++    errdefer global.release();
++    const task = try self.schedule(.flush, exec, exec.js.local.?);
++    task.resolver = global;
++    self._flushes.append(&task.node);
++    self._key_required = true;
++    return resolver.promise();
++}
++fn clear(self: *Decoder, exec: *js.Execution, local: *const js.Local) !void {
++    self._generation +%= 1;
++    self._key_required = true;
++    const had_queue = self._queue_size != 0;
++    self._queue_size = 0;
++    while (self._flushes.popFirst()) |node| {
++        const task: *Task = @fieldParentPtr("node", node);
++        const resolver = task.resolver.?;
++        task.resolver = null;
++        defer resolver.release();
++        try resolver.local(local).rejectValue(try local.zigValueToJs(DOMException.init("The decoder was reset", "AbortError"), .{}));
++    }
++    if (had_queue) _ = try self.schedule(.dequeue, exec, local);
++}
++fn reset(self: *Decoder, exec: *js.Execution) !void {
++    try self.requireOpen();
++    self._state = .unconfigured;
++    try self.clear(exec, exec.js.local.?);
++}
++fn close(self: *Decoder, exec: *js.Execution) !void {
++    try self.requireOpen();
++    self._state = .closed;
++    try self.clear(exec, exec.js.local.?);
++}
++
++const Task = struct {
++    const Kind = enum { decode, flush, failure, dequeue };
++    decoder: *Decoder,
++    arena: *lp.Arena,
++    root: js.Value.Global,
++    generation: u64,
++    kind: Kind,
++    node: std.DoublyLinkedList.Node = .{},
++    resolver: ?js.PromiseResolver.Global = null,
++    timestamp: i64 = 0,
++    duration: ?u64 = null,
++    width: u32 = 0,
++    height: u32 = 0,
++    display_width: u32 = 0,
++    display_height: u32 = 0,
++
++    fn dispose(self: *Task) void {
++        if (self.resolver) |resolver| {
++            self.decoder._flushes.remove(&self.node);
++            resolver.release();
++        }
++        self.root.release();
++        self.arena.release();
++    }
++    fn cancelled(ptr: *anyopaque) void {
++        const self: *Task = @ptrCast(@alignCast(ptr));
++        self.dispose();
++    }
++    fn run(ptr: *anyopaque) !?u32 {
++        const self: *Task = @ptrCast(@alignCast(ptr));
++        defer self.dispose();
++        const decoder = self.decoder;
++        const ctx = decoder._context orelse return null;
++        var scope: js.Local.Scope = undefined;
++        ctx.localScope(&scope);
++        defer scope.deinit();
++        defer scope.local.runMicrotasks();
++        const exec = &ctx.execution;
++        const local = &scope.local;
++        if (self.generation != decoder._generation) return null;
++        switch (self.kind) {
++            .dequeue => try decoder.dequeue(exec),
++            .decode => {
++                decoder._queue_size -= 1;
++                const frame = try VideoFrame.synthetic(self.width, self.height, self.display_width, self.display_height, self.timestamp, self.duration, exec);
++                const data = try Speech.callbackData(decoder._proto, local);
++                const output = (try data.getFunction("output")).?;
++                // Callback exceptions are reported, not decoder failures.
++                output.call(void, .{frame}) catch |err| exec.page.recordJsError(err);
++                if (self.generation == decoder._generation) try decoder.dequeue(exec);
++            },
++            .flush => {
++                const resolver = self.resolver.?;
++                decoder._flushes.remove(&self.node);
++                self.resolver = null;
++                defer resolver.release();
++                try resolver.local(local).resolveValue(try local.zigValueToJs({}, .{}));
++            },
++            .failure => {
++                decoder._state = .closed;
++                try decoder.clear(exec, local);
++                const data = try Speech.callbackData(decoder._proto, local);
++                const callback = (try data.getFunction("error")).?;
++                callback.call(void, .{DOMException.init("The codec configuration is not supported", "NotSupportedError")}) catch |err| exec.page.recordJsError(err);
++            },
++        }
++        return null;
++    }
++};
++fn schedule(self: *Decoder, kind: Task.Kind, exec: *js.Execution, local: *const js.Local) !*Task {
++    const ctx = self._context orelse return error.InvalidStateError;
++    const arena = try exec.getArena(.tiny, "VideoDecoder.task");
++    errdefer arena.release();
++    const root = try (try local.zigValueToJs(self, .{})).persist();
++    errdefer root.release();
++    const task = try arena.create(Task);
++    task.* = .{ .decoder = self, .arena = arena, .root = root, .generation = self._generation, .kind = kind };
++    try ctx.scheduler.add(task, Task.run, 0, .{ .name = "VideoDecoder", .finalizer = Task.cancelled });
++    return task;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Decoder);
++    pub const Meta = struct {
++        pub const name = "VideoDecoder";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(Decoder.init, .{});
++    pub const isConfigSupported = bridge.function(Decoder.isConfigSupported, .{ .static = true });
++    pub const state = bridge.accessor(getState, null, .{});
++    pub const decodeQueueSize = bridge.accessor(getQueueSize, null, .{});
++    pub const ondequeue = bridge.accessor(Speech.Binding(Decoder, 0).get, Speech.Binding(Decoder, 0).set, .{});
++    pub const configure = bridge.function(Decoder.configure, .{});
++    pub const decode = bridge.function(Decoder.decode, .{});
++    pub const flush = bridge.function(Decoder.flush, .{});
++    pub const reset = bridge.function(Decoder.reset, .{});
++    pub const close = bridge.function(Decoder.close, .{});
++};
+diff --git a/src/browser/webapi/VideoFrame.zig b/src/browser/webapi/VideoFrame.zig
+new file mode 100644
+index 0000000..56716ff
+--- /dev/null
++++ b/src/browser/webapi/VideoFrame.zig
+@@ -0,0 +1,328 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const Rect = @import("DOMRectReadOnly.zig");
++const Frame = @This();
++
++_arena: *lp.Arena,
++_rc: lp.RC = .{},
++_width: u32,
++_height: u32,
++_visible: Region,
++_display_width: u32,
++_display_height: u32,
++_timestamp: i64,
++_duration: ?u64,
++_pixels: ?[]const u8 = null,
++_closed: bool = false,
++_color_space: *ColorSpace,
++
++const Region = struct { height: u32, width: u32, x: u32 = 0, y: u32 = 0 };
++const Layout = struct { offset: u32, stride: u32 };
++const Init = struct {
++    alpha: enum {
++        keep,
++        discard,
++        pub const js_enum_from_string = true;
++    } = .keep,
++    codedHeight: ?u32 = null,
++    codedWidth: ?u32 = null,
++    colorSpace: ?ColorSpace.Init = null,
++    displayHeight: ?u32 = null,
++    displayWidth: ?u32 = null,
++    duration: ?u64 = null,
++    format: ?[]const u8 = null,
++    layout: ?[]const Layout = null,
++    timestamp: ?i64 = null,
++    visibleRect: ?Region = null,
++};
++const CopyOptions = struct {
++    format: ?[]const u8 = null,
++    layout: ?[]const Layout = null,
++    rect: ?Region = null,
++};
++
++fn checkedRegion(region: Region, width: u32, height: u32) !Region {
++    if (region.width == 0 or region.height == 0 or @as(u64, region.x) + region.width > width or @as(u64, region.y) + region.height > height) return error.TypeError;
++    return region;
++}
++fn layoutFor(region: Region, layouts: ?[]const Layout) !Layout {
++    const row = region.width * 4;
++    if (layouts) |layout| {
++        if (layout.len != 1 or layout[0].stride < row) return error.TypeError;
++        return layout[0];
++    }
++    return .{ .offset = 0, .stride = row };
++}
++fn sizeFor(region: Region, layout: Layout) !u32 {
++    const size = @as(u64, layout.offset) + @as(u64, layout.stride) * (region.height - 1) + region.width * 4;
++    if (size > std.math.maxInt(u32)) return error.TypeError;
++    return @intCast(size);
++}
++fn checkFormat(format: ?[]const u8) !void {
++    if (format) |value| {
++        if (!std.mem.eql(u8, value, "RGBA")) return error.NotSupported;
++    }
++}
++
++pub fn synthetic(width: u32, height: u32, display_width: u32, display_height: u32, timestamp: i64, duration: ?u64, exec: *js.Execution) !*Frame {
++    if (width == 0 or height == 0 or width > 16384 or height > 16384) return error.TypeError;
++    const color = try ColorSpace.init(.{ .primaries = .bt709, .transfer = .@"iec61966-2-1", .matrix = .rgb, .fullRange = true }, exec);
++    const arena = try exec.getArena(.small, "VideoFrame");
++    errdefer arena.release();
++    const self = try arena.create(Frame);
++    self.* = .{
++        ._arena = arena,
++        ._width = width,
++        ._height = height,
++        ._visible = .{ .width = width, .height = height },
++        ._display_width = display_width,
++        ._display_height = display_height,
++        ._timestamp = timestamp,
++        ._duration = duration,
++        ._color_space = color,
++    };
++    return self;
++}
++fn init(source: js.Value, options_: ?Init, exec: *js.Execution) !*Frame {
++    const options = options_ orelse Init{};
++    if (source.toZig(*Frame) catch null) |original| {
++        try original.requireOpen();
++        const copy = try original.clone(exec);
++        errdefer copy._arena.release();
++        if (options.timestamp) |value| copy._timestamp = value;
++        if (options.duration) |value| copy._duration = value;
++        if (options.visibleRect) |value| copy._visible = try checkedRegion(value, copy._width, copy._height);
++        if (options.displayWidth) |value| copy._display_width = value;
++        if (options.displayHeight) |value| copy._display_height = value;
++        if (copy._display_width == 0 or copy._display_height == 0) return error.TypeError;
++        return copy;
++    }
++    const buffer = try source.toZig(js.BufferSource);
++    const width = options.codedWidth orelse return error.TypeError;
++    const height = options.codedHeight orelse return error.TypeError;
++    const timestamp = options.timestamp orelse return error.TypeError;
++    if (options.format == null) return error.TypeError;
++    try checkFormat(options.format);
++    const self = try synthetic(width, height, options.displayWidth orelse width, options.displayHeight orelse height, timestamp, options.duration, exec);
++    errdefer self._arena.release();
++    if (self._display_width == 0 or self._display_height == 0) return error.TypeError;
++    const region = Region{ .width = width, .height = height };
++    const layout = try layoutFor(region, options.layout);
++    if (buffer.bytes.len < try sizeFor(region, layout)) return error.TypeError;
++    const pixels = try self._arena.alloc(u8, width * height * 4);
++    for (0..height) |y| {
++        const start = layout.offset + y * layout.stride;
++        @memcpy(pixels[y * width * 4 ..][0 .. width * 4], buffer.bytes[start..][0 .. width * 4]);
++    }
++    if (options.alpha == .discard) {
++        var i: usize = 3;
++        while (i < pixels.len) : (i += 4) pixels[i] = 255;
++    }
++    self._pixels = pixels;
++    if (options.visibleRect) |value| self._visible = try checkedRegion(value, width, height);
++    if (options.colorSpace) |color| self._color_space = try ColorSpace.init(color, exec);
++    return self;
++}
++pub fn acquireRef(self: *Frame) void {
++    self._rc.acquire();
++}
++pub fn releaseRef(self: *Frame, page: *Page) void {
++    self._rc.release(self, page);
++}
++pub fn deinit(self: *Frame, _: *Page) void {
++    self._arena.release();
++}
++fn requireOpen(self: *const Frame) !void {
++    if (self._closed) return error.InvalidStateError;
++}
++fn close(self: *Frame) void {
++    self._closed = true;
++    if (self._pixels) |pixels| self._arena.allocator().free(pixels);
++    self._pixels = null;
++}
++fn clone(self: *const Frame, exec: *js.Execution) !*Frame {
++    try self.requireOpen();
++    const copy = try synthetic(self._width, self._height, self._display_width, self._display_height, self._timestamp, self._duration, exec);
++    errdefer copy._arena.release();
++    copy._visible = self._visible;
++    copy._color_space = self._color_space;
++    if (self._pixels) |pixels| copy._pixels = try copy._arena.dupe(u8, pixels);
++    return copy;
++}
++fn allocationSize(self: *const Frame, options_: ?CopyOptions) !u32 {
++    try self.requireOpen();
++    const options = options_ orelse CopyOptions{};
++    try checkFormat(options.format);
++    const region = try checkedRegion(options.rect orelse self._visible, self._width, self._height);
++    return sizeFor(region, try layoutFor(region, options.layout));
++}
++fn copyTo(self: *const Frame, value: js.Value, options_: ?CopyOptions, exec: *js.Execution) !js.Promise {
++    try self.requireOpen();
++    const options = options_ orelse CopyOptions{};
++    try checkFormat(options.format);
++    const region = try checkedRegion(options.rect orelse self._visible, self._width, self._height);
++    const layout = try layoutFor(region, options.layout);
++    // Options getters can detach/resize the destination before this point.
++    const destination = try value.toZig(js.BufferSource);
++    if (destination.bytes.len < try sizeFor(region, layout)) return error.TypeError;
++    for (0..region.height) |y| {
++        const start = layout.offset + y * layout.stride;
++        const row = @constCast(destination.bytes[start..][0 .. region.width * 4]);
++        if (self._pixels) |pixels| {
++            const source = ((region.y + y) * self._width + region.x) * 4;
++            @memcpy(row, pixels[source..][0..row.len]);
++        } else {
++            // A synthetic decoded frame is opaque black, generated lazily.
++            @memset(row, 0);
++            var i: usize = 3;
++            while (i < row.len) : (i += 4) row[i] = 255;
++        }
++    }
++    const local = exec.js.local.?;
++    const resolver = js.PromiseResolver.init(local);
++    try resolver.resolveValue(try local.zigValueToJs([_]Layout{layout}, .{}));
++    return resolver.promise();
++}
++fn getFormat(self: *const Frame) ?[]const u8 {
++    return if (self._closed) null else "RGBA";
++}
++fn getWidth(self: *const Frame) u32 {
++    return if (self._closed) 0 else self._width;
++}
++fn getHeight(self: *const Frame) u32 {
++    return if (self._closed) 0 else self._height;
++}
++fn getDisplayWidth(self: *const Frame) u32 {
++    return if (self._closed) 0 else self._display_width;
++}
++fn getDisplayHeight(self: *const Frame) u32 {
++    return if (self._closed) 0 else self._display_height;
++}
++fn getTimestamp(self: *const Frame) i64 {
++    return self._timestamp;
++}
++fn getDuration(self: *const Frame) ?u64 {
++    return self._duration;
++}
++fn getCodedRect(self: *const Frame, exec: *js.Execution) !?*Rect {
++    if (self._closed) return null;
++    return try Rect.init(0, 0, @floatFromInt(self._width), @floatFromInt(self._height), exec);
++}
++fn getVisibleRect(self: *const Frame, exec: *js.Execution) !?*Rect {
++    if (self._closed) return null;
++    const r = self._visible;
++    return try Rect.init(@floatFromInt(r.x), @floatFromInt(r.y), @floatFromInt(r.width), @floatFromInt(r.height), exec);
++}
++fn getColorSpace(self: *const Frame) *ColorSpace {
++    return self._color_space;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Frame);
++    pub const Meta = struct {
++        pub const name = "VideoFrame";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(Frame.init, .{});
++    pub const format = bridge.accessor(getFormat, null, .{});
++    pub const codedWidth = bridge.accessor(getWidth, null, .{});
++    pub const codedHeight = bridge.accessor(getHeight, null, .{});
++    pub const codedRect = bridge.accessor(getCodedRect, null, .{});
++    pub const visibleRect = bridge.accessor(getVisibleRect, null, .{});
++    pub const displayWidth = bridge.accessor(getDisplayWidth, null, .{});
++    pub const displayHeight = bridge.accessor(getDisplayHeight, null, .{});
++    pub const timestamp = bridge.accessor(getTimestamp, null, .{});
++    pub const duration = bridge.accessor(getDuration, null, .{});
++    pub const colorSpace = bridge.accessor(getColorSpace, null, .{});
++    pub const allocationSize = bridge.function(Frame.allocationSize, .{});
++    pub const copyTo = bridge.function(Frame.copyTo, .{});
++    pub const clone = bridge.function(Frame.clone, .{});
++    pub const close = bridge.function(Frame.close, .{});
++};
++
++pub const ColorSpace = struct {
++    _data: ColorSpace.Init,
++    const Primaries = enum {
++        bt709,
++        bt470bg,
++        smpte170m,
++        bt2020,
++        smpte432,
++        pub const js_enum_from_string = true;
++    };
++    const Transfer = enum {
++        bt709,
++        smpte170m,
++        @"iec61966-2-1",
++        linear,
++        pq,
++        hlg,
++        pub const js_enum_from_string = true;
++    };
++    const Matrix = enum {
++        rgb,
++        bt709,
++        bt470bg,
++        smpte170m,
++        @"bt2020-ncl",
++        pub const js_enum_from_string = true;
++    };
++    pub const Init = struct { fullRange: ?bool = null, matrix: ?Matrix = null, primaries: ?Primaries = null, transfer: ?Transfer = null };
++    fn init(options: ?ColorSpace.Init, exec: *js.Execution) !*ColorSpace {
++        return exec._factory.create(ColorSpace{ ._data = options orelse .{} });
++    }
++    fn getPrimaries(self: *const ColorSpace) ?[]const u8 {
++        return if (self._data.primaries) |value| @tagName(value) else null;
++    }
++    fn getTransfer(self: *const ColorSpace) ?[]const u8 {
++        return if (self._data.transfer) |value| @tagName(value) else null;
++    }
++    fn getMatrix(self: *const ColorSpace) ?[]const u8 {
++        return if (self._data.matrix) |value| @tagName(value) else null;
++    }
++    fn getFullRange(self: *const ColorSpace) ?bool {
++        return self._data.fullRange;
++    }
++    fn toJSON(self: *const ColorSpace, exec: *js.Execution) !js.Object {
++        const result = exec.js.local.?.newObject();
++        _ = try result.set("primaries", self.getPrimaries(), .{});
++        _ = try result.set("transfer", self.getTransfer(), .{});
++        _ = try result.set("matrix", self.getMatrix(), .{});
++        _ = try result.set("fullRange", self.getFullRange(), .{});
++        return result;
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(ColorSpace);
++        pub const Meta = struct {
++            pub const name = "VideoColorSpace";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const constructor = bridge.constructor(ColorSpace.init, .{});
++        pub const primaries = bridge.accessor(getPrimaries, null, .{});
++        pub const transfer = bridge.accessor(getTransfer, null, .{});
++        pub const matrix = bridge.accessor(getMatrix, null, .{});
++        pub const fullRange = bridge.accessor(getFullRange, null, .{});
++        pub const toJSON = bridge.function(ColorSpace.toJSON, .{});
++    };
++};

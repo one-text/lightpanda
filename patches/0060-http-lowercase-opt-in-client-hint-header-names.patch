@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 2 Nov 2026 13:44:54 -0300
+Subject: [PATCH] http: lowercase opt-in client-hint header names
+
+Match Chrome 154's HTTP/1.1 spelling for browser-generated opted-in
+sec-ch-ua-full-version-list, sec-ch-ua-model,
+sec-ch-ua-platform-version, dpr, device-memory, sec-ch-ua-arch and
+sec-ch-ua-bitness. Keep hint values, insertion order, Accept-CH persistence,
+trust and permissions gates unchanged. HTTP/2 already lowercases names.
+
+When a higher-priority explicit header replaces one of these generated
+hints, preserve the supplied name rather than inheriting the browser's
+lowercase spelling. Limit this ownership transition to the seven opt-in
+hint names; leave existing source precedence and other headers unchanged.
+
+Temporary fingerprint/ wire diagnostics compare Chrome, the previous
+binary and this build across TLS 1.3 HTTP/1.1, no ALPN, TLS 1.2 ECDSA and
+HTTP/2. They verify cold/opted-in navigation and fetch, exact casing,
+unchanged generated values/order, mixed-case and empty CDP overrides,
+redirects, repeated requests, empty Accept-CH reset, cross-origin policy
+and untrustworthy HTTP origin gating. All 1658 existing upstream tests
+and all eight repeated TLS scenarios (20 samples per browser) pass.
+No new unit tests.
+
+References: fingerprint/README.md; Chrome 154.0.8037.97 local wire captures.
+---
+ src/network/HttpClient.zig | 27 ++++++++++++++++++++-------
+ 1 file changed, 20 insertions(+), 7 deletions(-)
+
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index 54868fe..4c9bee4 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -1354,20 +1354,20 @@ fn setClientHintHeaders(transfer: *Transfer) !void {
+     }
+     const origin = try URL.getOrigin(transfer.arena.allocator(), transfer.req.url) orelse return;
+     if (hints.origins.get(origin)) |requested| {
+-        if (requested.full_version_list) try transfer.setHeader("Sec-CH-UA-Full-Version-List", lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .{});
+-        if (requested.model) try transfer.setHeader("Sec-CH-UA-Model", "\"\"", .{});
+-        if (requested.platform_version) try transfer.setHeader("Sec-CH-UA-Platform-Version", "\"\"", .{});
++        if (requested.full_version_list) try transfer.setHeader("sec-ch-ua-full-version-list", lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .{});
++        if (requested.model) try transfer.setHeader("sec-ch-ua-model", "\"\"", .{});
++        if (requested.platform_version) try transfer.setHeader("sec-ch-ua-platform-version", "\"\"", .{});
+         if (requested.dpr) {
+             const scale = owner.scope.session().browser.getViewport().scale;
+             // Chrome serializes DPR with six significant digits.
+             var buffer: [std.fmt.float.min_buffer_size]u8 = undefined;
+             const rounded = try std.fmt.parseFloat(f64, try std.fmt.float.render(&buffer, @as(f64, scale), .{ .precision = 5 }));
+             const value = try std.fmt.allocPrint(transfer.arena.allocator(), "{d}", .{rounded});
+-            try transfer.setHeader("DPR", value, .{});
++            try transfer.setHeader("dpr", value, .{});
+         }
+-        if (requested.device_memory) try transfer.setHeader("Device-Memory", lp.Config.HttpHeaders.device_memory_header, .{});
+-        if (requested.architecture) try transfer.setHeader("Sec-CH-UA-Arch", lp.Config.HttpHeaders.sec_ch_ua_arch, .{});
+-        if (requested.bitness) try transfer.setHeader("Sec-CH-UA-Bitness", lp.Config.HttpHeaders.sec_ch_ua_bitness, .{});
++        if (requested.device_memory) try transfer.setHeader("device-memory", lp.Config.HttpHeaders.device_memory_header, .{});
++        if (requested.architecture) try transfer.setHeader("sec-ch-ua-arch", lp.Config.HttpHeaders.sec_ch_ua_arch, .{});
++        if (requested.bitness) try transfer.setHeader("sec-ch-ua-bitness", lp.Config.HttpHeaders.sec_ch_ua_bitness, .{});
+     }
+ }
+ 
+@@ -4071,6 +4071,19 @@ pub const Transfer = struct {
+                 }
+                 return;
+             }
++            // An explicit override owns its spelling as well as its value;
++            // don't retain a browser-generated opt-in hint's lowercase name.
++            if (hdr.source == .user_agent and source != .user_agent and
++                (std.ascii.eqlIgnoreCase(name, "sec-ch-ua-full-version-list") or
++                    std.ascii.eqlIgnoreCase(name, "sec-ch-ua-model") or
++                    std.ascii.eqlIgnoreCase(name, "sec-ch-ua-platform-version") or
++                    std.ascii.eqlIgnoreCase(name, "dpr") or
++                    std.ascii.eqlIgnoreCase(name, "device-memory") or
++                    std.ascii.eqlIgnoreCase(name, "sec-ch-ua-arch") or
++                    std.ascii.eqlIgnoreCase(name, "sec-ch-ua-bitness")))
++            {
++                hdr.name = try self.arena.allocator().dupe(u8, name);
++            }
+             if (mode == .append and hdr.source == source) {
+                 const sep = if (std.ascii.eqlIgnoreCase(name, "cookie")) "; " else ", ";
+                 hdr.value = try std.fmt.allocPrint(self.arena.allocator(), "{s}{s}{s}", .{ hdr.value, sep, value });

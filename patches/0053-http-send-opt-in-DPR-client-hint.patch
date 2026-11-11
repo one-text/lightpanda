@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Sat, 31 Oct 2026 19:35:14 -0300
+Subject: [PATCH] http: send opt-in DPR client hint
+
+Honor DPR-only Accept-CH and emit the native viewport scale, default 2 for the Neo persona. Round to six significant digits as measured in Chrome, retaining numeric decimal serialization. Preserve generated-header recomputation, explicit overrides, origin/session and trust gates. JS, TLS and other hints are unchanged; add no tests. Reference: fingerprint/README.md.
+---
+ src/network/HttpClient.zig | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index fa115b2..44ee7ee 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -1174,6 +1174,7 @@ const RequestedHints = struct {
+     full_version_list: bool = false,
+     model: bool = false,
+     platform_version: bool = false,
++    dpr: bool = false,
+     device_memory: bool = false,
+     architecture: bool = false,
+     bitness: bool = false,
+@@ -1190,7 +1191,7 @@ pub const ClientHints = struct {
+     }
+ 
+     fn update(self: *ClientHints, allocator: Allocator, origin: []const u8, requested: RequestedHints) !void {
+-        if (!requested.full_version_list and !requested.model and !requested.platform_version and !requested.device_memory and !requested.architecture and !requested.bitness) {
++        if (!requested.full_version_list and !requested.model and !requested.platform_version and !requested.dpr and !requested.device_memory and !requested.architecture and !requested.bitness) {
+             if (self.origins.fetchRemove(origin)) |removed| allocator.free(removed.key);
+         } else if (self.origins.getPtr(origin)) |existing| {
+             existing.* = requested;
+@@ -1285,6 +1286,8 @@ const ClientHintList = struct {
+                 requested.model = true;
+             } else if (std.ascii.eqlIgnoreCase(hint, "sec-ch-ua-platform-version")) {
+                 requested.platform_version = true;
++            } else if (std.ascii.eqlIgnoreCase(hint, "dpr")) {
++                requested.dpr = true;
+             } else if (std.ascii.eqlIgnoreCase(hint, "device-memory")) {
+                 requested.device_memory = true;
+             } else if (std.ascii.eqlIgnoreCase(hint, "sec-ch-ua-arch")) {
+@@ -1323,6 +1326,7 @@ fn setClientHintHeaders(transfer: *Transfer) !void {
+         if (hdr.source == .user_agent and (std.ascii.eqlIgnoreCase(hdr.name, "sec-ch-ua-full-version-list") or
+             std.ascii.eqlIgnoreCase(hdr.name, "sec-ch-ua-model") or
+             std.ascii.eqlIgnoreCase(hdr.name, "sec-ch-ua-platform-version") or
++            std.ascii.eqlIgnoreCase(hdr.name, "dpr") or
+             std.ascii.eqlIgnoreCase(hdr.name, "device-memory") or
+             std.ascii.eqlIgnoreCase(hdr.name, "sec-ch-ua-arch") or
+             std.ascii.eqlIgnoreCase(hdr.name, "sec-ch-ua-bitness")))
+@@ -1353,6 +1357,14 @@ fn setClientHintHeaders(transfer: *Transfer) !void {
+         if (requested.full_version_list) try transfer.setHeader("Sec-CH-UA-Full-Version-List", lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .{});
+         if (requested.model) try transfer.setHeader("Sec-CH-UA-Model", "\"\"", .{});
+         if (requested.platform_version) try transfer.setHeader("Sec-CH-UA-Platform-Version", "\"\"", .{});
++        if (requested.dpr) {
++            const scale = owner.scope.session().browser.getViewport().scale;
++            // Chrome serializes DPR with six significant digits.
++            var buffer: [std.fmt.float.min_buffer_size]u8 = undefined;
++            const rounded = try std.fmt.parseFloat(f64, try std.fmt.float.render(&buffer, @as(f64, scale), .{ .precision = 5 }));
++            const value = try std.fmt.allocPrint(transfer.arena.allocator(), "{d}", .{rounded});
++            try transfer.setHeader("DPR", value, .{});
++        }
+         if (requested.device_memory) try transfer.setHeader("Device-Memory", lp.Config.HttpHeaders.device_memory_header, .{});
+         if (requested.architecture) try transfer.setHeader("Sec-CH-UA-Arch", lp.Config.HttpHeaders.sec_ch_ua_arch, .{});
+         if (requested.bitness) try transfer.setHeader("Sec-CH-UA-Bitness", lp.Config.HttpHeaders.sec_ch_ua_bitness, .{});

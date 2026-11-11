@@ -1,0 +1,267 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 4 Nov 2026 15:11:21 -0300
+Subject: [PATCH] webapi: match Chrome broken-image dimensions
+
+Track current-generation image failures and expose a synthetic 16 CSS-pixel
+broken-image fallback without assigning natural dimensions or rendering an
+icon. Empty alt suppresses the unsized fallback. Reset failure state on
+source changes, including synchronous request-start failures.
+
+Share image sizing between native width/height getters and element geometry.
+Retain the existing unsigned-long reflection setters and their CE reactions;
+honor CSS/HTML explicit dimensions, natural aspect ratios, detached/hidden
+getter fallbacks, and whole-pixel image/offset dimensions. Detached images
+have no layout box. Update the existing detached successful-image assertion
+to expect its natural width; add no upstream tests.
+
+Dispatch by the HTMLImageElement subtype, not the tag enum shared with SVG.
+Invalidate cached document extents and schedule resize/intersection work in
+the owning frame on image completion, source resets and alt mutations, with
+teardown and request-generation guards intact.
+
+This is synthetic layout, not image decoding, icon rasterization, complete
+alt-text layout, or a general CSS replaced-element layout engine. The
+benchmark is unchanged. Reference behavior was captured with local desktop
+Chrome on Linux, not a macOS machine; the 16px fallback is in CSS pixels and
+does not introduce any host-derived hardware persona values.
+
+References:
+https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element
+https://drafts.csswg.org/cssom-view/#extensions-to-the-htmlimageelement-interface
+
+Validation: ReleaseFast build and all 1658 upstream tests pass. All 42
+temporary cases pass, including 33 exact Chrome reference matches and nine
+API-safety/observer/extent checks. The benchmark improves from 112/130 to
+113/130 (86.92%), with only broken-image-dimensions changing verdict.
+One reviewer pass found unsafe SVG dispatch and missing layout invalidation;
+both were fixed and validated before export.
+---
+ src/browser/frame/resource_load.zig           |  2 +
+ .../tests/element/html/image_fetch.html       |  2 +-
+ src/browser/webapi/Element.zig                | 10 ++-
+ src/browser/webapi/element/html/Image.zig     | 89 ++++++++++++++++++-
+ 4 files changed, 98 insertions(+), 5 deletions(-)
+
+diff --git a/src/browser/frame/resource_load.zig b/src/browser/frame/resource_load.zig
+index 04af69a..163e82f 100644
+--- a/src/browser/frame/resource_load.zig
++++ b/src/browser/frame/resource_load.zig
+@@ -176,12 +176,14 @@ const ImageLoad = struct {
+         const current = self.generation == img._generation;
+         if (current) {
+             img._complete = true;
++            img._broken = kind == .@"error";
+             if (kind == .load) {
+                 if (self.dimensions) |dimensions| {
+                     img._natural_width = dimensions.width;
+                     img._natural_height = dimensions.height;
+                 }
+             }
++            img.sizeChanged(frame);
+         }
+ 
+         // Released before anything below, because everything below can run JS
+diff --git a/src/browser/tests/element/html/image_fetch.html b/src/browser/tests/element/html/image_fetch.html
+index 74fc630..4739a36 100644
+--- a/src/browser/tests/element/html/image_fetch.html
++++ b/src/browser/tests/element/html/image_fetch.html
+@@ -28,7 +28,7 @@
+     testing.expectEqual("load", evt);
+     testing.expectEqual(1000, img.naturalWidth);
+     testing.expectEqual(750, img.naturalHeight);
+-    testing.expectEqual(0, img.width); // Natural size does not set HTML attributes.
++    testing.expectEqual(1000, img.width); // Detached images expose natural dimensions.
+   });
+ </script>
+ 
+diff --git a/src/browser/webapi/Element.zig b/src/browser/webapi/Element.zig
+index 52da6a2..e6168ea 100644
+--- a/src/browser/webapi/Element.zig
++++ b/src/browser/webapi/Element.zig
+@@ -1473,6 +1473,7 @@ pub fn hasPointerEventsNone(self: *Element, frame: *Frame) bool {
+ }
+ 
+ pub fn isVisible(self: *Element, frame: *Frame) bool {
++    if (self.is(Html.Image) != null and !self.asNode().isConnected()) return false;
+     const owner = self.ownerFrame(frame) orelse return false;
+     return !owner._style_manager.isHidden(self, .{});
+ }
+@@ -1506,6 +1507,9 @@ pub const Axis = enum {
+ 
+ pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.State {
+     const tag = self.getTag();
++    if (self.is(Html.Image)) |image| {
++        return .{ .value = image.layoutAxis(frame, axis), .explicit = true };
++    }
+     const root = self.isRootContainer();
+ 
+     if (self.ownerFrame(frame)) |owner| {
+@@ -1812,14 +1816,16 @@ pub fn getOffsetHeight(self: *Element, frame: *Frame) f64 {
+     if (!self.isVisible(frame)) {
+         return 0.0;
+     }
+-    return self.boxAxis(frame, .height);
++    const size = self.boxAxis(frame, .height);
++    return if (self.is(Html.Image) != null) @round(size) else size;
+ }
+ 
+ pub fn getOffsetWidth(self: *Element, frame: *Frame) f64 {
+     if (!self.isVisible(frame)) {
+         return 0.0;
+     }
+-    return self.boxAxis(frame, .width);
++    const size = self.boxAxis(frame, .width);
++    return if (self.is(Html.Image) != null) @round(size) else size;
+ }
+ 
+ pub fn getOffsetTop(self: *Element, frame: *Frame) f64 {
+diff --git a/src/browser/webapi/element/html/Image.zig b/src/browser/webapi/element/html/Image.zig
+index 5c8454b..a60cd8b 100644
+--- a/src/browser/webapi/element/html/Image.zig
++++ b/src/browser/webapi/element/html/Image.zig
+@@ -26,6 +26,7 @@ const Factory = @import("../../../Factory.zig");
+ const Node = @import("../../Node.zig");
+ const Element = @import("../../Element.zig");
+ const HtmlElement = @import("../Html.zig");
++const reflection = @import("../reflection.zig");
+ 
+ const Picture = @import("Picture.zig");
+ const Source = @import("Source.zig");
+@@ -42,6 +43,7 @@ _generation: u32 = 0,
+ _complete: bool = true,
+ _natural_width: u32 = 0,
+ _natural_height: u32 = 0,
++_broken: bool = false,
+ // Hash of the URL the last update selected, so a <picture> mutation that
+ // leaves the selection unchanged doesn't restart the load.
+ _selected_hash: u64 = 0,
+@@ -102,6 +104,76 @@ fn setLoading(self: *Image, value: []const u8, frame: *Frame) !void {
+     try self.asElement().setAttributeSafe(comptime .wrap("loading"), .wrap(value), frame);
+ }
+ 
++fn getWidth(self: *Image, frame: *Frame) u32 {
++    return self.getAxis(frame, .width);
++}
++
++fn getHeight(self: *Image, frame: *Frame) u32 {
++    return self.getAxis(frame, .height);
++}
++
++fn getAxis(self: *Image, frame: *Frame, comptime axis: Element.Axis) u32 {
++    const element = self.asElement();
++    if (element.asNode().isConnected() and element.isVisible(frame)) {
++        const size = self.layoutAxis(frame, axis);
++        return @intFromFloat(std.math.clamp(@round(size), 0, std.math.maxInt(u32)));
++    }
++    return self.attributeAxis(axis) orelse switch (axis) {
++        .width => self._natural_width,
++        .height => self._natural_height,
++    };
++}
++
++fn attributeAxis(self: *Image, comptime axis: Element.Axis) ?u32 {
++    const text = self.asElement().getAttributeInterned(@tagName(axis)) orelse return null;
++    const value = reflection.parseInteger(text) orelse return null;
++    if (value < 0 or value > std.math.maxInt(i32)) return null;
++    return @intCast(value);
++}
++
++fn specifiedAxis(self: *Image, frame: *Frame, comptime axis: Element.Axis) ?f64 {
++    const element = self.asElement();
++    if (element.ownerFrame(frame)) |owner| {
++        if (owner._style_manager.declaredSize(element, axis)) |size| return size;
++    }
++    return @floatFromInt(self.attributeAxis(axis) orelse return null);
++}
++
++// Shared by the IDL dimensions and synthetic geometry; no bitmap is rendered.
++pub fn layoutAxis(self: *Image, frame: *Frame, comptime axis: Element.Axis) f64 {
++    const width = self.specifiedAxis(frame, .width);
++    const height = self.specifiedAxis(frame, .height);
++    const specified = if (axis == .width) width else height;
++    if (width != null and height != null) return specified.?;
++
++    const natural = if (axis == .width) self._natural_width else self._natural_height;
++    const other_natural = if (axis == .width) self._natural_height else self._natural_width;
++    if (natural > 0 and other_natural > 0) {
++        if (specified) |size| return size;
++        if (if (axis == .width) height else width) |other| {
++            return other * @as(f64, @floatFromInt(natural)) / @as(f64, @floatFromInt(other_natural));
++        }
++        return @floatFromInt(natural);
++    }
++
++    // Chrome's unsized fallback is a 16 CSS-pixel icon, not a natural size.
++    // An empty alt suppresses the icon; one explicit axis alone is not a box.
++    if (self._broken) {
++        const alt = self.asElement().getAttributeInterned("alt");
++        if (alt == null or alt.?.len != 0) return 16;
++    }
++    return 0;
++}
++
++pub fn sizeChanged(self: *Image, frame: *Frame) void {
++    const element = self.asElement();
++    const owner = element.ownerFrame(frame) orelse return;
++    if (owner.isGoingAway() or !self.asNode().isConnected()) return;
++    owner.styleChanged();
++    Frame.observers.scheduleResizeDelivery(owner);
++    Frame.observers.scheduleIntersectionChecks(owner);
++}
++
+ fn getNaturalWidth(self: *const Image) u32 {
+     return self._natural_width;
+ }
+@@ -138,6 +210,8 @@ fn imageAddedCallback(self: *Image, frame: *Frame) !void {
+     self._complete = true;
+     self._natural_width = 0;
+     self._natural_height = 0;
++    self._broken = false;
++    self.sizeChanged(frame);
+ 
+     const src = self.selectSource(frame);
+     self._selected_hash = std.hash.Wyhash.hash(0, src);
+@@ -152,6 +226,9 @@ fn imageAddedCallback(self: *Image, frame: *Frame) !void {
+ 
+     Frame.resource_load.image(frame, self, src) catch |err| {
+         log.debug(.http, "image fetch", .{ .err = err, .src = src });
++        self._complete = true;
++        self._broken = true;
++        self.sizeChanged(frame);
+         return frame.queueElementEvent(Factory.protoOf(self), .@"error");
+     };
+ }
+@@ -381,8 +458,14 @@ pub const JsApi = struct {
+     pub const src = bridge.accessor(Image.getSrc, Image.setSrc, .{ .ce_reactions = true });
+     pub const currentSrc = bridge.accessor(Image.getCurrentSrc, null, .{});
+     pub const alt = reflect.string("alt");
+-    pub const width = reflect.unsignedLong("width", .{});
+-    pub const height = reflect.unsignedLong("height", .{});
++    pub const width: js.bridge.Accessor = .{
++        .getter = bridge.accessor(Image.getWidth, null, .{}).getter,
++        .setter = reflect.unsignedLong("width", .{}).setter,
++    };
++    pub const height: js.bridge.Accessor = .{
++        .getter = bridge.accessor(Image.getHeight, null, .{}).getter,
++        .setter = reflect.unsignedLong("height", .{}).setter,
++    };
+     pub const crossOrigin = reflect.enumerated("crossorigin", &.{ "anonymous", "use-credentials" }, .{ .missing = null, .nullable = true, .invalid = "anonymous" });
+     pub const loading = bridge.accessor(Image.getLoading, Image.setLoading, .{ .ce_reactions = true });
+     const reflect = Element.Reflect(Image);
+@@ -418,6 +501,7 @@ pub const Build = struct {
+ 
+     pub fn attributeChange(element: *Element, name: String, _: String, frame: *Frame) !void {
+         if (!isSourceAttribute(name)) {
++            if (name.eql(comptime .wrap("alt"))) element.as(Image).sizeChanged(frame);
+             return;
+         }
+         return element.as(Image).imageAddedCallback(frame);
+@@ -427,6 +511,7 @@ pub const Build = struct {
+     // has to be invalidated.
+     pub fn attributeRemove(element: *Element, name: String, frame: *Frame) !void {
+         if (!isSourceAttribute(name)) {
++            if (name.eql(comptime .wrap("alt"))) element.as(Image).sizeChanged(frame);
+             return;
+         }
+         return element.as(Image).imageAddedCallback(frame);

@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 14 Oct 2026 13:16:12 -0300
+Subject: [PATCH] webapi: spoof Neo storage estimates natively
+
+Report a fixed normal-profile quota of 153,600,000,000 bytes, modeled as
+60% of the base MacBook Neo's 256GB decimal SSD. Keep fresh-origin usage
+at zero rather than leaking the container filesystem or sizing quota
+from the spoofed JavaScript heap.
+
+Resolve estimate() with a fresh plain Chrome-shaped dictionary containing
+quota, usage and empty usageDetails. Define own writable, enumerable and
+configurable data properties so inherited setters and read-only prototype
+properties cannot interfere with dictionary construction. Remove the
+nonstandard StorageEstimate interface wrapper.
+
+Use the ordinary StorageManager native receiver mapping instead of the
+empty-object shortcut, so invalid receivers reject with TypeError.
+Window and worker scopes continue to share the same implementation.
+Update the existing navigator quota assertion; add no unit tests.
+
+The quota is a plausible fixed persona estimate, not measured usable
+disk capacity, storage reservation, persistence or usage accounting.
+
+References:
+https://www.apple.com/macbook-neo/specs/
+https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria
+https://storage.spec.whatwg.org/#dictdef-storageestimate
+https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/modules/quota/storage_manager.cc
+https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/modules/quota/storage_estimate.idl
+---
+ src/browser/tests/navigator/navigator.html |  2 +-
+ src/browser/webapi/StorageManager.zig      | 44 +++++-----------------
+ 2 files changed, 11 insertions(+), 35 deletions(-)
+
+diff --git a/src/browser/tests/navigator/navigator.html b/src/browser/tests/navigator/navigator.html
+index a815a99..54cc22c 100644
+--- a/src/browser/tests/navigator/navigator.html
++++ b/src/browser/tests/navigator/navigator.html
+@@ -109,7 +109,7 @@
+ 
+     await state.done(() =>{
+       testing.expectEqual(0, estimate.usage);
+-      testing.expectEqual(1024 * 1024 * 1024, estimate.quota);
++      testing.expectEqual(153_600_000_000, estimate.quota);
+     });
+   }
+ </script>
+diff --git a/src/browser/webapi/StorageManager.zig b/src/browser/webapi/StorageManager.zig
+index 3573fcb..dc37891 100644
+--- a/src/browser/webapi/StorageManager.zig
++++ b/src/browser/webapi/StorageManager.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -19,53 +20,28 @@
+ const js = @import("../js/js.zig");
+ const Execution = js.Execution;
+ 
+-pub fn registerTypes() []const type {
+-    return &.{ StorageManager, StorageEstimate };
+-}
+-
+ const StorageManager = @This();
+ 
+ _pad: bool = false,
+ 
++const neo_quota_bytes: u64 = 256_000_000_000 * 3 / 5;
++
+ fn estimate(_: *const StorageManager, exec: *const Execution) !js.Promise {
+-    const est = try exec._factory.create(StorageEstimate{
+-        ._usage = 0,
+-        ._quota = 1024 * 1024 * 1024, // 1 GiB
+-    });
+-    return exec.js.local.?.resolvePromise(est);
++    const local = exec.js.local.?;
++    const result = local.newObject();
++    const quota_defined = result.defineOwnProperty("quota", try local.zigValueToJs(neo_quota_bytes, .{}), 0) orelse return error.JsException;
++    const usage_defined = result.defineOwnProperty("usage", try local.zigValueToJs(@as(u64, 0), .{}), 0) orelse return error.JsException;
++    const details_defined = result.defineOwnProperty("usageDetails", local.newObject().toValue(), 0) orelse return error.JsException;
++    if (!quota_defined or !usage_defined or !details_defined) return error.TypeError;
++    return local.resolvePromise(result);
+ }
+ 
+-const StorageEstimate = struct {
+-    _quota: u64,
+-    _usage: u64,
+-
+-    fn getUsage(self: *const StorageEstimate) u64 {
+-        return self._usage;
+-    }
+-
+-    fn getQuota(self: *const StorageEstimate) u64 {
+-        return self._quota;
+-    }
+-
+-    pub const JsApi = struct {
+-        pub const bridge = js.Bridge(StorageEstimate);
+-        pub const Meta = struct {
+-            pub const name = "StorageEstimate";
+-            pub const prototype_chain = bridge.prototypeChain();
+-            pub var class_id: bridge.ClassId = undefined;
+-        };
+-        pub const quota = bridge.accessor(getQuota, null, .{});
+-        pub const usage = bridge.accessor(getUsage, null, .{});
+-    };
+-};
+-
+ pub const JsApi = struct {
+     pub const bridge = js.Bridge(StorageManager);
+     pub const Meta = struct {
+         pub const name = "StorageManager";
+         pub const prototype_chain = bridge.prototypeChain();
+         pub var class_id: bridge.ClassId = undefined;
+-        pub const empty_with_no_proto = true;
+     };
+     pub const estimate = bridge.function(StorageManager.estimate, .{});
+ };

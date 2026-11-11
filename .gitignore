@@ -1,0 +1,7 @@
+node_modules/
+dist/
+reports/
+*.log
+.build/
+tests/__pycache__/
+.playwright-cli

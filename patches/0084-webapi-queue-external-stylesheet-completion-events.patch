@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 10 Nov 2026 00:05:33 -0300
+Subject: [PATCH] webapi: queue external stylesheet completion events
+
+Steam sign-in waits for stylesheet load promises before rendering its React
+login form. Inline load dispatch during appendChild runs before the site
+attaches its listeners and leaves those promises pending.
+
+Queue successful and handled error completions while retaining synchronous
+fetch and parsing. Recheck load-listener presence per event, and drain
+completions queued by handlers before window.load.
+
+Validated with 1658 existing upstream tests, temporary load/error ordering
+pages, and the unchanged Steam sign-in compatibility contract (all four
+assertions pass). No new unit tests or site-contract changes.
+---
+ src/browser/Frame.zig | 29 +++++++++++++++--------------
+ 1 file changed, 15 insertions(+), 14 deletions(-)
+
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index 195adf4..8a15b03 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -1478,9 +1478,11 @@ fn _documentIsComplete(self: *Frame) !void {
+     }
+     if (self.loadEventsAborted()) return;
+ 
+-    // Run element load/error events before window.load.
+-    try self.dispatchQueuedEvents();
+-    if (self.loadEventsAborted()) return;
++    // Completion handlers can enqueue more element events before window.load.
++    while (self._queued_events.items.len > 0) {
++        try self.dispatchQueuedEvents();
++        if (self.loadEventsAborted()) return;
++    }
+ 
+     // Dispatch window.load event.
+     const window_target = self.window.asEventTarget();
+@@ -2568,7 +2570,8 @@ pub fn queueHashChange(self: *Frame, old_url: []const u8, new_url: []const u8) !
+ // splitting by route anyway).
+ const MAX_STYLESHEET_BYTES: usize = 2 * 1024 * 1024;
+ 
+-// Synchronously fetch and parse an external `<link rel=stylesheet>`.
++// Fetch and parse an external `<link rel=stylesheet>` synchronously, but queue
++// completion events so listeners attached after insertion can observe them.
+ // href is passed in as an optimization since the [currently] only callsite has
+ // it, so why look it up again?
+ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []const u8) !void {
+@@ -2596,7 +2599,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
+ 
+     const resolved = URL.resolve(arena.allocator(), self.base(), href, .{ .encoding = self.charset }) catch |err| {
+         log.debug(.http, "external stylesheet resolve", .{ .err = err, .href = href });
+-        try self.fireElementEvent(element, comptime .wrap("error"));
++        try self.queueElementEvent(Factory.protoOf(link), .@"error");
+         return;
+     };
+ 
+@@ -2617,7 +2620,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
+         .shutdown_callback = HttpClient.noopShutdown, // syncRequest installs its own
+     }, &self._http_owner) catch |err| {
+         log.debug(.http, "external stylesheet fetch", .{ .err = err, .url = resolved });
+-        return self.fireElementEvent(element, comptime .wrap("error"));
++        return self.queueElementEvent(Factory.protoOf(link), .@"error");
+     };
+     {
+         errdefer transfer.deinit();
+@@ -2639,13 +2642,13 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
+ 
+     var response = transfer.submitSync(.{}) catch |err| {
+         log.debug(.http, "external stylesheet fetch", .{ .err = err, .url = resolved });
+-        return self.fireElementEvent(element, comptime .wrap("error"));
++        return self.queueElementEvent(Factory.protoOf(link), .@"error");
+     };
+     defer response.deinit();
+ 
+     if (response.status < 200 or response.status >= 300) {
+         log.info(.http, "external stylesheet status", .{ .status = response.status, .url = resolved });
+-        return self.fireElementEvent(element, comptime .wrap("error"));
++        return self.queueElementEvent(Factory.protoOf(link), .@"error");
+     }
+ 
+     if (response.body.items.len > MAX_STYLESHEET_BYTES) {
+@@ -2654,7 +2657,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
+             .max = MAX_STYLESHEET_BYTES,
+             .url = resolved,
+         });
+-        return self.fireElementEvent(element, comptime .wrap("error"));
++        return self.queueElementEvent(Factory.protoOf(link), .@"error");
+     }
+ 
+     // Reuse the cached sheet on re-fetch (href mutation on a connected
+@@ -2683,11 +2686,11 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
+     // minimum.
+     sheet.replaceSync(response.body.items, self) catch |err| {
+         log.debug(.http, "external stylesheet parse", .{ .err = err, .url = resolved });
+-        return self.fireElementEvent(element, comptime .wrap("error"));
++        return self.queueElementEvent(Factory.protoOf(link), .@"error");
+     };
+     sheet._href = try self.arena.dupe(u8, resolved);
+ 
+-    try self.fireElementEvent(element, comptime .wrap("load"));
++    try self.queueLoad(Factory.protoOf(link));
+ }
+ 
+ fn fireElementEvent(self: *Frame, el: *Element, name: String) !void {
+@@ -2696,8 +2699,6 @@ fn fireElementEvent(self: *Frame, el: *Element, name: String) !void {
+ }
+ 
+ fn dispatchQueuedEvents(self: *Frame) !void {
+-    const has_dom_load_listener = self._event_manager.has_dom_load_listener;
+-
+     // Swap buffers - new additions during dispatch go to the other buffer
+     const to_process = self._queued_events;
+     self._queued_events = if (self._queued_events == &self._queued_events_1)
+@@ -2713,7 +2714,7 @@ fn dispatchQueuedEvents(self: *Frame) !void {
+             // access; a parsed `onload="..."` attribute is compiled lazily at
+             // dispatch (EventManager.getInlineHandler), so check it raw too.
+             .load => {
+-                if (has_dom_load_listener or
++                if (self._event_manager.has_dom_load_listener or
+                     html_element.hasAttributeFunction(.onload, self) or
+                     element.getAttributeSafe(comptime .wrap("onload")) != null)
+                 {

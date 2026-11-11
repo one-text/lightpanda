@@ -1,0 +1,534 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 5 Nov 2026 18:15:21 -0300
+Subject: [PATCH] webapi: mock Chrome close watcher and document PiP surfaces
+
+Fill the two missing interfaces in benchmark's chrome-window-features
+assertion without adding a renderer, OS window backend or platform close
+request manager. Keep the mocked interfaces together in CloseWatcher.zig
+and reuse native EventTarget, media_events and bridge bindings.
+
+CloseWatcher exposes requestClose/close/destroy and cancel/close handlers,
+with reentrancy guards and idempotent destruction. A JS-owned signal edge
+keeps AbortSignal alive; checking its state on programmatic close requests
+models silent abort destruction without a new native subscription system.
+The passive mock has no history-action activation, so cancel events are
+non-cancelable. There is no Escape/back-button or dialog/popover integration.
+
+DocumentPictureInPicture is a secure-context Window singleton with an idle
+null window, onenter and requestWindow. Convert options in Web IDL order,
+enforce dimension ranges and preserve getter exceptions as Promise
+rejections. Valid requests reject with a NotAllowedError DOMException;
+user-activated successful PiP windows are deliberately not simulated.
+Expose the companion event with its required Window payload. Capture native
+exposure descriptors before scripts run and restore them on origin changes
+without rereading page-controlled Window/Object globals.
+
+Validation: ReleaseFast build; 1658/1658 existing upstream tests; 100
+checks in ignored temporary secure/insecure diagnostics covering default
+constructors, forced GC, event order, abort, worker exposure, singleton
+identity, option conversion, Promise rejections and poisoned Window getter.
+The unmodified benchmark improves from 124/130 to 125/130 (96.15%), with
+chrome-window-features newly passing and no previous pass regressing.
+No unit tests or benchmark source changes are added.
+
+References:
+https://html.spec.whatwg.org/multipage/interaction.html#the-closewatcher-interface
+https://wicg.github.io/document-picture-in-picture/
+---
+ src/browser/js/Context.zig          |   6 +
+ src/browser/js/Env.zig              |   8 +
+ src/browser/js/bridge.zig           |   1 +
+ src/browser/webapi/CloseWatcher.zig | 271 ++++++++++++++++++++++++++++
+ src/browser/webapi/Event.zig        |   2 +
+ src/browser/webapi/EventTarget.zig  |  15 +-
+ src/browser/webapi/Window.zig       |   6 +
+ 7 files changed, 306 insertions(+), 3 deletions(-)
+ create mode 100644 src/browser/webapi/CloseWatcher.zig
+
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index 30886b1..bebd075 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -69,6 +69,8 @@ array_buffer_resizable: v8.Global,
+ // Native entries saved only while [SecureContext] battery APIs are hidden.
+ battery_bindings: ?struct { method: v8.Global, interface: v8.Global } = null,
+ web_share_bindings: ?[2]v8.Global = null,
++pip_bindings: ?[6]v8.Global = null,
++pip_hidden: bool = false,
+ media_device_bindings: ?struct {
+     descriptor: v8.Global,
+     define_property: v8.Global,
+@@ -269,6 +271,9 @@ pub fn deinit(self: *Context) void {
+     if (self.web_share_bindings) |*bindings| {
+         for (bindings) |*binding| v8.v8__Global__Reset(binding);
+     }
++    if (self.pip_bindings) |*bindings| {
++        for (bindings) |*binding| v8.v8__Global__Reset(binding);
++    }
+     if (self.media_device_bindings) |*bindings| {
+         v8.v8__Global__Reset(&bindings.descriptor);
+         v8.v8__Global__Reset(&bindings.define_property);
+@@ -321,6 +326,7 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
+             env.setVideoDecoderExposure(self, ls.local.handle, global_obj, secure);
+             env.setBatteryExposure(self, ls.local.handle, global_obj, secure);
+             env.setWebShareExposure(self, ls.local.handle, global_obj, secure);
++            try @import("../webapi/CloseWatcher.zig").expose(self, ls.local.handle, global_obj, secure);
+             try env.setMediaDevicesExposure(self, ls.local.handle, global_obj, secure);
+             // With the feature disabled, Env.createContext already hid this API.
+             if (!secure and self.page.session.experimental_features.serviceworker) {
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 0c6f4f4..28999a4 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -451,6 +451,11 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+     };
+     if (comptime !is_frame) try @import("../webapi/WebGPU.zig").expose(context, v8_context, global_obj, global._secure_context);
+ 
++    if (comptime is_frame) try @import("../webapi/CloseWatcher.zig").expose(context, v8_context, global_obj, global.isSecureContext());
++    errdefer if (context.pip_bindings) |*bindings| {
++        for (bindings) |*binding| v8.v8__Global__Reset(binding);
++    };
++
+     if (comptime is_frame) try self.captureEncryptedMediaBindings(context, v8_context, global_obj);
+     errdefer if (context.eme_bindings) |*bindings| {
+         for (bindings) |*binding| v8.v8__Global__Reset(binding);
+@@ -1127,6 +1132,7 @@ const PrivateSymbols = struct {
+     media_source_buffers: Private,
+     media_active_source_buffers: Private,
+     media_source_handle: Private,
++    document_picture_in_picture: Private,
+ 
+     fn init(isolate: *v8.Isolate) PrivateSymbols {
+         return .{
+@@ -1139,6 +1145,7 @@ const PrivateSymbols = struct {
+             .media_source_buffers = Private.init(isolate, "media_source_buffers"),
+             .media_active_source_buffers = Private.init(isolate, "media_active_source_buffers"),
+             .media_source_handle = Private.init(isolate, "media_source_handle"),
++            .document_picture_in_picture = Private.init(isolate, "document_picture_in_picture"),
+         };
+     }
+ 
+@@ -1152,6 +1159,7 @@ const PrivateSymbols = struct {
+         self.media_source_buffers.deinit();
+         self.media_active_source_buffers.deinit();
+         self.media_source_handle.deinit();
++        self.document_picture_in_picture.deinit();
+     }
+ };
+ 
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 356ef6f..db71d1e 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1029,6 +1029,7 @@ pub const SubType = enum {
+ 
+ // APIs for Page/Window contexts. Used by Snapshot.zig for Page snapshot creation.
+ pub const PageJsApis = flattenTypes(&.{
++    @import("../webapi/CloseWatcher.zig"),
+     @import("../webapi/WebRTC.zig"),
+     @import("../webapi/EncryptedMedia.zig"),
+     @import("../webapi/AudioContext.zig"),
+diff --git a/src/browser/webapi/CloseWatcher.zig b/src/browser/webapi/CloseWatcher.zig
+new file mode 100644
+index 0000000..4ff0457
+--- /dev/null
++++ b/src/browser/webapi/CloseWatcher.zig
+@@ -0,0 +1,271 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const Event = @import("Event.zig");
++const EventTarget = @import("EventTarget.zig");
++const DOMException = @import("DOMException.zig");
++const AbortSignal = @import("AbortSignal.zig");
++const Window = @import("Window.zig");
++const Events = @import("media_events.zig");
++const Speech = @import("SpeechSynthesis.zig");
++const Conversion = @import("media_constraints.zig");
++
++const CloseWatcher = @This();
++pub fn registerTypes() []const type {
++    return &.{ CloseWatcher, PictureInPicture, PictureInPictureEvent };
++}
++pub const Proto = EventTarget;
++_proto: *EventTarget,
++_arena: *lp.Arena,
++_rc: lp.RC = .{},
++_events: Events,
++_handlers: [2]Speech.Handler = undefined,
++_signal: ?*AbortSignal = null,
++_closed: bool = false,
++_requesting: bool = false,
++
++fn init(input: ?js.Value, exec: *js.Execution) !*CloseWatcher {
++    var signal: ?*AbortSignal = null;
++    if (try Conversion.dictionary(input)) |options| {
++        const value = try options.get("signal");
++        if (!value.isUndefined()) signal = try value.toZig(*AbortSignal);
++    }
++    const arena = try exec.getArena(.small, "CloseWatcher");
++    var owned = true;
++    errdefer if (owned) arena.release();
++    const self = try exec._factory.eventTargetWithAllocator(arena.allocator(), CloseWatcher{
++        ._proto = undefined,
++        ._arena = arena,
++        ._rc = lp.RC.init(1),
++        ._events = .init(arena),
++        ._signal = signal,
++    });
++    self._events.handlers(&self._handlers, &.{ "cancel", "close" }, self._proto);
++    owned = false;
++    defer self.releaseRef(exec.page);
++    const local = exec.js.local.?;
++    const data = try Speech.callbackData(self._proto, local);
++    if (signal) |s| {
++        // A JS edge keeps the signal alive without rooting callback cycles.
++        if (!(data.defineOwnProperty("signal", try local.zigValueToJs(s, .{}), 0) orelse false)) return error.JsException;
++    }
++    return self;
++}
++pub fn acquireRef(self: *CloseWatcher) void {
++    self._rc.acquire();
++}
++pub fn releaseRef(self: *CloseWatcher, page: *Page) void {
++    self._rc.release(self, page);
++}
++pub fn deinit(self: *CloseWatcher, _: *Page) void {
++    self._events.deinit(&self._handlers);
++    self._arena.release();
++}
++fn active(self: *const CloseWatcher) bool {
++    return !self._closed and (self._signal == null or !self._signal.?._aborted);
++}
++fn destroy(self: *CloseWatcher) void {
++    self._closed = true;
++}
++fn close(self: *CloseWatcher, exec: *js.Execution) !void {
++    if (!self.active() or self._requesting) return;
++    self.destroy();
++    try self._events.dispatch(try Event.initTrusted(comptime .wrap("close"), .{}, exec.page), exec);
++}
++fn requestClose(self: *CloseWatcher, exec: *js.Execution) !void {
++    if (!self.active() or self._requesting) return;
++    {
++        self._requesting = true;
++        defer self._requesting = false;
++        // Passive mock: no history-action activation or platform close requests.
++        try self._events.dispatch(try Event.initTrusted(comptime .wrap("cancel"), .{}, exec.page), exec);
++    }
++    try self.close(exec);
++}
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(CloseWatcher);
++    pub const Meta = struct {
++        pub const name = "CloseWatcher";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(init, .{});
++    pub const requestClose = bridge.function(CloseWatcher.requestClose, .{});
++    pub const close = bridge.function(CloseWatcher.close, .{});
++    pub const destroy = bridge.function(CloseWatcher.destroy, .{});
++    pub const oncancel = bridge.accessor(Speech.Binding(CloseWatcher, 0).get, Speech.Binding(CloseWatcher, 0).set, .{});
++    pub const onclose = bridge.accessor(Speech.Binding(CloseWatcher, 1).get, Speech.Binding(CloseWatcher, 1).set, .{});
++};
++
++pub const PictureInPicture = struct {
++    pub const Proto = EventTarget;
++    _proto: *EventTarget,
++    _arena: *lp.Arena,
++    _rc: lp.RC = .{},
++    _events: Events,
++    _handlers: [1]Speech.Handler = undefined,
++
++    pub fn init(exec: *js.Execution) !*PictureInPicture {
++        const arena = try exec.getArena(.small, "DocumentPictureInPicture");
++        errdefer arena.release();
++        const self = try exec._factory.eventTargetWithAllocator(arena.allocator(), PictureInPicture{
++            ._proto = undefined,
++            ._arena = arena,
++            ._events = .init(arena),
++        });
++        self._events.handlers(&self._handlers, &.{"enter"}, self._proto);
++        return self;
++    }
++    pub fn acquireRef(self: *PictureInPicture) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *PictureInPicture, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *PictureInPicture, _: *Page) void {
++        self._events.deinit(&self._handlers);
++        self._arena.release();
++    }
++    fn getWindow(_: *const PictureInPicture) ?*Window {
++        return null;
++    }
++    fn requestWindow(_: *PictureInPicture, input: ?js.Value, exec: *js.Execution) !js.Promise {
++        const local = exec.js.local.?;
++        var caught: js.TryCatch = undefined;
++        caught.init(local);
++        defer caught.deinit();
++        validate(input) catch |err| {
++            if (err == error.ExecutionTerminated or exec.js.env.terminatePending()) return error.ExecutionTerminated;
++            if (caught.exceptionValue()) |exception| {
++                const resolver = local.createPromiseResolver();
++                try resolver.rejectValue(exception);
++                return resolver.promise();
++            }
++            return err;
++        };
++        // No user activation or PiP window backend: model the passive Chrome path.
++        const resolver = local.createPromiseResolver();
++        resolver.reject("documentPictureInPicture.requestWindow", try exec._factory.create(DOMException.init("Document PiP requires user activation", "NotAllowedError")));
++        return resolver.promise();
++    }
++    fn validate(input: ?js.Value) !void {
++        const options = try Conversion.dictionary(input) orelse return;
++        _ = (try options.get("disallowReturnToOpener")).toBool();
++        try dimension(try options.get("height"));
++        _ = (try options.get("preferInitialWindowPlacement")).toBool();
++        try dimension(try options.get("width"));
++    }
++    fn dimension(value: js.Value) !void {
++        if (value.isUndefined()) return;
++        const number = @trunc(try value.toZig(f64));
++        if (!std.math.isFinite(number) or number < 0 or number >= 18446744073709551616.0) return error.TypeError;
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(PictureInPicture);
++        pub const Meta = struct {
++            pub const name = "DocumentPictureInPicture";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const requestWindow = bridge.function(PictureInPicture.requestWindow, .{});
++        pub const window = bridge.accessor(PictureInPicture.getWindow, null, .{});
++        pub const onenter = bridge.accessor(Speech.Binding(PictureInPicture, 0).get, Speech.Binding(PictureInPicture, 0).set, .{});
++    };
++};
++
++pub const PictureInPictureEvent = struct {
++    pub const Proto = Event;
++    _proto: *Event,
++    _window: *Window,
++    const Options = Event.inheritOptions(PictureInPictureEvent, struct { window: *Window });
++
++    fn init(typ: []const u8, options: Options, exec: *js.Execution) !*PictureInPictureEvent {
++        const arena = try exec.getArena(.tiny, "DocumentPictureInPictureEvent");
++        errdefer arena.release();
++        const event = try exec._factory.event(arena, try lp.String.init(arena.allocator(), typ, .{}), PictureInPictureEvent{
++            ._proto = undefined,
++            ._window = options.window,
++        });
++        Event.populatePrototypes(event, options, false);
++        return event;
++    }
++    pub fn asEvent(self: *PictureInPictureEvent) *Event {
++        return self._proto;
++    }
++    fn getWindow(self: *const PictureInPictureEvent) *Window {
++        return self._window;
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(PictureInPictureEvent);
++        pub const Meta = struct {
++            pub const name = "DocumentPictureInPictureEvent";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const constructor = bridge.constructor(PictureInPictureEvent.init, .{});
++        pub const window = bridge.accessor(PictureInPictureEvent.getWindow, null, .{});
++    };
++};
++
++// Preserve native descriptors across the initial opaque -> real origin change.
++pub fn expose(ctx: *js.Context, context: *const js.v8.Context, global: *const js.v8.Object, secure: bool) !void {
++    if (ctx.pip_bindings != null and secure == !ctx.pip_hidden) return;
++    const v8 = js.v8;
++    const isolate = ctx.isolate;
++    const names = .{ "DocumentPictureInPicture", "DocumentPictureInPictureEvent", "documentPictureInPicture", "documentPictureInPicture" };
++    if (ctx.pip_bindings == null) {
++        // Capture before page code can replace Window or Object.
++        const constructor = v8.v8__Object__Get(global, context, isolate.initStringHandle("Window")) orelse return error.JsException;
++        const prototype = v8.v8__Object__Get(@ptrCast(constructor), context, isolate.initStringHandle("prototype")) orelse return error.JsException;
++        const targets = [_]*const v8.Object{ global, global, global, @ptrCast(prototype) };
++        var bindings: [6]v8.Global = @splat(.{ .data_ptr = 0 });
++        errdefer for (&bindings) |*binding| v8.v8__Global__Reset(binding);
++        inline for (names, 0..) |name, i| {
++            const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(targets[i], context, isolate.initStringHandle(name)) orelse return error.JsException;
++            v8.v8__Global__New(isolate.handle, descriptor, &bindings[i]);
++        }
++        const object = v8.v8__Object__Get(global, context, isolate.initStringHandle("Object")) orelse return error.JsException;
++        const define = v8.v8__Object__Get(@ptrCast(object), context, isolate.initStringHandle("defineProperty")) orelse return error.JsException;
++        v8.v8__Global__New(isolate.handle, define, &bindings[4]);
++        v8.v8__Global__New(isolate.handle, prototype, &bindings[5]);
++        ctx.pip_bindings = bindings;
++    }
++    if (secure == !ctx.pip_hidden) return;
++    const prototype: *const v8.Object = @ptrCast(v8.v8__Global__Get(&ctx.pip_bindings.?[5], isolate.handle).?);
++    const targets = [_]*const v8.Object{ global, global, global, prototype };
++    inline for (names, 0..) |name, i| {
++        const key = isolate.initStringHandle(name);
++        if (secure) {
++            const descriptor = v8.v8__Global__Get(&ctx.pip_bindings.?[i], isolate.handle).?;
++            // Global interfaces can mirror the accessor only on the instance.
++            if (!v8.v8__Value__IsUndefined(descriptor)) {
++                const args = [_]?*const v8.Value{ @ptrCast(targets[i]), key, descriptor };
++                const define: *const v8.Function = @ptrCast(v8.v8__Global__Get(&ctx.pip_bindings.?[4], isolate.handle).?);
++                _ = v8.v8__Function__Call(define, context, @ptrCast(global), args.len, &args) orelse return error.JsException;
++            }
++        } else {
++            var result: v8.MaybeBool = undefined;
++            v8.v8__Object__Delete(targets[i], context, key, &result);
++            if (!result.has_value or !result.value) return error.JsException;
++        }
++    }
++    ctx.pip_hidden = !secure;
++}
+diff --git a/src/browser/webapi/Event.zig b/src/browser/webapi/Event.zig
+index b81107e..54d1879 100644
+--- a/src/browser/webapi/Event.zig
++++ b/src/browser/webapi/Event.zig
+@@ -84,6 +84,7 @@ const EventPhase = enum(u8) {
+ 
+ pub const Type = union(enum) {
+     generic,
++    document_picture_in_picture_event: *@import("CloseWatcher.zig").PictureInPictureEvent,
+     speech_synthesis_event: *@import("event/SpeechSynthesisEvent.zig"),
+     rtc_ice_event: *@import("WebRTC.zig").IceEvent,
+     error_event: *@import("event/ErrorEvent.zig"),
+@@ -205,6 +206,7 @@ pub fn relatedTargetPtr(self: *Event) ?*?*EventTarget {
+ pub fn is(self: *Event, comptime T: type) ?*T {
+     switch (self._type) {
+         .generic => return if (T == Event) self else null,
++        .document_picture_in_picture_event => |e| return if (T == @import("CloseWatcher.zig").PictureInPictureEvent) e else null,
+         .speech_synthesis_event => |e| return e.is(T),
+         .rtc_ice_event => |e| return if (T == @import("WebRTC.zig").IceEvent) e else null,
+         .error_event => |e| return if (T == @import("event/ErrorEvent.zig")) e else null,
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index ffc35fa..bb9b87f 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -73,6 +73,7 @@ const AudioContext = @import("AudioContext.zig");
+ const MediaKeySession = @import("EncryptedMedia.zig").Session;
+ const MediaSource = @import("MediaSource.zig");
+ const MediaRecorder = @import("MediaRecorder.zig");
++const CloseWatcher = @import("CloseWatcher.zig");
+ const MediaStream = @import("MediaStream.zig");
+ 
+ const EventTarget = @This();
+@@ -92,6 +93,8 @@ pub const Type = enum(u8) {
+     battery_manager,
+     broadcast_channel,
+     cookie_store,
++    close_watcher,
++    document_picture_in_picture,
+     event_source,
+     file_reader,
+     font_face_set,
+@@ -143,6 +146,8 @@ pub fn Subtype(comptime tag: Type) type {
+         .battery_manager => BatteryManager,
+         .broadcast_channel => BroadcastChannel,
+         .cookie_store => CookieStore,
++        .close_watcher => CloseWatcher,
++        .document_picture_in_picture => CloseWatcher.PictureInPicture,
+         .event_source => EventSource,
+         .file_reader => FileReader,
+         .font_face_set => FontFaceSet,
+@@ -246,7 +251,7 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
+     }
+ 
+     switch (self._type) {
+-        inline .media_source, .source_buffer_list, .media_recorder, .media_stream => |tag| {
++        inline .media_source, .source_buffer_list, .media_recorder, .media_stream, .close_watcher, .document_picture_in_picture => |tag| {
+             try self.subtype(Subtype(tag))._events.dispatch(event, exec);
+             return !event._cancelable or !event._prevent_default;
+         },
+@@ -367,7 +372,7 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
+         return;
+     }
+     switch (self._type) {
+-        inline .media_source, .source_buffer_list, .media_recorder, .media_stream => |tag| return self.subtype(Subtype(tag))._events.register(typ, em_callback, options, exec),
++        inline .media_source, .source_buffer_list, .media_recorder, .media_stream, .close_watcher, .document_picture_in_picture => |tag| return self.subtype(Subtype(tag))._events.register(typ, em_callback, options, exec),
+         .speech_synthesis => {
+             _ = try self.subtype(SpeechSynthesis)._events.register(self, typ, em_callback, options);
+             return;
+@@ -426,7 +431,7 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
+         return;
+     }
+     switch (self._type) {
+-        inline .media_source, .source_buffer_list, .media_recorder, .media_stream => |tag| {
++        inline .media_source, .source_buffer_list, .media_recorder, .media_stream, .close_watcher, .document_picture_in_picture => |tag| {
+             self.subtype(Subtype(tag))._events.remove(typ, em_callback, use_capture, exec);
+             return;
+         },
+@@ -476,6 +481,8 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         .media_source => writer.writeAll("<MediaSource>"),
+         .source_buffer_list => writer.writeAll("<SourceBufferList>"),
+         .media_recorder => writer.writeAll("<MediaRecorder>"),
++        .close_watcher => writer.writeAll("<CloseWatcher>"),
++        .document_picture_in_picture => writer.writeAll("<DocumentPictureInPicture>"),
+         .media_stream => writer.writeAll("<MediaStream>"),
+         .media_key_session => writer.writeAll("<MediaKeySession>"),
+         .media_query_list => writer.writeAll("<MediaQueryList>"),
+@@ -525,6 +532,8 @@ pub fn toString(self: *EventTarget) []const u8 {
+         .media_source => return "[object MediaSource]",
+         .source_buffer_list => return "[object SourceBufferList]",
+         .media_recorder => return "[object MediaRecorder]",
++        .close_watcher => return "[object CloseWatcher]",
++        .document_picture_in_picture => return "[object DocumentPictureInPicture]",
+         .media_stream => return "[object MediaStream]",
+         .media_key_session => return "[object MediaKeySession]",
+         .media_query_list => return "[object MediaQueryList]",
+diff --git a/src/browser/webapi/Window.zig b/src/browser/webapi/Window.zig
+index 2cda74c..b503d8b 100644
+--- a/src/browser/webapi/Window.zig
++++ b/src/browser/webapi/Window.zig
+@@ -52,6 +52,7 @@ const CustomElementRegistry = @import("CustomElementRegistry.zig");
+ const Selection = @import("Selection.zig");
+ const Timers = @import("Timers.zig");
+ const Scheduler = @import("Scheduler.zig");
++const PictureInPicture = @import("CloseWatcher.zig").PictureInPicture;
+ const Notification = @import("../../Notification.zig");
+ const SpeechSynthesis = @import("SpeechSynthesis.zig");
+ 
+@@ -275,6 +276,10 @@ fn getNavigator(self: *Window) *Navigator {
+     return self._navigator;
+ }
+ 
++fn getDocumentPictureInPicture(_: *Window, exec: *Execution) !*PictureInPicture {
++    return PictureInPicture.init(exec);
++}
++
+ fn getScheduler(self: *Window) *Scheduler {
+     return &self._scheduler;
+ }
+@@ -1247,6 +1252,7 @@ pub const JsApi = struct {
+     pub const parent = bridge.accessor(Window.getParent, Window.setParent, .{});
+     pub const navigator = bridge.accessor(Window.getNavigator, null, .{});
+     pub const scheduler = bridge.accessor(Window.getScheduler, null, .{});
++    pub const documentPictureInPicture = bridge.accessor(Window.getDocumentPictureInPicture, null, .{ .cache = .{ .private = "document_picture_in_picture" } });
+     pub const speechSynthesis = bridge.accessor(Window.getSpeechSynthesis, null, .{});
+     pub const screen = bridge.accessor(Window.getScreen, Window.setScreen, .{});
+     pub const visualViewport = bridge.accessor(Window.getVisualViewport, Window.setVisualViewport, .{});
