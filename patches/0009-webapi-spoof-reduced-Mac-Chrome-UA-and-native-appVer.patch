@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 13 Oct 2026 23:17:05 -0300
+Subject: [PATCH] webapi: spoof reduced Mac Chrome UA and native appVersion
+
+Use the existing Chrome 155 major-version constant to construct the
+shared default reduced desktop macOS User-Agent. Navigator, WorkerNavigator
+and HTTP request headers continue to use the effective HTTP-client UA,
+including the existing configuration and CDP override paths.
+
+Derive native appVersion from everything after the first slash in that
+same effective UA, matching Chromium NavigatorID, including custom UAs
+without a slash or with an empty suffix. Forward Execution through the
+existing WorkerNavigator getter; retain native read-only accessors.
+
+The frozen Intel Mac OS X 10_15_7 token is Chromium's compatibility format,
+not an Intel hardware claim or a pin of the actual macOS release. Keep the
+MacBook Neo / Apple A18 Pro / 8GB / 256GB persona and Chrome 155.0.8059.40
+high-entropy versions unchanged. Host-derived platform and architecture
+hints, CDP version identity and resource-loading policy remain out of scope.
+UA override security validation remains unchanged.
+
+Adjust existing navigator/fetch/XHR assertions for the spoofed default and
+the runner's internal-tester suffix. Detect the existing test harness using
+that suffix instead of the removed Lightpanda prefix so its checks remain
+active. Update the suffix help text; add no tests or benchmark changes.
+
+References:
+https://www.chromium.org/updates/ua-reduction/
+https://source.chromium.org/chromium/chromium/src/+/HEAD:third_party/blink/renderer/core/frame/navigator_id.cc
+---
+ src/Config.zig                             | 4 ++--
+ src/browser/tests/navigator/navigator.html | 4 ++--
+ src/browser/tests/net/fetch.html           | 4 ++--
+ src/browser/tests/net/xhr.html             | 4 ++--
+ src/browser/tests/testing.js               | 4 +++-
+ src/browser/webapi/Navigator.zig           | 6 ++++--
+ src/browser/webapi/WorkerNavigator.zig     | 4 ++--
+ src/help.zon                               | 4 +++-
+ 8 files changed, 20 insertions(+), 14 deletions(-)
+
+diff --git a/src/Config.zig b/src/Config.zig
+index 9c2ce36..6b74c25 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -984,7 +984,7 @@ pub const WaitUntil = enum {
+ /// HTTP header values shared across Http and Client.
+ /// Must be initialized with an allocator that outlives all HTTP connections.
+ pub const HttpHeaders = struct {
+-    const user_agent_base: [:0]const u8 = "Lightpanda/1.0";
++    const user_agent_base: [:0]const u8 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" ++ chrome_major_version ++ ".0.0.0 Safari/537.36";
+ 
+     const Brand = struct {
+         brand: [:0]const u8,
+@@ -1030,7 +1030,7 @@ pub const HttpHeaders = struct {
+     // Document-navigation Accept value Chrome sends.
+     pub const navigation_accept: [:0]const u8 = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+ 
+-    user_agent: [:0]const u8, // User agent value (e.g. "Lightpanda/1.0")
++    user_agent: [:0]const u8, // Effective User-Agent value
+ 
+     proxy_bearer_header: ?[:0]const u8,
+ 
+diff --git a/src/browser/tests/navigator/navigator.html b/src/browser/tests/navigator/navigator.html
+index 6f81195..f5daee5 100644
+--- a/src/browser/tests/navigator/navigator.html
++++ b/src/browser/tests/navigator/navigator.html
+@@ -6,9 +6,9 @@
+   // Navigator should be accessible from window
+   testing.expectEqual(navigator, window.navigator);
+   testing.expectEqual(true, navigator.userAgent.length > 0);
+-  testing.expectEqual(true, navigator.userAgent.includes('Lightpanda'));
++  testing.expectEqual('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 internal-tester', navigator.userAgent);
+   testing.expectEqual('Netscape', navigator.appName);
+-  testing.expectEqual('1.0', navigator.appVersion);
++  testing.expectEqual(navigator.userAgent.slice(navigator.userAgent.indexOf('/') + 1), navigator.appVersion);
+   testing.expectEqual(true, navigator.platform.length > 0);
+ 
+   // Platform should be one of the known values
+diff --git a/src/browser/tests/net/fetch.html b/src/browser/tests/net/fetch.html
+index 826f130..36b952d 100644
+--- a/src/browser/tests/net/fetch.html
++++ b/src/browser/tests/net/fetch.html
+@@ -479,8 +479,8 @@
+       testing.expectEqual('fr', got['accept-language']);
+       testing.expectEqual('a, b', got['x-multi']);
+       testing.expectEqual(undefined, got['cookie']);
+-      testing.expectEqual(true, got['user-agent'].includes('Lightpanda'));
+-      testing.expectEqual(false, got['user-agent'].includes('Mozilla'));
++      testing.expectEqual('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 internal-tester', got['user-agent']);
++      testing.expectEqual(navigator.userAgent, got['user-agent']);
+       testing.expectEqual('"Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"', got['sec-ch-ua']);
+     });
+   }
+diff --git a/src/browser/tests/net/xhr.html b/src/browser/tests/net/xhr.html
+index 6def224..b528ac0 100644
+--- a/src/browser/tests/net/xhr.html
++++ b/src/browser/tests/net/xhr.html
+@@ -631,8 +631,8 @@
+       }
+       testing.expectEqual('fr', got['accept-language']);
+       testing.expectEqual('a, b', got['x-multi']);
+-      testing.expectEqual(true, got['user-agent'].includes('Lightpanda'));
+-      testing.expectEqual(false, got['user-agent'].includes('Mozilla'));
++      testing.expectEqual('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 internal-tester', got['user-agent']);
++      testing.expectEqual(navigator.userAgent, got['user-agent']);
+       testing.expectEqual('"Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"', got['sec-ch-ua']);
+       testing.expectEqual(false, (got['cookie'] ?? '').includes('injected'));
+       testing.expectEqual(undefined, got['proxy-test']);
+diff --git a/src/browser/tests/testing.js b/src/browser/tests/testing.js
+index f53ea30..d1533bd 100644
+--- a/src/browser/tests/testing.js
++++ b/src/browser/tests/testing.js
+@@ -1,3 +1,5 @@
++// Brenno Flávio <contato@brennoflavio.com.br>
++
+ (() => {
+   let failed = false;
+   let observed_ids = {};
+@@ -148,7 +150,7 @@
+     console.warn('Pending count:', Array.from(async_pending.keys()));
+   }
+ 
+-  const IS_TEST_RUNNER = window.navigator.userAgent.startsWith("Lightpanda/");
++  const IS_TEST_RUNNER = window.navigator.userAgent.endsWith(" internal-tester");
+ 
+   window.testing = {
+     fail: fail,
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index ca36bda..fe2010d 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -76,8 +76,10 @@ pub fn getAppCodeName(_: *const Navigator) []const u8 {
+     return "Mozilla";
+ }
+ 
+-pub fn getAppVersion(_: *const Navigator) []const u8 {
+-    return "1.0";
++pub fn getAppVersion(self: *const Navigator, exec: *const Execution) []const u8 {
++    const agent = self.getUserAgent(exec);
++    const start = if (std.mem.indexOfScalar(u8, agent, '/')) |index| index + 1 else 0;
++    return agent[start..];
+ }
+ 
+ pub fn getLanguage(self: *const Navigator, exec: *const Execution) []const u8 {
+diff --git a/src/browser/webapi/WorkerNavigator.zig b/src/browser/webapi/WorkerNavigator.zig
+index 6768811..477434c 100644
+--- a/src/browser/webapi/WorkerNavigator.zig
++++ b/src/browser/webapi/WorkerNavigator.zig
+@@ -59,8 +59,8 @@ fn getAppCodeName(_: *const WorkerNavigator) []const u8 {
+     return Navigator.getAppCodeName(&Navigator.init);
+ }
+ 
+-fn getAppVersion(_: *const WorkerNavigator) []const u8 {
+-    return Navigator.getAppVersion(&Navigator.init);
++fn getAppVersion(_: *const WorkerNavigator, exec: *const Execution) []const u8 {
++    return Navigator.getAppVersion(&Navigator.init, exec);
+ }
+ 
+ fn getLanguage(_: *const WorkerNavigator, exec: *const Execution) []const u8 {
+diff --git a/src/help.zon b/src/help.zon
+index d00ecca..8489a6d 100644
+--- a/src/help.zon
++++ b/src/help.zon
+@@ -1,3 +1,5 @@
++// Brenno Flávio <contato@brennoflavio.com.br>
++
+ .{
+     //                                                                     MAX_HELP_LEN|
+     .general =
+@@ -530,7 +532,7 @@
+     \\          browsers; any value containing "Mozilla" is forbidden. The browser
+     \\          still sends Sec-Ch-Ua. Incompatible with --user-agent-suffix.
+     \\  --user-agent-suffix <STRING>
+-    \\          Suffix appended to the Lightpanda/X.Y User-Agent.
++    \\          Suffix appended to the default User-Agent.
+     \\  --v8-flags-unsafe <FLAGS>
+     \\          Flags passed as-is to the V8 JavaScript engine, space-separated.
+     \\          e.g. --v8-flags-unsafe "--expose-gc --stack-size 1000".

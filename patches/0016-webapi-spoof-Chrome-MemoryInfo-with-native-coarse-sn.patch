@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 14 Oct 2026 12:22:04 -0300
+Subject: [PATCH] webapi: spoof Chrome MemoryInfo with native coarse snapshots
+
+Expose Performance.prototype.memory only in Window realms and return a fresh
+native MemoryInfo wrapper per read. Implement all three enumerable read-only
+prototype getters with coherent fixed bucketed values: totalJSHeapSize and
+usedJSHeapSize are 10,000,000 bytes; jsHeapSizeLimit is 3,760,000,000 bytes.
+
+Keep the base MacBook Neo / A18 Pro / 8GB RAM / 256GB SSD persona. These are
+spoofed Chrome coarse readings, not measurements from a Neo, host RAM,
+container memory or the actual V8 heap. Chrome's precise-versus-bucketed mode
+depends on process site-locking; no site-lock/precise/live-usage simulation is
+introduced here. Leave StorageManager's quota and the real V8 cap unchanged.
+
+Add opt-in LegacyNoInterfaceObject metadata to snapshot installation: retain
+the native template and MemoryInfo brand, omit the global interface and its
+prototype's own constructor. Other interfaces keep their existing behavior.
+Use the Performance receiver wrapper's realm and weak RC finalization so
+fresh snapshots are collectible and held snapshots survive GC/frame removal.
+
+Current Chromium IDL/source plus native Chrome 154 diagnostics confirm the
+shape: fresh wrappers, inherited Object constructor, brand/descriptors,
+native illegal-receiver errors and receiver-realm behavior. The page persona
+remains the existing Chrome 155; the fixed values are an observed coarse
+Chrome profile, not a pinned macOS-specific precise limit.
+
+References:
+https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/core/timing/memory_info.idl
+https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/core/timing/window_performance.cc
+https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/renderer/core/timing/memory_info.cc
+
+Validation: release build, 1658 existing upstream tests, and 44 temporary
+native-shape/realm/worker/isolated-world/navigation/GC checks pass. Diagnostics
+use iframe/worker resource loading and expose-gc only for coverage; benchmark
+validation uses the standard server command. No new tests or benchmark edits.
+---
+ src/browser/js/Snapshot.zig        | 12 +++++-
+ src/browser/webapi/Performance.zig | 63 +++++++++++++++++++++++++++++-
+ 2 files changed, 73 insertions(+), 2 deletions(-)
+
+diff --git a/src/browser/js/Snapshot.zig b/src/browser/js/Snapshot.zig
+index 220496e..8a471c7 100644
+--- a/src/browser/js/Snapshot.zig
++++ b/src/browser/js/Snapshot.zig
+@@ -326,7 +326,8 @@ fn createSnapshotContext(
+         @setEvalBranchQuota(10_000);
+         const template_index = comptime bridge.JsApiLookup.getId(JsApi);
+         const func = v8.v8__FunctionTemplate__GetFunction(templates[template_index], context);
+-        if (@hasDecl(JsApi.Meta, "name")) {
++        const no_interface_object = comptime @hasDecl(JsApi.Meta, "no_interface_object") and JsApi.Meta.no_interface_object;
++        if (@hasDecl(JsApi.Meta, "name") and !no_interface_object) {
+             const name = JsApi.Meta.name;
+             const v8_class_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+             var maybe_result: v8.MaybeBool = undefined;
+@@ -342,6 +343,15 @@ fn createSnapshotContext(
+             }
+         }
+ 
++        if (no_interface_object) {
++            // [LegacyNoInterfaceObject] also omits prototype.constructor.
++            const proto = v8.v8__Object__Get(@ptrCast(func), context, prototype_key) orelse return error.PrototypeLookupFailed;
++            const constructor_key = v8.v8__String__NewFromUtf8(isolate, "constructor", v8.kNormal, 11);
++            var result: v8.MaybeBool = undefined;
++            v8.v8__Object__Delete(@ptrCast(proto), context, constructor_key, &result);
++            if (!result.has_value or !result.value) return error.ConstructorDeleteFailed;
++        }
++
+         if (comptime @hasDecl(JsApi.Meta, "array_iterator") and JsApi.Meta.array_iterator) {
+             // Use the realm's intrinsic, not a custom callback or injected JS.
+             const array = v8.v8__Array__New(isolate, 0).?;
+diff --git a/src/browser/webapi/Performance.zig b/src/browser/webapi/Performance.zig
+index a4bc5d5..cf68371 100644
+--- a/src/browser/webapi/Performance.zig
++++ b/src/browser/webapi/Performance.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -21,6 +22,7 @@ const lp = @import("lightpanda");
+ 
+ const js = @import("../js/js.zig");
+ const Factory = @import("../Factory.zig");
++const Page = @import("../Page.zig");
+ const Scheduler = @import("../js/Scheduler.zig");
+ 
+ const Event = @import("Event.zig");
+@@ -37,7 +39,7 @@ const DEFAULT_RESOURCE_BUFFER_SIZE = 250;
+ const BUFFER_FULL = "resourcetimingbufferfull";
+ 
+ pub fn registerTypes() []const type {
+-    return &.{ Performance, Entry, Mark, Measure, ResourceTiming, PerformanceTiming, PerformanceNavigation };
++    return &.{ Performance, Entry, Mark, Measure, ResourceTiming, PerformanceTiming, PerformanceNavigation, MemoryInfo };
+ }
+ 
+ const Performance = @This();
+@@ -106,6 +108,10 @@ pub fn getTiming(self: *Performance) *PerformanceTiming {
+     return &self._timing;
+ }
+ 
++fn getMemory(self: *Performance) !*MemoryInfo {
++    return self._factory.create(MemoryInfo{ ._performance = self });
++}
++
+ pub fn now(self: *const Performance) f64 {
+     const current = highResTimestamp();
+     const elapsed = current - self._time_origin;
+@@ -752,11 +758,66 @@ pub const JsApi = struct {
+     pub const getEntriesByName = bridge.function(Performance.getEntriesByName, .{});
+     pub const timeOrigin = bridge.accessor(Performance.getTimeOrigin, null, .{});
+     pub const timing = bridge.accessor(Performance.getTiming, null, .{ .exposed = .window });
++    pub const memory = bridge.accessor(Performance.getMemory, null, .{ .exposed = .window });
+     pub const navigation = bridge.accessor(Performance.getNavigation, null, .{ .exposed = .window });
+     pub const eventCounts = bridge.accessor(Performance.getEventCounts, null, .{ .exposed = .window });
+     pub const onresourcetimingbufferfull = bridge.accessor(Performance.getOnResourceTimingBufferFull, Performance.setOnResourceTimingBufferFull, .{});
+ };
+ 
++const MemoryInfo = struct {
++    _performance: *Performance,
++    _rc: lp.RC = .{},
++
++    pub fn acquireRef(self: *MemoryInfo) void {
++        self._rc.acquire();
++    }
++
++    pub fn releaseRef(self: *MemoryInfo, page: *Page) void {
++        self._rc.release(self, page);
++    }
++
++    pub fn deinit(self: *MemoryInfo, page: *Page) void {
++        page.factory.destroyStandalone(self);
++    }
++
++    pub fn creationContext(self: *const MemoryInfo, local: *const js.Local) *const js.v8.Context {
++        if (local.ctx.identity.identity_map.getPtr(@intFromPtr(self._performance))) |global| {
++            const wrapper = js.v8.v8__Global__Get(global, local.isolate.handle).?;
++            return js.v8.v8__Object__GetCreationContext(@ptrCast(wrapper)).?;
++        }
++        return local.handle;
++    }
++
++    // A fixed coarse Chrome snapshot, independent of host/container memory.
++    fn getTotalJSHeapSize(_: *const MemoryInfo) u64 {
++        return 10_000_000;
++    }
++
++    fn getUsedJSHeapSize(_: *const MemoryInfo) u64 {
++        return 10_000_000;
++    }
++
++    fn getJSHeapSizeLimit(_: *const MemoryInfo) u64 {
++        return 3_760_000_000;
++    }
++
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(MemoryInfo);
++
++        pub const Meta = struct {
++            pub const name = "MemoryInfo";
++            pub const no_interface_object = true;
++            pub const creation_context = MemoryInfo.creationContext;
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++
++        pub const totalJSHeapSize = bridge.accessor(getTotalJSHeapSize, null, .{});
++        pub const usedJSHeapSize = bridge.accessor(getUsedJSHeapSize, null, .{});
++        pub const jsHeapSizeLimit = bridge.accessor(getJSHeapSizeLimit, null, .{});
++    };
++};
++
+ pub const Entry = struct {
+     _duration: f64 = 0.0,
+     _type: Type,

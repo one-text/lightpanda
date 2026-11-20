@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 29 Oct 2026 16:29:48 -0300
+Subject: [PATCH] tls: enable native TLS 1.2 session tickets
+
+Curl disables RFC 5077 tickets before the SSL-context callback. Clear only SSL_OP_NO_TICKET via the pinned BoringSSL uint32 API; keep ticket receipt, serialization, expiry, selection and cleanup in the existing multi-owned curl cache, which survives pooled easy resets. Preserve verification and all other options.
+
+The fingerprint baseline never resumes TLS 1.2 in 20 processes, but TLS 1.3 resumes in all 20 without SendError. Do not attribute a TLS 1.3 fix to this change. Development smoke confirms actual reuse after disconnect/reconnect for both versions. Release build and all 1658 existing tests pass; exported full-matrix validation follows. Missing unrelated TLS extensions remain out of scope.
+---
+ src/network/http.zig  | 3 +++
+ src/sys/libcrypto.zig | 2 ++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/src/network/http.zig b/src/network/http.zig
+index cbe8310..afc25ca 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -476,6 +476,9 @@ pub const Connection = struct {
+                 raw_x509_store: ?*anyopaque,
+             ) callconv(.c) libcurl.CurlCode {
+                 const ssl_ctx: *crypto.SSL_CTX = @ptrCast(raw_ssl_ctx);
++                // Curl disables RFC 5077 tickets by default. Keep its session cache,
++                // but allow BoringSSL to receive and offer TLS 1.2 tickets too.
++                _ = crypto.SSL_CTX_clear_options(ssl_ctx, crypto.SSL_OP_NO_TICKET);
+                 crypto.SSL_CTX_set_grease_enabled(ssl_ctx, 1);
+                 crypto.SSL_CTX_set_grease_sigalgs_enabled(ssl_ctx, 1);
+                 crypto.SSL_CTX_set_permute_extensions(ssl_ctx, 1);
+diff --git a/src/sys/libcrypto.zig b/src/sys/libcrypto.zig
+index 3f49a95..b6215b0 100644
+--- a/src/sys/libcrypto.zig
++++ b/src/sys/libcrypto.zig
+@@ -178,6 +178,8 @@ const struct_ssl_ctx_st = opaque {};
+ pub const SSL_CTX = struct_ssl_ctx_st;
+ pub const SSL = opaque {};
+ pub extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *?[*]const u8, len: *c_uint) void;
++pub const SSL_OP_NO_TICKET: u32 = 0x00004000;
++pub extern fn SSL_CTX_clear_options(ctx: *SSL_CTX, options: u32) u32;
+ pub extern fn SSL_CTX_set1_verify_cert_store(ctx: ?*SSL_CTX, store: ?*X509_STORE) c_int;
+ pub extern fn SSL_CTX_set_grease_enabled(ctx: *SSL_CTX, enabled: c_int) void;
+ pub extern fn SSL_CTX_set_grease_sigalgs_enabled(ctx: *SSL_CTX, enabled: c_int) void;

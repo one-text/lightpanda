@@ -1,0 +1,472 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 5 Nov 2026 22:19:14 -0300
+Subject: [PATCH] webapi: mock native WebGL2 and shader precision queries
+
+Expose separate native WebGLRenderingContext and WebGL2RenderingContext
+interfaces from the existing WebGL module, without JS prototype inheritance.
+Share the query implementation while selecting WebGL 1/2 and GLSL ES 1/3
+version strings. Preserve the base MacBook Neo Apple A18 Pro / ANGLE Metal
+identity, debug-extension gating, dimensions and clear-on-read error state.
+
+Implement getShaderPrecisionFormat for both shader stages and all six
+LOW/MEDIUM/HIGH FLOAT/INT enums. Use a deterministic synthetic profile:
+low/medium float 15/15/10, high float 127/127/23, and integer 31/30/0.
+These are chosen mock capabilities, not measurements from an A18 Pro Mac.
+Invalid enums return null and latch INVALID_ENUM without clearing pending
+errors on successful queries.
+
+Return fresh WebGLShaderPrecisionFormat objects with readonly native
+accessors and GC finalizer/ref-count hooks, so discarded query results and
+their JS properties can be collected. Keep native receiver checks, method
+arity and illegal constructors through the existing bridge.
+
+Route and cache webgl2 independently in HTMLCanvasElement and OffscreenCanvas,
+including worker realms, while preserving 2D/WebGL1/WebGL2 mutual exclusion
+and existing canvas-export fallbacks. Add no unit tests and leave the
+benchmark unchanged. Validate with existing upstream tests, the benchmark,
+and ignored page/iframe/dedicated/shared/service worker and GC diagnostics.
+
+This remains a query-only mock: shader compilation, graphics resources,
+drawing and the separate WebGL/SVG functional assertion are not implemented.
+
+References:
+https://registry.khronos.org/webgl/specs/latest/1.0/
+https://registry.khronos.org/webgl/specs/latest/2.0/
+https://www.apple.com/macbook-neo/specs/
+---
+ src/browser/webapi/canvas/OffscreenCanvas.zig |  18 +-
+ .../webapi/canvas/WebGLRenderingContext.zig   | 275 ++++++++++++------
+ src/browser/webapi/element/html/Canvas.zig    |  12 +-
+ 3 files changed, 202 insertions(+), 103 deletions(-)
+
+diff --git a/src/browser/webapi/canvas/OffscreenCanvas.zig b/src/browser/webapi/canvas/OffscreenCanvas.zig
+index fc129be..794ceba 100644
+--- a/src/browser/webapi/canvas/OffscreenCanvas.zig
++++ b/src/browser/webapi/canvas/OffscreenCanvas.zig
+@@ -24,7 +24,7 @@ const Blob = @import("../Blob.zig");
+ const Recording = @import("Recording.zig");
+ const empty_recording: Recording = .{};
+ const OffscreenCanvasRenderingContext2D = @import("OffscreenCanvasRenderingContext2D.zig");
+-const WebGLRenderingContext = @import("WebGLRenderingContext.zig");
++const WebGL = @import("WebGLRenderingContext.zig");
+ 
+ const Execution = js.Execution;
+ 
+@@ -41,7 +41,8 @@ _cached: ?DrawingContext = null,
+ /// we're using tagged union.
+ const DrawingContext = union(enum) {
+     @"2d": *OffscreenCanvasRenderingContext2D,
+-    webgl: *WebGLRenderingContext,
++    webgl: *WebGL.WebGLRenderingContext,
++    webgl2: *WebGL.WebGL2RenderingContext,
+ };
+ 
+ pub fn constructor(width: u32, height: u32, exec: *Execution) !*OffscreenCanvas {
+@@ -72,7 +73,7 @@ fn setHeight(self: *OffscreenCanvas, value: u32) void {
+ fn resetBitmap(self: *OffscreenCanvas) void {
+     if (self._cached) |cached| switch (cached) {
+         .@"2d" => |ctx| ctx.reset(),
+-        .webgl => {},
++        .webgl, .webgl2 => {},
+     };
+ }
+ 
+@@ -81,6 +82,7 @@ fn getContext(self: *OffscreenCanvas, context_type: []const u8, exec: *Execution
+         return switch (cached) {
+             .@"2d" => if (std.mem.eql(u8, context_type, "2d")) cached else null,
+             .webgl => if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) cached else null,
++            .webgl2 => if (std.mem.eql(u8, context_type, "webgl2")) cached else null,
+         };
+     }
+ 
+@@ -91,11 +93,17 @@ fn getContext(self: *OffscreenCanvas, context_type: []const u8, exec: *Execution
+     }
+ 
+     if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) {
+-        const ctx = try exec._factory.create(WebGLRenderingContext{ ._canvas = .{ .offscreen = self } });
++        const ctx = try exec._factory.create(WebGL.WebGLRenderingContext{ ._canvas = .{ .offscreen = self } });
+         self._cached = .{ .webgl = ctx };
+         return self._cached;
+     }
+ 
++    if (std.mem.eql(u8, context_type, "webgl2")) {
++        const ctx = try exec._factory.create(WebGL.WebGL2RenderingContext{ ._canvas = .{ .offscreen = self } });
++        self._cached = .{ .webgl2 = ctx };
++        return self._cached;
++    }
++
+     return null;
+ }
+ 
+@@ -107,7 +115,7 @@ fn convertToBlob(self: *const OffscreenCanvas, exec: *Execution) !js.Promise {
+     }
+     const recording = if (self._cached) |cached| switch (cached) {
+         .@"2d" => |ctx| &ctx._recording,
+-        .webgl => &empty_recording,
++        .webgl, .webgl2 => &empty_recording,
+     } else &empty_recording;
+     const blob = try Blob.initFromBytes(try recording.png(self._width, self._height, exec), "image/png", exec);
+     return exec.js.local.?.resolvePromise(blob);
+diff --git a/src/browser/webapi/canvas/WebGLRenderingContext.zig b/src/browser/webapi/canvas/WebGLRenderingContext.zig
+index 0aa59d3..47a9ed0 100644
+--- a/src/browser/webapi/canvas/WebGLRenderingContext.zig
++++ b/src/browser/webapi/canvas/WebGLRenderingContext.zig
+@@ -18,94 +18,212 @@
+ // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ 
+ const std = @import("std");
++const lp = @import("lightpanda");
+ const js = @import("../../js/js.zig");
++const Page = @import("../../Page.zig");
+ const Canvas = @import("../element/html/Canvas.zig");
+ const OffscreenCanvas = @import("OffscreenCanvas.zig");
+ 
+-const WebGLRenderingContext = @This();
++pub const WebGLRenderingContext = Context(1);
++pub const WebGL2RenderingContext = Context(2);
+ 
+ pub fn registerTypes() []const type {
+-    return &.{ WebGLRenderingContext, DebugRendererInfo };
++    return &.{ WebGLRenderingContext, WebGL2RenderingContext, ShaderPrecisionFormat, DebugRendererInfo };
+ }
+ 
+-pub const Owner = union(enum) {
++const Owner = union(enum) {
+     html: *Canvas,
+     offscreen: *OffscreenCanvas,
+ };
+ 
+-_canvas: Owner,
+-_debug_info: ?*DebugRendererInfo = null,
+-_error: u32 = 0,
+-
+-fn getCanvas(self: *const WebGLRenderingContext) Owner {
+-    return self._canvas;
+-}
+-
+-fn getDrawingBufferWidth(self: *const WebGLRenderingContext) u32 {
+-    return switch (self._canvas) {
+-        inline else => |canvas| canvas.getWidth(),
+-    };
+-}
+-
+-fn getDrawingBufferHeight(self: *const WebGLRenderingContext) u32 {
+-    return switch (self._canvas) {
+-        inline else => |canvas| canvas.getHeight(),
+-    };
+-}
+-
+ const Parameter = union(enum) {
+     string: []const u8,
+     number: u32,
+     int32: js.TypedArray(i32),
+ };
+ 
+-// Synthetic WebGL 1 query profile for the base Neo's Apple A18 Pro.
+-// No graphics resources, shader execution or rendering are implemented.
+-fn getParameter(self: *WebGLRenderingContext, pname: u32) ?Parameter {
+-    return switch (pname) {
+-        0x1F00 => .{ .string = "WebKit" },
+-        0x1F01 => .{ .string = "WebKit WebGL" },
+-        0x1F02 => .{ .string = "WebGL 1.0 (OpenGL ES 2.0 Chromium)" },
+-        0x8B8C => .{ .string = "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)" },
+-        0x9245, 0x9246 => if (self._debug_info != null)
+-            .{ .string = if (pname == 0x9245) "Google Inc. (Apple)" else "ANGLE (Apple, ANGLE Metal Renderer: Apple A18 Pro, Unspecified Version)" }
+-        else
+-            self.invalidEnum(),
+-        0x0D33, 0x851C, 0x84E8 => .{ .number = 16384 },
+-        0x0D3A => .{ .int32 = .{ .values = &.{ 16384, 16384 } } },
+-        0x8872, 0x8B4C => .{ .number = 16 },
+-        0x8B4D => .{ .number = 32 },
+-        0x8869 => .{ .number = 16 },
+-        else => self.invalidEnum(),
++// Separate native interfaces with shared query behavior, not JS inheritance.
++// This A18 Pro profile has no graphics resources, shaders or rendering backend.
++fn Context(comptime version: u2) type {
++    return struct {
++        const Self = @This();
++
++        _canvas: Owner,
++        _debug_info: ?*DebugRendererInfo = null,
++        _error: u32 = 0,
++
++        fn getCanvas(self: *const Self) Owner {
++            return self._canvas;
++        }
++
++        fn getDrawingBufferWidth(self: *const Self) u32 {
++            return switch (self._canvas) {
++                inline else => |canvas| canvas.getWidth(),
++            };
++        }
++
++        fn getDrawingBufferHeight(self: *const Self) u32 {
++            return switch (self._canvas) {
++                inline else => |canvas| canvas.getHeight(),
++            };
++        }
++
++        fn getParameter(self: *Self, pname: u32) ?Parameter {
++            return switch (pname) {
++                0x1F00 => .{ .string = "WebKit" },
++                0x1F01 => .{ .string = "WebKit WebGL" },
++                0x1F02 => .{ .string = if (version == 2) "WebGL 2.0 (OpenGL ES 3.0 Chromium)" else "WebGL 1.0 (OpenGL ES 2.0 Chromium)" },
++                0x8B8C => .{ .string = if (version == 2) "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)" else "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)" },
++                0x9245, 0x9246 => if (self._debug_info != null)
++                    .{ .string = if (pname == 0x9245) "Google Inc. (Apple)" else "ANGLE (Apple, ANGLE Metal Renderer: Apple A18 Pro, Unspecified Version)" }
++                else blk: {
++                    self.invalidEnum();
++                    break :blk null;
++                },
++                0x0D33, 0x851C, 0x84E8 => .{ .number = 16384 },
++                0x0D3A => .{ .int32 = .{ .values = &.{ 16384, 16384 } } },
++                0x8872, 0x8B4C => .{ .number = 16 },
++                0x8B4D => .{ .number = 32 },
++                0x8869 => .{ .number = 16 },
++                else => blk: {
++                    self.invalidEnum();
++                    break :blk null;
++                },
++            };
++        }
++
++        fn getShaderPrecisionFormat(self: *Self, shader_type: u32, precision_type: u32, exec: *js.Execution) !?*ShaderPrecisionFormat {
++            if (shader_type != 0x8B31 and shader_type != 0x8B30) {
++                self.invalidEnum();
++                return null;
++            }
++            // Synthetic half/full-float and 32-bit integer capabilities; not
++            // measurements from an A18 Pro. Both stages use the same table.
++            const format: ShaderPrecisionFormat = switch (precision_type) {
++                0x8DF0, 0x8DF1 => .{ ._range_min = 15, ._range_max = 15, ._precision = 10 },
++                0x8DF2 => .{ ._range_min = 127, ._range_max = 127, ._precision = 23 },
++                0x8DF3, 0x8DF4, 0x8DF5 => .{ ._range_min = 31, ._range_max = 30, ._precision = 0 },
++                else => {
++                    self.invalidEnum();
++                    return null;
++                },
++            };
++            return try exec._factory.create(format);
++        }
++
++        fn invalidEnum(self: *Self) void {
++            if (self._error == 0) self._error = 0x0500;
++        }
++
++        fn getError(self: *Self) u32 {
++            const err = self._error;
++            self._error = 0;
++            return err;
++        }
++
++        fn isContextLost(_: *const Self) bool {
++            return false;
++        }
++
++        fn getExtension(self: *Self, name: []const u8, exec: *js.Execution) !?*DebugRendererInfo {
++            if (!std.ascii.eqlIgnoreCase(name, "WEBGL_debug_renderer_info")) return null;
++            if (self._debug_info == null) {
++                self._debug_info = try exec._factory.create(DebugRendererInfo{});
++            }
++            return self._debug_info;
++        }
++
++        fn getSupportedExtensions(_: *const Self) []const []const u8 {
++            return &.{"WEBGL_debug_renderer_info"};
++        }
++
++        pub const JsApi = struct {
++            pub const bridge = js.Bridge(Self);
++            pub const Meta = struct {
++                pub const name = if (version == 2) "WebGL2RenderingContext" else "WebGLRenderingContext";
++                pub const prototype_chain = bridge.prototypeChain();
++                pub var class_id: bridge.ClassId = undefined;
++            };
++
++            pub const canvas = bridge.accessor(Self.getCanvas, null, .{});
++            pub const drawingBufferWidth = bridge.accessor(Self.getDrawingBufferWidth, null, .{});
++            pub const drawingBufferHeight = bridge.accessor(Self.getDrawingBufferHeight, null, .{});
++            pub const getParameter = bridge.function(Self.getParameter, .{});
++            pub const getShaderPrecisionFormat = bridge.function(Self.getShaderPrecisionFormat, .{});
++            pub const getExtension = bridge.function(Self.getExtension, .{});
++            pub const getSupportedExtensions = bridge.function(Self.getSupportedExtensions, .{});
++            pub const getError = bridge.function(Self.getError, .{});
++            pub const isContextLost = bridge.function(Self.isContextLost, .{});
++
++            pub const NO_ERROR = bridge.property(@as(u32, 0), .{ .template = true });
++            pub const INVALID_ENUM = bridge.property(@as(u32, 0x0500), .{ .template = true });
++            pub const VERTEX_SHADER = bridge.property(@as(u32, 0x8B31), .{ .template = true });
++            pub const FRAGMENT_SHADER = bridge.property(@as(u32, 0x8B30), .{ .template = true });
++            pub const LOW_FLOAT = bridge.property(@as(u32, 0x8DF0), .{ .template = true });
++            pub const MEDIUM_FLOAT = bridge.property(@as(u32, 0x8DF1), .{ .template = true });
++            pub const HIGH_FLOAT = bridge.property(@as(u32, 0x8DF2), .{ .template = true });
++            pub const LOW_INT = bridge.property(@as(u32, 0x8DF3), .{ .template = true });
++            pub const MEDIUM_INT = bridge.property(@as(u32, 0x8DF4), .{ .template = true });
++            pub const HIGH_INT = bridge.property(@as(u32, 0x8DF5), .{ .template = true });
++            pub const VENDOR = bridge.property(@as(u32, 0x1F00), .{ .template = true });
++            pub const RENDERER = bridge.property(@as(u32, 0x1F01), .{ .template = true });
++            pub const VERSION = bridge.property(@as(u32, 0x1F02), .{ .template = true });
++            pub const SHADING_LANGUAGE_VERSION = bridge.property(@as(u32, 0x8B8C), .{ .template = true });
++            pub const MAX_TEXTURE_SIZE = bridge.property(@as(u32, 0x0D33), .{ .template = true });
++            pub const MAX_CUBE_MAP_TEXTURE_SIZE = bridge.property(@as(u32, 0x851C), .{ .template = true });
++            pub const MAX_RENDERBUFFER_SIZE = bridge.property(@as(u32, 0x84E8), .{ .template = true });
++            pub const MAX_VIEWPORT_DIMS = bridge.property(@as(u32, 0x0D3A), .{ .template = true });
++            pub const MAX_TEXTURE_IMAGE_UNITS = bridge.property(@as(u32, 0x8872), .{ .template = true });
++            pub const MAX_VERTEX_TEXTURE_IMAGE_UNITS = bridge.property(@as(u32, 0x8B4C), .{ .template = true });
++            pub const MAX_COMBINED_TEXTURE_IMAGE_UNITS = bridge.property(@as(u32, 0x8B4D), .{ .template = true });
++            pub const MAX_VERTEX_ATTRIBS = bridge.property(@as(u32, 0x8869), .{ .template = true });
++        };
+     };
+ }
+ 
+-fn invalidEnum(self: *WebGLRenderingContext) ?Parameter {
+-    if (self._error == 0) self._error = 0x0500;
+-    return null;
+-}
++const ShaderPrecisionFormat = struct {
++    _rc: lp.RC = .{},
++    _range_min: i32,
++    _range_max: i32,
++    _precision: i32,
+ 
+-fn getError(self: *WebGLRenderingContext) u32 {
+-    const err = self._error;
+-    self._error = 0;
+-    return err;
+-}
++    pub fn deinit(self: *ShaderPrecisionFormat, page: *Page) void {
++        page.factory.destroy(self);
++    }
+ 
+-fn isContextLost(_: *const WebGLRenderingContext) bool {
+-    return false;
+-}
++    pub fn acquireRef(self: *ShaderPrecisionFormat) void {
++        self._rc.acquire();
++    }
+ 
+-fn getExtension(self: *WebGLRenderingContext, name: []const u8, exec: *js.Execution) !?*DebugRendererInfo {
+-    if (!std.ascii.eqlIgnoreCase(name, "WEBGL_debug_renderer_info")) return null;
+-    if (self._debug_info == null) {
+-        self._debug_info = try exec._factory.create(DebugRendererInfo{});
++    pub fn releaseRef(self: *ShaderPrecisionFormat, page: *Page) void {
++        self._rc.release(self, page);
+     }
+-    return self._debug_info;
+-}
+ 
+-fn getSupportedExtensions(_: *const WebGLRenderingContext) []const []const u8 {
+-    return &.{"WEBGL_debug_renderer_info"};
+-}
++    fn getRangeMin(self: *const ShaderPrecisionFormat) i32 {
++        return self._range_min;
++    }
++
++    fn getRangeMax(self: *const ShaderPrecisionFormat) i32 {
++        return self._range_max;
++    }
++
++    fn getPrecision(self: *const ShaderPrecisionFormat) i32 {
++        return self._precision;
++    }
++
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(ShaderPrecisionFormat);
++        pub const Meta = struct {
++            pub const name = "WebGLShaderPrecisionFormat";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++
++        pub const rangeMin = bridge.accessor(ShaderPrecisionFormat.getRangeMin, null, .{});
++        pub const rangeMax = bridge.accessor(ShaderPrecisionFormat.getRangeMax, null, .{});
++        pub const precision = bridge.accessor(ShaderPrecisionFormat.getPrecision, null, .{});
++    };
++};
+ 
+ const DebugRendererInfo = struct {
+     _: u8 = 0,
+@@ -122,36 +240,3 @@ const DebugRendererInfo = struct {
+         pub const UNMASKED_RENDERER_WEBGL = bridge.property(@as(u32, 0x9246), .{ .template = false, .readonly = true });
+     };
+ };
+-
+-pub const JsApi = struct {
+-    pub const bridge = js.Bridge(WebGLRenderingContext);
+-    pub const Meta = struct {
+-        pub const name = "WebGLRenderingContext";
+-        pub const prototype_chain = bridge.prototypeChain();
+-        pub var class_id: bridge.ClassId = undefined;
+-    };
+-
+-    pub const canvas = bridge.accessor(WebGLRenderingContext.getCanvas, null, .{});
+-    pub const drawingBufferWidth = bridge.accessor(WebGLRenderingContext.getDrawingBufferWidth, null, .{});
+-    pub const drawingBufferHeight = bridge.accessor(WebGLRenderingContext.getDrawingBufferHeight, null, .{});
+-    pub const getParameter = bridge.function(WebGLRenderingContext.getParameter, .{});
+-    pub const getExtension = bridge.function(WebGLRenderingContext.getExtension, .{});
+-    pub const getSupportedExtensions = bridge.function(WebGLRenderingContext.getSupportedExtensions, .{});
+-    pub const getError = bridge.function(WebGLRenderingContext.getError, .{});
+-    pub const isContextLost = bridge.function(WebGLRenderingContext.isContextLost, .{});
+-
+-    pub const NO_ERROR = bridge.property(@as(u32, 0), .{ .template = true });
+-    pub const INVALID_ENUM = bridge.property(@as(u32, 0x0500), .{ .template = true });
+-    pub const VENDOR = bridge.property(@as(u32, 0x1F00), .{ .template = true });
+-    pub const RENDERER = bridge.property(@as(u32, 0x1F01), .{ .template = true });
+-    pub const VERSION = bridge.property(@as(u32, 0x1F02), .{ .template = true });
+-    pub const SHADING_LANGUAGE_VERSION = bridge.property(@as(u32, 0x8B8C), .{ .template = true });
+-    pub const MAX_TEXTURE_SIZE = bridge.property(@as(u32, 0x0D33), .{ .template = true });
+-    pub const MAX_CUBE_MAP_TEXTURE_SIZE = bridge.property(@as(u32, 0x851C), .{ .template = true });
+-    pub const MAX_RENDERBUFFER_SIZE = bridge.property(@as(u32, 0x84E8), .{ .template = true });
+-    pub const MAX_VIEWPORT_DIMS = bridge.property(@as(u32, 0x0D3A), .{ .template = true });
+-    pub const MAX_TEXTURE_IMAGE_UNITS = bridge.property(@as(u32, 0x8872), .{ .template = true });
+-    pub const MAX_VERTEX_TEXTURE_IMAGE_UNITS = bridge.property(@as(u32, 0x8B4C), .{ .template = true });
+-    pub const MAX_COMBINED_TEXTURE_IMAGE_UNITS = bridge.property(@as(u32, 0x8B4D), .{ .template = true });
+-    pub const MAX_VERTEX_ATTRIBS = bridge.property(@as(u32, 0x8869), .{ .template = true });
+-};
+diff --git a/src/browser/webapi/element/html/Canvas.zig b/src/browser/webapi/element/html/Canvas.zig
+index e5602a4..47db86e 100644
+--- a/src/browser/webapi/element/html/Canvas.zig
++++ b/src/browser/webapi/element/html/Canvas.zig
+@@ -28,7 +28,7 @@ const Node = @import("../../Node.zig");
+ const Element = @import("../../Element.zig");
+ 
+ const OffscreenCanvas = @import("../../canvas/OffscreenCanvas.zig");
+-const WebGLRenderingContext = @import("../../canvas/WebGLRenderingContext.zig");
++const WebGL = @import("../../canvas/WebGLRenderingContext.zig");
+ const CanvasRenderingContext2D = @import("../../canvas/CanvasRenderingContext2D.zig");
+ 
+ const HtmlElement = @import("../Html.zig");
+@@ -75,7 +75,8 @@ fn dimension(self: *const Canvas, name: []const u8, default: u32) u32 {
+ /// we're using tagged union.
+ const DrawingContext = union(enum) {
+     @"2d": *CanvasRenderingContext2D,
+-    webgl: *WebGLRenderingContext,
++    webgl: *WebGL.WebGLRenderingContext,
++    webgl2: *WebGL.WebGL2RenderingContext,
+ };
+ 
+ fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?DrawingContext {
+@@ -83,6 +84,7 @@ fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?DrawingC
+         const matches = switch (cached) {
+             .@"2d" => std.mem.eql(u8, context_type, "2d"),
+             .webgl => std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl"),
++            .webgl2 => std.mem.eql(u8, context_type, "webgl2"),
+         };
+         return if (matches) cached else null;
+     }
+@@ -94,9 +96,13 @@ fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?DrawingC
+         }
+ 
+         if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) {
+-            const ctx = try frame._factory.create(WebGLRenderingContext{ ._canvas = .{ .html = self } });
++            const ctx = try frame._factory.create(WebGL.WebGLRenderingContext{ ._canvas = .{ .html = self } });
+             break :blk .{ .webgl = ctx };
+         }
++        if (std.mem.eql(u8, context_type, "webgl2")) {
++            const ctx = try frame._factory.create(WebGL.WebGL2RenderingContext{ ._canvas = .{ .html = self } });
++            break :blk .{ .webgl2 = ctx };
++        }
+         return null;
+     };
+     self._cached = drawing_context;

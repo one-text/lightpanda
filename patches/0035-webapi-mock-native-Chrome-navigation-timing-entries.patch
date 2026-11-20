@@ -1,0 +1,351 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 19 Oct 2026 23:45:59 -0300
+Subject: [PATCH] webapi: mock native Chrome navigation timing entries
+
+Expose a Window-only PerformanceNavigationTiming interface inheriting
+PerformanceResourceTiming and PerformanceEntry. Lazily allocate one native
+navigation entry per document and reuse existing timeline getters, ordering,
+identity and buffered PerformanceObserver delivery.
+
+Mock type as navigate (including reload/history traversals), status as 200,
+HTML content type, zero timings/sizes/redirectCount, empty protocol/encoding
+and null notRestoredReasons. Include inherited and navigation fields in
+native toJSON. Do not add network timing collection, lifecycle measurement,
+new polling tasks, per-resource work or JavaScript shims.
+
+Retain a page-owned document-navigation URL separately from mutable SPA URLs
+and from the owning context, so a saved iframe Performance remains safe and
+keeps its original name after context teardown. Workers do not gain navigation
+entries or the constructor.
+
+Fashion Nova's root bundle directly evaluates instanceof
+PerformanceNavigationTiming in an affiliate effect. Its missing interface
+throws a ReferenceError and renders the React error boundary; supplying only
+the missing constructor restored the cart contract in diagnostics. This patch
+returns the lightweight Chromium-like native shape instead of a page shim.
+Reference: https://w3c.github.io/navigation-timing/
+
+Adjust existing upstream resource-order/buffer and supported-entry-type
+expectations for the added navigation entry. Add no upstream unit tests.
+---
+ src/browser/Frame.zig                         |   3 +
+ src/browser/js/bridge.zig                     |   1 +
+ .../performance_observer.html                 |   2 +-
+ .../tests/performance_resource_timing.html    |   2 +-
+ .../performance_resource_timing_buffer.html   |   6 +-
+ src/browser/webapi/Performance.zig            | 128 +++++++++++++++++-
+ src/browser/webapi/PerformanceObserver.zig    |   9 +-
+ 7 files changed, 138 insertions(+), 13 deletions(-)
+
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index cb2633c..d403c7f 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -431,6 +431,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
+     });
+     errdefer browser.env.destroyContext(self.js);
+     self.window._performance.attach(self.js);
++    self.window._performance.setNavigationName("about:blank");
+ 
+     const location = try Location.init("about:blank", self);
+     // We're holding a reference in Zig-side.
+@@ -766,6 +767,7 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
+         // We're not holding a ref to old location anymore.
+         self.window._location.releaseRef(self.page);
+         self.window._location = location;
++        self.window._performance.setNavigationName(self.url);
+ 
+         if (is_blob) {
+             // strip out blob:
+@@ -1577,6 +1579,7 @@ fn frameHeaderDoneCallback(transfer: *HttpClient.Transfer) !HttpClient.Transfer.
+     location.acquireRef();
+     self.window._location.releaseRef(self.page);
+     self.window._location = location;
++    self.window._performance.setNavigationName(self.url);
+ 
+     if (comptime lp.IS_DEBUG) {
+         log.debug(.frame, "navigate header", .{
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 452461b..541711d 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1305,6 +1305,7 @@ pub const PageJsApis = flattenTypes(&.{
+     @import("../webapi/URLPattern.zig"),
+     @import("../webapi/Window.zig"),
+     @import("../webapi/Performance.zig"),
++    @import("../webapi/Performance.zig").NavigationTiming,
+     @import("../webapi/EventCounts.zig"),
+     @import("../webapi/PluginArray.zig"),
+     @import("../webapi/MutationObserver.zig"),
+diff --git a/src/browser/tests/performance_observer/performance_observer.html b/src/browser/tests/performance_observer/performance_observer.html
+index 477e266..08096c6 100644
+--- a/src/browser/tests/performance_observer/performance_observer.html
++++ b/src/browser/tests/performance_observer/performance_observer.html
+@@ -71,7 +71,7 @@
+ </script>
+ 
+ <script>
+-  testing.expectEqual(['mark', 'measure', 'resource'], PerformanceObserver.supportedEntryTypes);
++  testing.expectEqual(['mark', 'measure', 'navigation', 'resource'], PerformanceObserver.supportedEntryTypes);
+ </script>
+ 
+ <script id="list_get_entries_by_type">
+diff --git a/src/browser/tests/performance_resource_timing.html b/src/browser/tests/performance_resource_timing.html
+index 2a9647e..4b3c26c 100644
+--- a/src/browser/tests/performance_resource_timing.html
++++ b/src/browser/tests/performance_resource_timing.html
+@@ -17,7 +17,7 @@
+   testing.expectEqual(e.decodedBodySize, e.encodedBodySize);
+   testing.expectEqual(true, e.transferSize > e.encodedBodySize);
+   testing.expectEqual(1, performance.getEntriesByType('resource').length);
+-  testing.expectEqual(e, performance.getEntries()[0]);
++  testing.expectEqual(e, performance.getEntries().find((entry) => entry.entryType === 'resource'));
+ </script>
+ 
+ <script id=fetch_entry type=module>
+diff --git a/src/browser/tests/performance_resource_timing_buffer.html b/src/browser/tests/performance_resource_timing_buffer.html
+index ce34783..06c9454 100644
+--- a/src/browser/tests/performance_resource_timing_buffer.html
++++ b/src/browser/tests/performance_resource_timing_buffer.html
+@@ -26,12 +26,12 @@
+       testing.expectEqual(1, list.length);
+       testing.expectEqual(testing.ORIGIN + '/xhr', list[0].name);
+       testing.expectEqual([testing.ORIGIN + '/xhr', testing.ORIGIN + '/xhr/json'], observed);
+-      testing.expectEqual(0, performance.getEntries().filter((e) => e.entryType !== 'resource').length);
++      testing.expectEqual(1, performance.getEntries().filter((e) => e.entryType === 'navigation').length);
+ 
+       // getEntries merges marks and resources in startTime order.
+       performance.mark('early', { startTime: 0.5 });
+       performance.mark('late');
+-      const names = performance.getEntries().map((e) => e.name);
++      const names = performance.getEntries().filter((e) => e.entryType !== 'navigation').map((e) => e.name);
+       testing.expectEqual(['early', testing.ORIGIN + '/xhr', 'late'], names);
+       testing.expectEqual(['early', 'late'], performance.getEntriesByType('mark').map((e) => e.name));
+       testing.expectEqual(0, performance.getEntriesByType('bogus').length);
+@@ -40,7 +40,7 @@
+ 
+       performance.setResourceTimingBufferSize(0);
+       performance.clearResourceTimings();
+-      testing.expectEqual(['early', 'late'], performance.getEntries().map((e) => e.name));
++      testing.expectEqual(['early', 'late'], performance.getEntries().filter((e) => e.entryType !== 'navigation').map((e) => e.name));
+     });
+   }
+ </script>
+diff --git a/src/browser/webapi/Performance.zig b/src/browser/webapi/Performance.zig
+index cf68371..c27913a 100644
+--- a/src/browser/webapi/Performance.zig
++++ b/src/browser/webapi/Performance.zig
+@@ -50,14 +50,16 @@ _proto: *EventTarget,
+ _time_origin: u64,
+ _arena: Allocator,
+ _factory: *Factory,
+-// Marks and measures. Kept in startTime order (see insertOrdered), as the
+-// getters must return them.
++// Marks, measures and the mocked navigation entry, in startTime order.
+ _entries: std.ArrayList(*Entry) = .empty,
+ // resources has its own cap, so it's split from entries (it's also potentially
+ // polled more)
+ _resources: std.ArrayList(*Entry) = .empty,
+ _timing: PerformanceTiming = .{},
+ _navigation: PerformanceNavigation = .{},
++_navigation_timing: ?*NavigationTiming = null,
++// Set only at document navigation, to a URL owned by the page arena.
++_navigation_name: ?[]const u8 = null,
+ _event_counts: EventCounts = .{},
+ _resource_buffer_size: u32 = DEFAULT_RESOURCE_BUFFER_SIZE,
+ _buffer_full_pending: bool = false,
+@@ -456,11 +458,13 @@ const content_encodings = std.StaticStringMap([]const u8).initComptime(.{
+     .{ "zstd", "zstd" },
+ });
+ 
+-pub fn getEntries(self: *const Performance, exec: *const Execution) ![]const *Entry {
++pub fn getEntries(self: *Performance, exec: *const Execution) ![]const *Entry {
++    try self.ensureNavigation();
+     return mergeOrdered(exec.local_arena, self._entries.items, self._resources.items);
+ }
+ 
+-pub fn getEntriesByType(self: *const Performance, entry_type: []const u8, exec: *const Execution) ![]const *Entry {
++pub fn getEntriesByType(self: *Performance, entry_type: []const u8, exec: *const Execution) ![]const *Entry {
++    try self.ensureNavigation();
+     const kind = Entry.Type.Enum.parse(entry_type) orelse return &.{};
+     if (kind == .resource) {
+         return self._resources.items;
+@@ -468,7 +472,8 @@ pub fn getEntriesByType(self: *const Performance, entry_type: []const u8, exec:
+     return filterEntriesByType(exec.local_arena, self._entries.items, kind);
+ }
+ 
+-pub fn getEntriesByName(self: *const Performance, name: []const u8, entry_type: ?[]const u8, exec: *const Execution) ![]const *Entry {
++pub fn getEntriesByName(self: *Performance, name: []const u8, entry_type: ?[]const u8, exec: *const Execution) ![]const *Entry {
++    try self.ensureNavigation();
+     const arena = exec.local_arena;
+     if (entry_type) |t| {
+         const kind = Entry.Type.Enum.parse(t) orelse return &.{};
+@@ -482,6 +487,51 @@ pub fn getEntriesByName(self: *const Performance, name: []const u8, entry_type:
+     );
+ }
+ 
++pub fn setNavigationName(self: *Performance, name: []const u8) void {
++    self._navigation_name = name;
++    if (self._navigation_timing) |entry| entry._proto._proto._name = name;
++}
++
++// One lazy native entry per document; no network instrumentation or load tasks.
++// Retained Performance objects must not consult their destroyed owning context.
++pub fn ensureNavigation(self: *Performance) !void {
++    if (self._navigation_timing != null) return;
++    const name = self._navigation_name orelse return;
++    const navigation = try self._factory.chained(.{
++        Entry{
++            ._name = name,
++            ._type = undefined,
++        },
++        ResourceTiming{
++            ._proto = undefined,
++            ._initiator_type = "navigation",
++            ._next_hop_protocol = "",
++            ._delivery_type = "",
++            ._redirect_start = 0,
++            ._redirect_end = 0,
++            ._fetch_start = 0,
++            ._domain_lookup_start = 0,
++            ._domain_lookup_end = 0,
++            ._connect_start = 0,
++            ._connect_end = 0,
++            ._secure_connection_start = 0,
++            ._request_start = 0,
++            ._response_start = 0,
++            ._response_end = 0,
++            ._transfer_size = 0,
++            ._encoded_body_size = 0,
++            ._decoded_body_size = 0,
++            ._response_status = 200,
++            ._content_type = "text/html",
++            ._content_encoding = "",
++        },
++        NavigationTiming{ ._proto = undefined },
++    });
++    navigation._proto._proto._type = .{ .navigation = navigation };
++    try self.insertOrdered(&self._entries, navigation._proto._proto);
++    self._navigation_timing = navigation;
++}
++
+ // Also used by PerformanceObserver
+ pub fn filterEntriesByType(arena: Allocator, list: []const *Entry, kind: Entry.Type.Enum) ![]const *Entry {
+     var result: std.ArrayList(*Entry) = .empty;
+@@ -833,7 +883,7 @@ pub const Entry = struct {
+         @"long-animation-frame",
+         longtask,
+         measure: *Measure,
+-        navigation,
++        navigation: *NavigationTiming,
+         paint,
+         resource: *ResourceTiming,
+         taskattribution,
+@@ -1244,6 +1294,72 @@ const ResourceTiming = struct {
+     };
+ };
+ 
++/// Lightweight Navigation Timing Level 2 shape. Timings and sizes stay zero;
++/// every document is reported as an ordinary navigation, including reloads.
++pub const NavigationTiming = struct {
++    pub const Proto = ResourceTiming;
++    _proto: *ResourceTiming,
++
++    const zero_fields = .{
++        "unloadEventStart",           "unloadEventEnd",           "domInteractive",
++        "domContentLoadedEventStart", "domContentLoadedEventEnd", "domComplete",
++        "loadEventStart",             "loadEventEnd",             "activationStart",
++        "criticalCHRestart",
++    };
++
++    fn getZero(_: *const NavigationTiming) f64 {
++        return 0;
++    }
++
++    fn getType(_: *const NavigationTiming) []const u8 {
++        return "navigate";
++    }
++
++    fn getRedirectCount(_: *const NavigationTiming) u16 {
++        return 0;
++    }
++
++    fn getNotRestoredReasons(_: *const NavigationTiming) ?js.Object {
++        return null;
++    }
++
++    fn toJSON(self: *const NavigationTiming, exec: *const Execution) !js.Object {
++        const local = exec.js.local.?;
++        const result = (try local.zigValueToJs(self._proto.toJSON(), .{})).toObject();
++        inline for (zero_fields) |name| {
++            if (!(try result.set(name, @as(f64, 0), .{}))) return error.JsException;
++        }
++        if (!(try result.set("type", self.getType(), .{}))) return error.JsException;
++        if (!(try result.set("redirectCount", self.getRedirectCount(), .{}))) return error.JsException;
++        if (!(try result.set("notRestoredReasons", null, .{}))) return error.JsException;
++        return result;
++    }
++
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(NavigationTiming);
++        pub const Meta = struct {
++            pub const name = "PerformanceNavigationTiming";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++
++        pub const unloadEventStart = bridge.accessor(getZero, null, .{});
++        pub const unloadEventEnd = bridge.accessor(getZero, null, .{});
++        pub const domInteractive = bridge.accessor(getZero, null, .{});
++        pub const domContentLoadedEventStart = bridge.accessor(getZero, null, .{});
++        pub const domContentLoadedEventEnd = bridge.accessor(getZero, null, .{});
++        pub const domComplete = bridge.accessor(getZero, null, .{});
++        pub const loadEventStart = bridge.accessor(getZero, null, .{});
++        pub const loadEventEnd = bridge.accessor(getZero, null, .{});
++        pub const activationStart = bridge.accessor(getZero, null, .{});
++        pub const criticalCHRestart = bridge.accessor(getZero, null, .{});
++        pub const @"type" = bridge.accessor(getType, null, .{});
++        pub const redirectCount = bridge.accessor(getRedirectCount, null, .{});
++        pub const notRestoredReasons = bridge.accessor(getNotRestoredReasons, null, .{});
++        pub const toJSON = bridge.function(NavigationTiming.toJSON, .{});
++    };
++};
++
+ /// PerformanceTiming — Navigation Timing Level 1 (legacy, but widely used).
+ /// https://developer.mozilla.org/en-US/docs/Web/API/PerformanceTiming
+ /// All properties return 0 as stub values; the object must not be undefined
+diff --git a/src/browser/webapi/PerformanceObserver.zig b/src/browser/webapi/PerformanceObserver.zig
+index b8d49f8..b262080 100644
+--- a/src/browser/webapi/PerformanceObserver.zig
++++ b/src/browser/webapi/PerformanceObserver.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -138,6 +139,7 @@ pub fn observe(self: *PerformanceObserver, maybe_options: ?ObserveOptions) !void
+     // Deliver existing entries if buffered option is set (only honoured
+     // with `type`, see above). Delivery is async via a queued task.
+     if (options.buffered and options.type != null and !self.hasRecords()) {
++        try self._performance.ensureNavigation();
+         for ([_][]const *Performance.Entry{ self._performance._entries.items, self._performance._resources.items }) |list| {
+             for (list) |entry| {
+                 if (self.interested(entry)) {
+@@ -169,8 +171,11 @@ pub fn takeRecords(self: *PerformanceObserver) ![]*Performance.Entry {
+     return records;
+ }
+ 
+-fn getSupportedEntryTypes() []const []const u8 {
+-    return &.{ "mark", "measure", "resource" };
++fn getSupportedEntryTypes(exec: *const Execution) []const []const u8 {
++    return switch (exec.js.global) {
++        .frame => &.{ "mark", "measure", "navigation", "resource" },
++        .worker => &.{ "mark", "measure", "resource" },
++    };
+ }
+ 
+ /// Returns true if observer interested with given entry.

@@ -1,0 +1,910 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 13 Oct 2026 01:59:00 -0300
+Subject: [PATCH] webapi: expose Chrome-like PDF plugin and MIME surface
+
+Hardcode the default PDF-enabled desktop profile from Chromium
+634b046faf2137b83af71c87baf362b533af9104. Expose native PluginArray,
+Plugin, MimeTypeArray and MimeType bindings with legacy properties and
+intrinsic array iteration. Cache navigator collections, plugins and
+global MIME entries while finalizing fresh plugin-level MIME wrappers.
+
+Preserve per-document Navigator state and owning realms across
+WindowProxy reuse, and detach PDF ownership on frame removal and popup
+close. refresh(true) schedules the owning frame reload.
+
+This is fingerprint metadata only, not PDF rendering.
+---
+ src/browser/Frame.zig                      |  23 ++++
+ src/browser/js/Local.zig                   |  14 ++-
+ src/browser/js/Snapshot.zig                |  13 ++
+ src/browser/tests/navigator/navigator.html |   5 +-
+ src/browser/webapi/MimeType.zig            |  87 ++++++++++++++
+ src/browser/webapi/MimeTypeArray.zig       |  79 ++++++++++++
+ src/browser/webapi/Navigator.zig           |  51 +++++++-
+ src/browser/webapi/Plugin.zig              |  83 +++++++++++++
+ src/browser/webapi/PluginArray.zig         | 114 +++++++++---------
+ src/browser/webapi/Window.zig              |   6 +-
+ src/browser/webapi/pdf_collection.zig      | 132 +++++++++++++++++++++
+ 11 files changed, 543 insertions(+), 64 deletions(-)
+ create mode 100644 src/browser/webapi/MimeType.zig
+ create mode 100644 src/browser/webapi/MimeTypeArray.zig
+ create mode 100644 src/browser/webapi/Plugin.zig
+ create mode 100644 src/browser/webapi/pdf_collection.zig
+
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index 11d7028..e9ccd68 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -386,9 +387,12 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
+         });
+     }
+ 
++    const navigator = try arena.create(@import("webapi/Navigator.zig"));
++    navigator.* = .{ ._frame = self };
+     const window_template = Window{
+         ._frame = self,
+         ._proto = undefined,
++        ._navigator = navigator,
+         ._document = self.document,
+         ._location = undefined,
+         ._performance = try .init(factory, arena),
+@@ -475,6 +479,7 @@ pub fn deinit(self: *Frame) void {
+         cs.detach();
+     }
+ 
++    self.window._navigator.detachPdf();
+     if (self.window._navigator._service_worker) |container| {
+         container.detach();
+     }
+@@ -540,6 +545,21 @@ pub fn deinit(self: *Frame) void {
+     self._local_arena.release();
+ }
+ 
++pub fn detachPdf(self: *Frame) void {
++    self.window._navigator.detachPdf();
++    for (self.child_frames.items) |child| child.detachPdf();
++}
++
++fn detachDisconnectedPdf(self: *Frame) void {
++    if (self.iframe) |iframe| {
++        if (!iframe.asNode().isConnected()) {
++            self.detachPdf();
++            return;
++        }
++    }
++    for (self.child_frames.items) |child| child.detachDisconnectedPdf();
++}
++
+ pub fn viewportChanged(self: *Frame) void {
+     var i: usize = 0;
+     while (i < self._media_query_lists.items.len) : (i += 1) {
+@@ -2819,6 +2839,9 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
+         return;
+     }
+ 
++    self.page.frame.detachDisconnectedPdf();
++    for (self.page.popups.items) |popup| popup.detachDisconnectedPdf();
++
+     // Focus goes with the removed subtree. The focused element can be inside a
+     // shadow tree hanging off it, which the walk below doesn't descend into,
+     // so ask it directly whether it's still in the document.
+diff --git a/src/browser/js/Local.zig b/src/browser/js/Local.zig
+index fee409a..aadbb61 100644
+--- a/src/browser/js/Local.zig
++++ b/src/browser/js/Local.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -269,6 +270,11 @@ pub fn mapZigInstanceToJs(self: *const Local, js_obj_handle: ?*const v8.Object,
+         .pointer => |ptr| {
+             const resolved = resolveValue(value);
+ 
++            const JsApi = bridge.Struct(ptr.child).JsApi;
++            const creation_context = if (comptime @hasDecl(JsApi.Meta, "creation_context"))
++                JsApi.Meta.creation_context(value, self)
++            else
++                self.handle;
+             const resolved_ptr_id = @intFromPtr(resolved.ptr);
+             const gop = try ctx.addIdentity(resolved_ptr_id);
+             if (gop.found_existing) {
+@@ -280,7 +286,6 @@ pub fn mapZigInstanceToJs(self: *const Local, js_obj_handle: ?*const v8.Object,
+             }
+ 
+             const isolate = self.isolate;
+-            const JsApi = bridge.Struct(ptr.child).JsApi;
+ 
+             // Sometimes we're creating a new Object, like when
+             // we're returning a value from a function. In those cases
+@@ -294,7 +299,9 @@ pub fn mapZigInstanceToJs(self: *const Local, js_obj_handle: ?*const v8.Object,
+                 .handle = js_obj_handle orelse blk: {
+                     const function_template_handle = ctx.templates[resolved.class_id];
+                     const object_template_handle = v8.v8__FunctionTemplate__InstanceTemplate(function_template_handle).?;
+-                    break :blk v8.v8__ObjectTemplate__NewInstance(object_template_handle, self.handle).?;
++                    v8.v8__Context__Enter(creation_context);
++                    defer v8.v8__Context__Exit(creation_context);
++                    break :blk v8.v8__ObjectTemplate__NewInstance(object_template_handle, creation_context).?;
+                 },
+             };
+ 
+@@ -1378,6 +1385,9 @@ fn resolveT(comptime T: type, value: *T) Resolved {
+         .class_id = Meta.class_id,
+         .prototype_chain = &Meta.prototype_chain,
+         .finalizer = blk: {
++            if (comptime @hasDecl(Meta, "has_finalizer")) {
++                if (!Meta.has_finalizer(value)) break :blk null;
++            }
+             const FT = (comptime findFinalizerType(T)) orelse break :blk null;
+             const getFinalizerPtr = comptime finalizerPtrGetter(T, FT);
+             const finalizer_ptr = getFinalizerPtr(value);
+diff --git a/src/browser/js/Snapshot.zig b/src/browser/js/Snapshot.zig
+index ccd6f02..220496e 100644
+--- a/src/browser/js/Snapshot.zig
++++ b/src/browser/js/Snapshot.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -341,6 +342,18 @@ fn createSnapshotContext(
+             }
+         }
+ 
++        if (comptime @hasDecl(JsApi.Meta, "array_iterator") and JsApi.Meta.array_iterator) {
++            // Use the realm's intrinsic, not a custom callback or injected JS.
++            const array = v8.v8__Array__New(isolate, 0).?;
++            const array_proto = v8.v8__Object__GetPrototype(@ptrCast(array)).?;
++            const values_key = v8.v8__String__NewFromUtf8(isolate, "values", v8.kNormal, 6);
++            const values = v8.v8__Object__Get(@ptrCast(array_proto), context, values_key) orelse return error.IteratorLookupFailed;
++            const proto = v8.v8__Object__Get(@ptrCast(func), context, prototype_key) orelse return error.PrototypeLookupFailed;
++            var result: v8.MaybeBool = undefined;
++            v8.v8__Object__DefineOwnProperty(@ptrCast(proto), context, @ptrCast(v8.v8__Symbol__GetIterator(isolate)), values, v8.DontEnum, &result);
++            if (!result.has_value or !result.value) return error.IteratorInstallFailed;
++        }
++
+         // WebIDL [Exposed=...] gating. Members are installed on the shared
+         // FunctionTemplate by attachClass; here we delete the ones that don't
+         // match this realm from the per-context Func.prototype.
+diff --git a/src/browser/tests/navigator/navigator.html b/src/browser/tests/navigator/navigator.html
+index 248b477..9b9d134 100644
+--- a/src/browser/tests/navigator/navigator.html
++++ b/src/browser/tests/navigator/navigator.html
+@@ -1,4 +1,5 @@
+ <!DOCTYPE html>
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
+ <script src="../testing.js"></script>
+ 
+ <script id=navigator>
+@@ -52,7 +53,7 @@
+ </script>
+ 
+ <script id=navigator_plugins_named_presence>
+-  // No plugin is exposed, so PluginArray has no named properties at all.
++  // Unknown plugin names are absent even when PDF plugins are exposed.
+   testing.expectEqual(false, 'anything' in navigator.plugins);
+   testing.expectEqual(false, Object.hasOwn(navigator.plugins, 'anything'));
+   testing.expectEqual(null, navigator.plugins.namedItem('anything'));
+@@ -64,7 +65,7 @@
+ <script id=navigator_plugins_iterable>
+   // WebIDL: indexed getter => @@iterator (Chrome: [...navigator.plugins] works)
+   testing.expectEqual('function', typeof navigator.plugins[Symbol.iterator]);
+-  testing.expectEqual(0, [...navigator.plugins].length);
++  testing.expectEqual(5, [...navigator.plugins].length);
+ </script>
+ 
+ <script id=navigator_native_descriptor_walk>
+diff --git a/src/browser/webapi/MimeType.zig b/src/browser/webapi/MimeType.zig
+new file mode 100644
+index 0000000..e721802
+--- /dev/null
++++ b/src/browser/webapi/MimeType.zig
+@@ -0,0 +1,87 @@
++// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
++//
++// Francis Bouvier <francis@lightpanda.io>
++// Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const Plugin = @import("Plugin.zig");
++
++const MimeType = @This();
++
++pub const names = [_][]const u8{ "application/pdf", "text/pdf" };
++
++_plugin: *Plugin,
++_index: u32,
++_cached: bool = false,
++_rc: lp.RC = .{},
++
++pub fn acquireRef(self: *MimeType) void {
++    self._rc.acquire();
++}
++
++pub fn releaseRef(self: *MimeType, page: *Page) void {
++    self._rc.release(self, page);
++}
++
++pub fn deinit(self: *MimeType, page: *Page) void {
++    page.factory.destroyStandalone(self);
++}
++
++fn hasFinalizer(self: *const MimeType) bool {
++    // The two global entries are arena-owned and strongly identity-cached.
++    // Plugin-level entries use the factory and weak-wrapper finalization.
++    return !self._cached;
++}
++
++pub fn creationContext(self: *const MimeType, local: *const js.Local) *const js.v8.Context {
++    return self._plugin.creationContext(local);
++}
++
++pub fn getType(self: *const MimeType) []const u8 {
++    return names[self._index];
++}
++
++pub fn getSuffixes(_: *const MimeType) []const u8 {
++    return "pdf";
++}
++
++pub fn getDescription(_: *const MimeType) []const u8 {
++    return "Portable Document Format";
++}
++
++pub fn getEnabledPlugin(self: *const MimeType) ?*Plugin {
++    return if (self._plugin._array._frame != null) self._plugin else null;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(MimeType);
++
++    pub const Meta = struct {
++        pub const name = "MimeType";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++        pub const creation_context = MimeType.creationContext;
++        pub const has_finalizer = MimeType.hasFinalizer;
++    };
++
++    pub const @"type" = bridge.accessor(MimeType.getType, null, .{});
++    pub const suffixes = bridge.accessor(MimeType.getSuffixes, null, .{});
++    pub const description = bridge.accessor(MimeType.getDescription, null, .{});
++    pub const enabledPlugin = bridge.accessor(MimeType.getEnabledPlugin, null, .{});
++};
+diff --git a/src/browser/webapi/MimeTypeArray.zig b/src/browser/webapi/MimeTypeArray.zig
+new file mode 100644
+index 0000000..83d9638
+--- /dev/null
++++ b/src/browser/webapi/MimeTypeArray.zig
+@@ -0,0 +1,79 @@
++// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
++//
++// Francis Bouvier <francis@lightpanda.io>
++// Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const js = @import("../js/js.zig");
++const std = @import("std");
++const PluginArray = @import("PluginArray.zig");
++const MimeType = @import("MimeType.zig");
++
++const MimeTypeArray = @This();
++
++_plugins: *PluginArray,
++_mimes: [MimeType.names.len]*MimeType,
++
++pub fn init(plugins: *PluginArray) !*MimeTypeArray {
++    const self = try plugins._arena.create(MimeTypeArray);
++    self._plugins = plugins;
++    const first = plugins._plugins[0];
++    for (0..MimeType.names.len) |i| {
++        const mime = try plugins._arena.create(MimeType);
++        mime.* = .{ ._plugin = first, ._index = @intCast(i), ._cached = true };
++        self._mimes[i] = mime;
++    }
++    return self;
++}
++
++pub fn creationContext(self: *const MimeTypeArray, local: *const js.Local) *const js.v8.Context {
++    return self._plugins.creationContext(local);
++}
++
++pub fn getLength(_: *const MimeTypeArray) u32 {
++    return MimeType.names.len;
++}
++
++pub fn getAtIndex(self: *const MimeTypeArray, index: u32) ?*MimeType {
++    if (index >= MimeType.names.len) return null;
++    return self._mimes[index];
++}
++
++pub fn getByName(self: *const MimeTypeArray, name: []const u8) ?*MimeType {
++    for (MimeType.names, 0..) |supported, i| {
++        if (std.mem.eql(u8, name, supported)) return self._mimes[i];
++    }
++    return null;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(MimeTypeArray);
++    const Collection = @import("pdf_collection.zig").Binding(MimeTypeArray, MimeType, &MimeType.names);
++
++    pub const Meta = struct {
++        pub const name = "MimeTypeArray";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++        pub const array_iterator = true;
++        pub const creation_context = MimeTypeArray.creationContext;
++    };
++
++    pub const length = bridge.accessor(MimeTypeArray.getLength, null, .{});
++    pub const @"[int]" = Collection.indexed;
++    pub const @"[str]" = Collection.named;
++    pub const item = Collection.item;
++    pub const namedItem = Collection.namedItem;
++};
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index 4c09aac..af1e84c 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -24,6 +25,7 @@ const Frame = @import("../Frame.zig");
+ const Execution = js.Execution;
+ 
+ const PluginArray = @import("PluginArray.zig");
++const MimeTypeArray = @import("MimeTypeArray.zig");
+ const Permissions = @import("Permissions.zig");
+ const ModelContext = @import("ModelContext.zig");
+ const StorageManager = @import("StorageManager.zig");
+@@ -37,12 +39,15 @@ comptime {
+     // Ensure we don't cause an identity map conflict. Because _geolocation is
+     // lazy and, for now, Zig orders the highest-aligned field first, none of
+     // the other fields land at offset 0.
+-    for ([_][]const u8{ "_plugins", "_permissions", "_storage", "_ua_data" }) |name| {
++    for ([_][]const u8{ "_permissions", "_storage", "_ua_data" }) |name| {
+         if (@offsetOf(Navigator, name) == 0) @compileError(name ++ " aliases the Navigator");
+     }
+ }
+ 
+-_plugins: PluginArray = .{},
++_frame: ?*Frame = null,
++_pdf_detached: bool = false,
++_plugins: ?*PluginArray = null,
++_mime_types: ?*MimeTypeArray = null,
+ _permissions: Permissions = .{},
+ _geolocation: ?*Geolocation = null,
+ _storage: StorageManager = .{},
+@@ -143,8 +148,43 @@ fn sendBeacon(_: *const Navigator, url: js.Value, data: ?js.Value) bool {
+     return true;
+ }
+ 
+-fn getPlugins(self: *Navigator) *PluginArray {
+-    return &self._plugins;
++pub fn creationContext(self: *const Navigator, local: *const js.Local) *const js.v8.Context {
++    if (local.ctx.identity.identity_map.getPtr(@intFromPtr(self))) |global| {
++        const wrapper = js.v8.v8__Global__Get(global, local.isolate.handle).?;
++        return js.v8.v8__Object__GetCreationContext(@ptrCast(wrapper)).?;
++    }
++    if (!self._pdf_detached) {
++        if (self._frame) |frame| {
++            if (local.ctx.identity == frame.js.identity) {
++                return @ptrCast(js.v8.v8__Global__Get(&frame.js.handle, local.isolate.handle).?);
++            }
++        }
++    }
++    return local.handle;
++}
++
++fn getPlugins(self: *Navigator) !*PluginArray {
++    if (self._plugins) |plugins| return plugins;
++    const plugins = try PluginArray.init(self._frame.?, self);
++    if (self._pdf_detached) plugins._frame = null;
++    self._plugins = plugins;
++    return plugins;
++}
++
++fn getMimeTypes(self: *Navigator) !*MimeTypeArray {
++    if (self._mime_types) |mimes| return mimes;
++    const mimes = try MimeTypeArray.init(try self.getPlugins());
++    self._mime_types = mimes;
++    return mimes;
++}
++
++fn getPdfViewerEnabled(_: *const Navigator) bool {
++    return true;
++}
++
++pub fn detachPdf(self: *Navigator) void {
++    self._pdf_detached = true;
++    if (self._plugins) |plugins| plugins._frame = null;
+ }
+ 
+ fn getPermissions(self: *Navigator) *Permissions {
+@@ -257,6 +297,7 @@ pub const JsApi = struct {
+ 
+     pub const Meta = struct {
+         pub const name = "Navigator";
++        pub const creation_context = Navigator.creationContext;
+         pub const prototype_chain = bridge.prototypeChain();
+         pub var class_id: bridge.ClassId = undefined;
+     };
+@@ -286,6 +327,8 @@ pub const JsApi = struct {
+     pub const serviceWorker = bridge.accessor(Navigator.getServiceWorker, null, .{});
+     pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});
+     pub const plugins = bridge.accessor(Navigator.getPlugins, null, .{});
++    pub const mimeTypes = bridge.accessor(Navigator.getMimeTypes, null, .{});
++    pub const pdfViewerEnabled = bridge.accessor(Navigator.getPdfViewerEnabled, null, .{});
+     pub const geolocation = bridge.accessor(Navigator.getGeolocation, null, .{});
+     pub const modelContext = bridge.accessor(Navigator.getModelContext, null, .{});
+     pub const registerProtocolHandler = bridge.function(Navigator.registerProtocolHandler, .{});
+diff --git a/src/browser/webapi/Plugin.zig b/src/browser/webapi/Plugin.zig
+new file mode 100644
+index 0000000..1a6ba49
+--- /dev/null
++++ b/src/browser/webapi/Plugin.zig
+@@ -0,0 +1,83 @@
++// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
++//
++// Francis Bouvier <francis@lightpanda.io>
++// Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const js = @import("../js/js.zig");
++const std = @import("std");
++const PluginArray = @import("PluginArray.zig");
++const MimeType = @import("MimeType.zig");
++
++const Plugin = @This();
++
++_array: *PluginArray,
++_name: []const u8,
++
++pub fn creationContext(self: *const Plugin, local: *const js.Local) *const js.v8.Context {
++    return self._array.creationContext(local);
++}
++
++pub fn getName(self: *const Plugin) []const u8 {
++    return self._name;
++}
++
++pub fn getFilename(_: *const Plugin) []const u8 {
++    return "internal-pdf-viewer";
++}
++
++pub fn getDescription(_: *const Plugin) []const u8 {
++    return "Portable Document Format";
++}
++
++pub fn getLength(_: *const Plugin) u32 {
++    return MimeType.names.len;
++}
++
++pub fn getAtIndex(self: *Plugin, index: u32) !?*MimeType {
++    if (index >= MimeType.names.len) return null;
++    // Chromium's DOMPlugin creates a new DOMMimeType on every lookup.
++    return self._array._factory.create(MimeType{ ._plugin = self, ._index = index });
++}
++
++pub fn getByName(self: *Plugin, name: []const u8) !?*MimeType {
++    for (MimeType.names, 0..) |supported, i| {
++        if (std.mem.eql(u8, name, supported)) return self.getAtIndex(@intCast(i));
++    }
++    return null;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Plugin);
++    const Collection = @import("pdf_collection.zig").Binding(Plugin, MimeType, &MimeType.names);
++
++    pub const Meta = struct {
++        pub const name = "Plugin";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++        pub const array_iterator = true;
++        pub const creation_context = Plugin.creationContext;
++    };
++
++    pub const name = bridge.accessor(Plugin.getName, null, .{});
++    pub const filename = bridge.accessor(Plugin.getFilename, null, .{});
++    pub const description = bridge.accessor(Plugin.getDescription, null, .{});
++    pub const length = bridge.accessor(Plugin.getLength, null, .{});
++    pub const @"[int]" = Collection.indexed;
++    pub const @"[str]" = Collection.named;
++    pub const item = Collection.item;
++    pub const namedItem = Collection.namedItem;
++};
+diff --git a/src/browser/webapi/PluginArray.zig b/src/browser/webapi/PluginArray.zig
+index 3f0fe69..c78f669 100644
+--- a/src/browser/webapi/PluginArray.zig
++++ b/src/browser/webapi/PluginArray.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -17,83 +18,88 @@
+ // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ 
+ const js = @import("../js/js.zig");
++const std = @import("std");
+ const Frame = @import("../Frame.zig");
+-const GenericIterator = @import("collections/iterator.zig").Entry;
+-
+-pub fn registerTypes() []const type {
+-    return &.{ PluginArray, Plugin, ValueIterator };
+-}
++const Factory = @import("../Factory.zig");
++const Navigator = @import("Navigator.zig");
++const Plugin = @import("Plugin.zig");
++const MimeType = @import("MimeType.zig");
++const MimeTypeArray = @import("MimeTypeArray.zig");
+ 
+ const PluginArray = @This();
+ 
+-_pad: bool = false,
++pub const names = [_][]const u8{
++    "PDF Viewer",
++    "Chrome PDF Viewer",
++    "Chromium PDF Viewer",
++    "Microsoft Edge PDF Viewer",
++    "WebKit built-in PDF",
++};
+ 
+-pub fn refresh(_: *const PluginArray) void {}
+-pub fn getAtIndex(_: *const PluginArray, index: usize) ?*Plugin {
+-    _ = index;
+-    return null;
++_frame: ?*Frame,
++_navigator: *Navigator,
++_factory: *Factory,
++_arena: std.mem.Allocator,
++_plugins: [names.len]*Plugin,
++
++pub fn init(frame: *Frame, navigator: *Navigator) !*PluginArray {
++    const self = try frame.arena.create(PluginArray);
++    self.* = .{ ._frame = frame, ._navigator = navigator, ._factory = frame._factory, ._arena = frame.arena, ._plugins = undefined };
++    for (names, 0..) |name, i| {
++        const plugin = try frame.arena.create(Plugin);
++        plugin.* = .{ ._array = self, ._name = name };
++        self._plugins[i] = plugin;
++    }
++    return self;
+ }
+ 
+-pub fn getByName(_: *const PluginArray, name: []const u8) ?*Plugin {
+-    _ = name;
+-    return null;
++pub fn registerTypes() []const type {
++    return &.{ PluginArray, Plugin, MimeType, MimeTypeArray };
+ }
+ 
+-// Cannot be constructed, and we currently never return any, so no reason to
+-// implement anything on it (for now)
+-const Plugin = struct {
+-    pub const JsApi = struct {
+-        pub const bridge = js.Bridge(Plugin);
+-        pub const Meta = struct {
+-            pub const name = "Plugin";
+-            pub const prototype_chain = bridge.prototypeChain();
+-            pub var class_id: bridge.ClassId = undefined;
+-            pub const empty_with_no_proto = true;
+-        };
+-    };
+-};
++pub fn creationContext(self: *const PluginArray, local: *const js.Local) *const js.v8.Context {
++    // Navigator's wrapper anchors the realm even when only mimeTypes was read.
++    return self._navigator.creationContext(local);
++}
+ 
+-fn values(_: *const PluginArray, frame: *Frame) !*ValueIterator {
+-    return .init(.{}, frame);
++pub fn refresh(self: *const PluginArray, reload: ?bool) !void {
++    if (!(reload orelse false)) return;
++    const frame = self._frame orelse return;
++    return frame.scheduleNavigation(frame.url, .{ .reason = .script, .kind = .reload }, .{ .script = frame });
+ }
+ 
+-const ValueIterator = GenericIterator(Iterator, null);
++pub fn getLength(_: *const PluginArray) u32 {
++    return names.len;
++}
++
++pub fn getAtIndex(self: *const PluginArray, index: u32) ?*Plugin {
++    if (index >= names.len) return null;
++    return self._plugins[index];
++}
+ 
+-const Iterator = struct {
+-    pub fn next(_: *Iterator, _: *Frame) ?*Plugin {
+-        return null;
++pub fn getByName(self: *const PluginArray, name: []const u8) ?*Plugin {
++    for (names, 0..) |supported, i| {
++        if (std.mem.eql(u8, name, supported)) return self._plugins[i];
+     }
+-};
++    return null;
++}
+ 
+ pub const JsApi = struct {
+     pub const bridge = js.Bridge(PluginArray);
++    const Collection = @import("pdf_collection.zig").Binding(PluginArray, Plugin, &names);
+ 
+     pub const Meta = struct {
+         pub const name = "PluginArray";
+         pub const prototype_chain = bridge.prototypeChain();
+         pub var class_id: bridge.ClassId = undefined;
+-        pub const empty_with_no_proto = true;
++        pub const array_iterator = true;
++        pub const creation_context = PluginArray.creationContext;
+     };
+ 
+-    pub const length = bridge.property(0, .{ .template = false });
+     pub const refresh = bridge.function(PluginArray.refresh, .{});
+-    pub const @"[int]" = bridge.indexed(PluginArray.getAtIndex, null, .{ .null_as_undefined = true });
+-    pub const @"[str]" = bridge.namedIndexed(PluginArray.getByName, null, null, null, struct {
+-        fn wrap(_: *const PluginArray, _: []const u8) !u32 {
+-            // No plugin is ever exposed, so there are no named properties.
+-            return error.NotHandled;
+-        }
+-    }.wrap, .{ .null_as_undefined = true });
+-
+-    pub const item = bridge.function(struct {
+-        fn wrap(self: *const PluginArray, index: i32) ?*Plugin {
+-            if (index < 0) {
+-                return null;
+-            }
+-            return self.getAtIndex(@intCast(index));
+-        }
+-    }.wrap, .{});
+-
+-    pub const namedItem = bridge.function(PluginArray.getByName, .{});
+-    pub const symbol_iterator = bridge.iterator(PluginArray.values, .{});
++    pub const length = bridge.accessor(PluginArray.getLength, null, .{});
++    pub const @"[int]" = Collection.indexed;
++    pub const @"[str]" = Collection.named;
++    pub const item = Collection.item;
++    pub const namedItem = Collection.namedItem;
+ };
+diff --git a/src/browser/webapi/Window.zig b/src/browser/webapi/Window.zig
+index 6205956..f389ffb 100644
+--- a/src/browser/webapi/Window.zig
++++ b/src/browser/webapi/Window.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -71,7 +72,7 @@ _document: *Document,
+ _css: CSS = .init,
+ _crypto: Crypto = .init,
+ _console: Console = .init,
+-_navigator: Navigator = .init,
++_navigator: *Navigator,
+ _model_context: ModelContext = .init,
+ _screen: *Screen,
+ _visual_viewport: *VisualViewport,
+@@ -245,7 +246,7 @@ fn setPageYOffset(self: *Window, value: js.Value) void {
+ }
+ 
+ fn getNavigator(self: *Window) *Navigator {
+-    return &self._navigator;
++    return self._navigator;
+ }
+ 
+ fn getScheduler(self: *Window) *Scheduler {
+@@ -788,6 +789,7 @@ pub fn close(self: *Window) void {
+     } else return;
+ 
+     self._closed = true;
++    frame.detachPdf();
+ 
+     // Any live Window holding us as its opener must drop the reference —
+     // our Frame is about to go away, and a stale _frame deref on their
+diff --git a/src/browser/webapi/pdf_collection.zig b/src/browser/webapi/pdf_collection.zig
+new file mode 100644
+index 0000000..52b0591
+--- /dev/null
++++ b/src/browser/webapi/pdf_collection.zig
+@@ -0,0 +1,132 @@
++// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
++//
++// Francis Bouvier <francis@lightpanda.io>
++// Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const js = @import("../js/js.zig");
++const Frame = @import("../Frame.zig");
++
++// The three PDF legacy collections share the same Web IDL property policy.
++pub fn Binding(comptime T: type, comptime Item: type, comptime names: []const []const u8) type {
++    return struct {
++        const bridge = js.Bridge(T);
++
++        pub const indexed = bridge.indexedFull(getAtIndex, setAtIndex, deleteAtIndex, queryAtIndex, defineAtIndex, getIndexes, .{});
++        pub const named = bridge.namedIndexedFull(getByName, null, deleteByName, getNames, queryByName, defineByName, describeByName, .{});
++        pub const item = bridge.function(itemImpl, .{});
++        pub const namedItem = bridge.function(namedItemImpl, .{});
++
++        fn lookup(self: *T, index: u32) !?*Item {
++            const result = self.getAtIndex(index);
++            return switch (@typeInfo(@TypeOf(result))) {
++                .error_union => try result,
++                else => result,
++            };
++        }
++
++        fn nameIndex(name: []const u8) ?u32 {
++            for (names, 0..) |supported, i| {
++                if (std.mem.eql(u8, name, supported)) return @intCast(i);
++            }
++            return null;
++        }
++
++        fn itemImpl(self: *T, index: js.Value) !?*Item {
++            // V8 ToUint32 implements Web IDL wraparound and rejects BigInt.
++            return lookup(self, try index.toU32());
++        }
++
++        fn namedItemImpl(self: *T, name: js.Value) !?*Item {
++            // The general bridge string conversion accepts Symbols; DOMString
++            // does not. Keep this correction local to the PDF interfaces.
++            if (name.isSymbol()) return error.TypeError;
++            const index = nameIndex(try name.toStringSlice()) orelse return null;
++            return lookup(self, index);
++        }
++
++        fn getAtIndex(self: *T, index: u32) !*Item {
++            return (try lookup(self, index)) orelse error.NotHandled;
++        }
++
++        fn getByName(self: *T, name: []const u8) !*Item {
++            return getAtIndex(self, nameIndex(name) orelse return error.NotHandled);
++        }
++
++        fn setAtIndex(_: *T, _: u32, _: js.Value) bool {
++            return false;
++        }
++
++        fn defineAtIndex(_: *T, _: u32) bool {
++            return false;
++        }
++
++        fn queryAtIndex(_: *T, index: u32) !u32 {
++            if (index < names.len) return js.v8.ReadOnly;
++            return error.NotHandled;
++        }
++
++        fn deleteAtIndex(_: *T, index: u32) !bool {
++            if (index < names.len) return false;
++            return error.NotHandled;
++        }
++
++        fn queryByName(_: *T, name: []const u8) !u32 {
++            // Like HTMLCollection, allow [[Set]] through derived receivers;
++            // the descriptor and definer enforce readonly on the collection.
++            if (nameIndex(name) != null) return js.v8.DontEnum;
++            return error.NotHandled;
++        }
++
++        fn defineByName(_: *T, name: []const u8) !bool {
++            if (nameIndex(name) != null) return false;
++            return error.NotHandled;
++        }
++
++        fn deleteByName(_: *T, name: []const u8) !bool {
++            if (nameIndex(name) != null) return false;
++            return error.NotHandled;
++        }
++
++        const Descriptor = struct {
++            value: *Item,
++            writable: bool = false,
++            enumerable: bool = false,
++            configurable: bool = true,
++        };
++
++        fn describeByName(self: *T, name: []const u8) !Descriptor {
++            return .{ .value = try getByName(self, name) };
++        }
++
++        fn getIndexes(_: *T, frame: *Frame) !js.Array {
++            var arr = frame.js.local.?.newArray(names.len);
++            for (0..names.len) |i| {
++                _ = try arr.set(@intCast(i), i, .{});
++            }
++            return arr;
++        }
++
++        fn getNames(_: *T, frame: *Frame) !js.Array {
++            var arr = frame.js.local.?.newArray(names.len);
++            for (names, 0..) |name, i| {
++                _ = try arr.set(@intCast(i), name, .{});
++            }
++            return arr;
++        }
++    };
++}

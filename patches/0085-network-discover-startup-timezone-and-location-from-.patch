@@ -1,0 +1,399 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 11 Nov 2026 15:39:07 -0300
+Subject: [PATCH] network: discover startup timezone and location from exit IP
+
+Probe https://api.ip.sb/geoip before ICU/V8 initialization using the
+configured HTTP connection and proxy authentication. Require HTTP 200,
+a bounded JSON response, a valid IP, installed IANA TZif data, and finite
+coordinates. Apply discovered timezone to Date/Intl and seed permission-gated
+geolocation with conservative 50 km accuracy.
+
+Bound the transfer to five seconds and fall back with a warning to
+America/Los_Angeles and approximate San Francisco coordinates. Explicit
+--timezone remains authoritative; locale is unchanged. Skip public discovery
+in the upstream unit-test binary.
+
+Make direct mode ignore inherited curl proxies and prevent NO_PROXY from
+bypassing an explicit proxy. Keep bearer authentication in proxy-only headers
+for both discovery and page traffic. Discovery is process-startup-only;
+rotating exits and CDP proxy changes still require restart.
+
+Validation: debug and release builds; 1658 existing upstream tests; 13 temporary
+CDP/proxy scenarios including timeout, invalid data, CA ownership, bearer
+isolation, permissions, and explicit overrides. Live direct and residential-
+proxy requests agree with browser timezone/coordinates. Benchmark timezone-
+present and timezone-matches-ip pass in both modes (127/130 overall; unrelated
+stack-depth timing, WebGL/SVG, offline audio failures). No new unit tests.
+---
+ src/App.zig                          |   9 +-
+ src/StartupLocation.zig              | 169 +++++++++++++++++++++++++++
+ src/browser/Browser.zig              |   1 +
+ src/help.zon                         |   3 +-
+ src/network/http.zig                 |  21 ++--
+ src/server/cdp/domains/emulation.zig |   3 +-
+ src/sys/libcurl.zig                  |   5 +-
+ 7 files changed, 199 insertions(+), 12 deletions(-)
+ create mode 100644 src/StartupLocation.zig
+
+diff --git a/src/App.zig b/src/App.zig
+index 124e8e6..da6507f 100644
+--- a/src/App.zig
++++ b/src/App.zig
+@@ -23,6 +23,7 @@ const Config = @import("Config.zig");
+ const Regex = @import("Regex.zig");
+ const Snapshot = @import("browser/js/Snapshot.zig");
+ const Platform = @import("browser/js/Platform.zig");
++const StartupLocation = @import("StartupLocation.zig");
+ const Telemetry = @import("telemetry/telemetry.zig").Telemetry;
+ 
+ const Network = @import("network/Network.zig");
+@@ -38,6 +39,7 @@ const App = @This();
+ network: Network,
+ config: *const Config,
+ platform: Platform,
++location: StartupLocation,
+ snapshot: Snapshot,
+ telemetry: Telemetry,
+ watchdog: Watchdog,
+@@ -49,10 +51,14 @@ regex_context: *Regex.Context,
+ default_sanitizer: *Sanitizer,
+ 
+ pub fn init(allocator: Allocator, config: *const Config) !*App {
++    const location = StartupLocation.resolve(allocator, config);
++    if (config.timezone()) |id| {
++        log.info(.app, "startup timezone override", .{ .timezone = id });
++    }
+     const platform = try Platform.init(.{
+         .v8_flags = config.v8Flags(),
+         .locale = config.locale(),
+-        .timezone = config.timezone(),
++        .timezone = config.timezone() orelse location.timezone(),
+     });
+     errdefer platform.deinit();
+ 
+@@ -69,6 +75,7 @@ pub fn init(allocator: Allocator, config: *const Config) !*App {
+         .config = config,
+         .allocator = allocator,
+         .platform = platform,
++        .location = location,
+         .snapshot = snapshot,
+         .regex_context = regex_context,
+         .network = undefined,
+diff --git a/src/StartupLocation.zig b/src/StartupLocation.zig
+new file mode 100644
+index 0000000..236d9f9
+--- /dev/null
++++ b/src/StartupLocation.zig
+@@ -0,0 +1,169 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const http = @import("network/http.zig");
++const Certificates = @import("network/Certificates.zig");
++const libcurl = @import("sys/libcurl.zig");
++const Geolocation = @import("browser/webapi/geolocation/Geolocation.zig");
++
++const StartupLocation = @This();
++
++const fallback_timezone = "America/Los_Angeles";
++const timeout_ms = 5000;
++
++timezone_buf: [65]u8 = @splat(0),
++timezone_len: usize = fallback_timezone.len,
++position: Geolocation.Override = .{
++    .latitude = 37.7749,
++    .longitude = -122.4194,
++    .accuracy = 50000,
++},
++
++pub fn timezone(self: *const StartupLocation) [:0]const u8 {
++    return self.timezone_buf[0..self.timezone_len :0];
++}
++
++pub fn resolve(allocator: std.mem.Allocator, config: *const lp.Config) StartupLocation {
++    var fallback: StartupLocation = .{};
++    @memcpy(fallback.timezone_buf[0..fallback_timezone.len], fallback_timezone);
++    // Existing upstream tests must not depend on public network availability.
++    if (lp.IS_TEST) return fallback;
++
++    const location = discover(allocator, config) catch |err| {
++        lp.log.warn(.app, "startup location fallback", .{
++            .err = err,
++            .timezone = config.timezone() orelse fallback.timezone(),
++            .location = "San Francisco, US",
++        });
++        return fallback;
++    };
++    lp.log.info(.app, "startup location discovered", .{
++        .timezone = location.timezone(),
++    });
++    return location;
++}
++
++fn discover(allocator: std.mem.Allocator, config: *const lp.Config) !StartupLocation {
++    var arena = std.heap.ArenaAllocator.init(allocator);
++    defer arena.deinit();
++    const scratch = arena.allocator();
++
++    try libcurl.curl_global_init(.{ .ssl = true }, null);
++    defer libcurl.curl_global_cleanup();
++
++    const certificates = try Certificates.init(scratch, config);
++    // A custom store is borrowed here; Network.init takes ownership later.
++    defer if (!config.tlsVerifyHost() or config.customCertStore() == null) certificates.deinit();
++
++    var conn = try http.Connection.init(certificates, config, null);
++    defer conn.deinit();
++    try conn.setURL("https://api.ip.sb/geoip");
++    try conn.setGetMode();
++    try conn.setTimeout(timeout_ms);
++    try libcurl.curl_easy_setopt(conn._easy, .connect_timeout_ms, timeout_ms);
++    try conn.setHttpVersion(config.httpVersion());
++
++    const headers = try lp.Config.HttpHeaders.init(scratch, config);
++    defer headers.deinit(scratch);
++    try conn.addHeader(scratch, "User-Agent", headers.user_agent);
++    try conn.addHeader(scratch, "Accept", "application/json");
++    try conn.secretHeaders(&headers);
++    try conn.commitHeaders();
++
++    var body: Body = .{};
++    try libcurl.curl_easy_setopt(conn._easy, .write_data, &body);
++    try libcurl.curl_easy_setopt(conn._easy, .write_function, Body.receive);
++    const status = try conn.perform();
++    if (status != 200) return error.GeolocationHttpStatus;
++
++    const payload = try std.json.parseFromSlice(struct {
++        ip: []const u8,
++        timezone: []const u8,
++        latitude: f64,
++        longitude: f64,
++    }, scratch, body.bytes[0..body.len], .{ .ignore_unknown_fields = true });
++    defer payload.deinit();
++    const geo = payload.value;
++    _ = try std.Io.net.IpAddress.parse(geo.ip, 0);
++    if (!std.math.isFinite(geo.latitude) or @abs(geo.latitude) > 90 or
++        !std.math.isFinite(geo.longitude) or @abs(geo.longitude) > 180)
++    {
++        return error.InvalidCoordinates;
++    }
++    try validateTimezone(geo.timezone);
++
++    var location: StartupLocation = .{
++        .timezone_len = geo.timezone.len,
++        .position = .{ .latitude = geo.latitude, .longitude = geo.longitude, .accuracy = 50000 },
++    };
++    @memcpy(location.timezone_buf[0..geo.timezone.len], geo.timezone);
++    return location;
++}
++
++fn validateTimezone(id: []const u8) !void {
++    try lp.Config.validateTimezone(id);
++    // Reject paths and POSIX TZ expressions; accept only installed IANA zones.
++    for (id) |c| {
++        if (!std.ascii.isAlphanumeric(c) and c != '/' and c != '_' and c != '-' and c != '+') {
++            return error.InvalidTimezone;
++        }
++    }
++    if (std.mem.indexOf(u8, id, "//") != null) return error.InvalidTimezone;
++    const area = id[0 .. std.mem.indexOfScalar(u8, id, '/') orelse id.len];
++    _ = std.meta.stringToEnum(enum {
++        Africa,
++        America,
++        Antarctica,
++        Arctic,
++        Asia,
++        Atlantic,
++        Australia,
++        Europe,
++        Indian,
++        Pacific,
++        Etc,
++        UTC,
++    }, area) orelse return error.InvalidTimezone;
++    const roots = [_][]const u8{ "/usr/share/zoneinfo/", "/var/db/timezone/zoneinfo/" };
++    for (roots) |root| {
++        var path_buf: [128]u8 = undefined;
++        const path = try std.fmt.bufPrint(&path_buf, "{s}{s}", .{ root, id });
++        const file = std.Io.Dir.cwd().openFile(lp.io, path, .{}) catch continue;
++        defer file.close(lp.io);
++        var magic: [4]u8 = undefined;
++        var reader = file.reader(lp.io, &.{});
++        reader.interface.readSliceAll(&magic) catch continue;
++        if (std.mem.eql(u8, &magic, "TZif")) return;
++    }
++    return error.UnknownTimezone;
++}
++
++const Body = struct {
++    bytes: [16384]u8 = undefined,
++    len: usize = 0,
++
++    fn receive(buffer: [*]const u8, count: usize, size: usize, ctx: *anyopaque) callconv(.c) usize {
++        const self: *Body = @ptrCast(@alignCast(ctx));
++        const length = std.math.mul(usize, count, size) catch return 0;
++        if (length > self.bytes.len - self.len) return 0;
++        @memcpy(self.bytes[self.len..][0..length], buffer[0..length]);
++        self.len += length;
++        return length;
++    }
++};
+diff --git a/src/browser/Browser.zig b/src/browser/Browser.zig
+index c5b6703..e272d42 100644
+--- a/src/browser/Browser.zig
++++ b/src/browser/Browser.zig
+@@ -140,6 +140,7 @@ pub fn init(self: *Browser, app: *App, opts: InitOpts) !void {
+         .fc_identity_pool = .empty,
+         .selector_cache = .init(allocator),
+         .watchdog_entry = undefined,
++        .geolocation_override = app.location.position,
+     };
+     self.env.protectHeapLimit();
+     try self.http_client.init(app);
+diff --git a/src/help.zon b/src/help.zon
+index 10f7185..4425ef8 100644
+--- a/src/help.zon
++++ b/src/help.zon
+@@ -528,7 +528,8 @@
+     \\          Defaults to 1000.
+     \\  --timezone <IANA>
+     \\          Time zone used by Date and Intl, e.g. Europe/Paris or UTC.
+-    \\          Defaults to the host time zone.
++    \\          Defaults to IP.SB discovery through the configured connection.
++    \\          Discovery times out after 5 seconds; fallback: America/Los_Angeles.
+     \\  --user-agent <STRING>
+     \\          Override the User-Agent header entirely. Must not impersonate other
+     \\          browsers; any value containing "Mozilla" is forbidden. The browser
+diff --git a/src/network/http.zig b/src/network/http.zig
+index 2475efa..af7eb40 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -279,6 +279,7 @@ pub const Connection = struct {
+     // curl by commitHeaders. Owned here because curl reads it during
+     // perform; freed on reset/deinit or by the next clearHeaders.
+     _header_list: ?*libcurl.CurlSList = null,
++    _proxy_header_list: ?*libcurl.CurlSList = null,
+ 
+     pub const Transport = union(enum) {
+         none, // used for cases that manage their own connection, e.g. telemetry
+@@ -391,6 +392,7 @@ pub const Connection = struct {
+ 
+     pub fn commitHeaders(self: *const Connection) !void {
+         try libcurl.curl_easy_setopt(self._easy, .http_header, self._header_list);
++        try libcurl.curl_easy_setopt(self._easy, .proxy_header, self._proxy_header_list);
+     }
+ 
+     pub fn clearHeaders(self: *Connection) void {
+@@ -398,6 +400,10 @@ pub const Connection = struct {
+             libcurl.curl_slist_free_all(list);
+             self._header_list = null;
+         }
++        if (self._proxy_header_list) |list| {
++            libcurl.curl_slist_free_all(list);
++            self._proxy_header_list = null;
++        }
+     }
+ 
+     pub fn setCookies(self: *const Connection, cookies: [*c]const u8) !void {
+@@ -487,11 +493,7 @@ pub const Connection = struct {
+ 
+         // proxy
+         const http_proxy = config.httpProxy();
+-        if (http_proxy) |proxy| {
+-            try libcurl.curl_easy_setopt(self._easy, .proxy, proxy.ptr);
+-        } else {
+-            try libcurl.curl_easy_setopt(self._easy, .proxy, null);
+-        }
++        try self.setProxy(http_proxy);
+ 
+         // TLS.
+         try libcurl.curl_easy_setopt(self._easy, .ech, "grease");
+@@ -619,7 +621,10 @@ pub const Connection = struct {
+     }
+ 
+     pub fn setProxy(self: *const Connection, proxy: ?[:0]const u8) !void {
+-        try libcurl.curl_easy_setopt(self._easy, .proxy, if (proxy) |p| p.ptr else null);
++        // Null enables curl's environment proxies; an empty string means direct.
++        try libcurl.curl_easy_setopt(self._easy, .proxy, if (proxy) |p| p.ptr else "");
++        // Explicit proxy selection must not be bypassed by inherited NO_PROXY.
++        try libcurl.curl_easy_setopt(self._easy, .noproxy, "");
+     }
+ 
+     pub fn setHttpVersion(self: *const Connection, version: Config.HttpVersion) !void {
+@@ -805,10 +810,10 @@ pub const Connection = struct {
+         };
+     }
+ 
+-    // These are headers that may not be send to the users for inteception.
++    // Proxy authorization must never be forwarded to the destination server.
+     pub fn secretHeaders(self: *Connection, http_headers: *const Config.HttpHeaders) !void {
+         if (http_headers.proxy_bearer_header) |hdr| {
+-            try self.addRawHeader(hdr);
++            self._proxy_header_list = libcurl.curl_slist_append(self._proxy_header_list, hdr) orelse return error.OutOfMemory;
+         }
+     }
+ 
+diff --git a/src/server/cdp/domains/emulation.zig b/src/server/cdp/domains/emulation.zig
+index 44d03e9..e0b731b 100644
+--- a/src/server/cdp/domains/emulation.zig
++++ b/src/server/cdp/domains/emulation.zig
+@@ -690,10 +690,11 @@ test "cdp.Emulation: navigator.geolocation needs an explicit permission grant" {
+     try testing.expectEqual(1, try errorCodeFor(bc));
+ }
+ 
+-test "cdp.Emulation: navigator.geolocation granted without an override is POSITION_UNAVAILABLE" {
++test "cdp.Emulation: navigator.geolocation cleared override is POSITION_UNAVAILABLE" {
+     var ctx = try testing.context();
+     defer ctx.deinit();
+     const bc = try ctx.loadBrowserContext(.{ .id = "BID-GEO6", .url = "cdp/dom1.html" });
++    bc.session.browser.geolocation_override = null;
+ 
+     try ctx.processMessage(.{
+         .id = 1,
+diff --git a/src/sys/libcurl.zig b/src/sys/libcurl.zig
+index b9536cb..14f399f 100644
+--- a/src/sys/libcurl.zig
++++ b/src/sys/libcurl.zig
+@@ -202,6 +202,8 @@ const CurlOption = enum(c.CURLoption) {
+     http_version = c.CURLOPT_HTTP_VERSION,
+     stream_weight = c.CURLOPT_STREAM_WEIGHT,
+     proxy = c.CURLOPT_PROXY,
++    noproxy = c.CURLOPT_NOPROXY,
++    proxy_header = c.CURLOPT_PROXYHEADER,
+     ssl_verify_host = c.CURLOPT_SSL_VERIFYHOST,
+     ssl_verify_peer = c.CURLOPT_SSL_VERIFYPEER,
+     proxy_ssl_verify_host = c.CURLOPT_PROXY_SSL_VERIFYHOST,
+@@ -644,6 +646,7 @@ pub fn curl_easy_setopt(easy: *Curl, comptime option: CurlOption, value: anytype
+ 
+         .url,
+         .proxy,
++        .noproxy,
+         .accept_encoding,
+         .ech,
+         .custom_request,
+@@ -653,7 +656,7 @@ pub fn curl_easy_setopt(easy: *Curl, comptime option: CurlOption, value: anytype
+         .copy_post_fields,
+         => @as(?[*]const u8, value),
+ 
+-        .http_header => @as(?*CurlSList, value),
++        .http_header, .proxy_header => @as(?*CurlSList, value),
+ 
+         .private,
+         .header_data,

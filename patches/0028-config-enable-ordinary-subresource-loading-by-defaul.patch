@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Fri, 16 Oct 2026 10:33:23 -0300
+Subject: [PATCH] config: enable ordinary subresource loading by default
+
+Enable image, dedicated/shared worker and external stylesheet loading by
+default alongside the iframe default from the previous patch. Reuse the
+existing native implementations and preserve per-context opt-outs through
+LP.configureLoading. Leave experimental service workers disabled.
+
+Update CLI help and deprecated-option warnings for the new defaults. Clarify
+that image loading reads at most a 16 KiB prefix for supported dimensions,
+without decoding or rendering image pixels.
+
+Keep placeholder URL/property fixtures explicitly in no-fetch mode; existing
+image and external stylesheet fetch tests continue to exercise network
+loading. Update the existing CDP stylesheet-default expectation. Add no new
+unit tests and leave the benchmark unchanged.
+
+The worker-enabled diagnostic changed four benchmark failures to passes
+without synthetic worker objects or benchmark-specific interception. The
+extra requests, script execution and CSS parsing are intentional fidelity
+costs; performance measurement is deferred.
+---
+ src/Config.zig                            | 10 +++++-----
+ src/browser/tests/element/html/image.html |  2 +-
+ src/browser/tests/element/html/link.html  |  6 +++---
+ src/browser/webapi/element/html/Image.zig |  4 ++--
+ src/browser/webapi/element/html/Link.zig  |  2 +-
+ src/help.zon                              | 10 ++++++----
+ src/server/cdp/domains/lp.zig             |  5 +++--
+ 7 files changed, 21 insertions(+), 18 deletions(-)
+
+diff --git a/src/Config.zig b/src/Config.zig
+index cf762c5..f0079d1 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -233,10 +233,10 @@ pub const HttpVersion = enum {
+ };
+ 
+ pub const LoadResources = packed struct(u4) {
+-    image: bool = false,
++    image: bool = true,
+     iframe: bool = true,
+-    worker: bool = false,
+-    stylesheet: bool = false,
++    worker: bool = true,
++    stylesheet: bool = true,
+ };
+ 
+ pub const ExperimentalFeatures = packed struct(u2) {
+@@ -286,8 +286,8 @@ const CommonOptions = .{
+     .{ .name = "cookie", .type = ?[]const u8 },
+     .{ .name = "cookie_jar", .type = ?[]const u8 },
+     .{ .name = "disable_subframes", .type = bool, .deprecated = "iframes are enabled by default; use LP.configureLoading with subFrame=false to disable" },
+-    .{ .name = "disable_workers", .type = bool, .deprecated = "workers are now disabled by default, use \"--load-resources worker\" to enable" },
+-    .{ .name = "enable_external_stylesheets", .type = bool, .deprecated = "use \"--load-resources stylesheet\" to enable" },
++    .{ .name = "disable_workers", .type = bool, .deprecated = "workers are enabled by default; use LP.configureLoading with worker=false to disable" },
++    .{ .name = "enable_external_stylesheets", .type = bool, .deprecated = "external stylesheets are enabled by default; use LP.configureLoading with externalStylesheets=false to disable" },
+     .{ .name = "disable_features", .type = DisabledFeatures, .default = DisabledFeatures{} },
+     .{ .name = "experimental_features", .type = ExperimentalFeatures, .default = ExperimentalFeatures{} },
+     .{ .name = "load_resources", .type = LoadResources, .default = LoadResources{} },
+diff --git a/src/browser/tests/element/html/image.html b/src/browser/tests/element/html/image.html
+index 368de08..27a5fe8 100644
+--- a/src/browser/tests/element/html/image.html
++++ b/src/browser/tests/element/html/image.html
+@@ -135,7 +135,7 @@
+     testing.expectEqual(false, e.composed);
+     testing.expectEqual(true, e.isTrusted);
+     testing.expectEqual(img, e.target);
+-    testing.expectEqual(0, img.naturalWidth); // Images are not fetched by default.
++    testing.expectEqual(0, img.naturalWidth); // This fixture disables image fetching.
+   });
+ </script>
+ 
+diff --git a/src/browser/tests/element/html/link.html b/src/browser/tests/element/html/link.html
+index 2831400..b2af75d 100644
+--- a/src/browser/tests/element/html/link.html
++++ b/src/browser/tests/element/html/link.html
+@@ -116,7 +116,7 @@
+ <script id="refs">
+ {
+   const rels = ['stylesheet', 'preload', 'modulepreload'];
+-  // stylesheet fetching is off by default and a bare preload has no `as`, so
++  // This fixture disables stylesheet fetching and a bare preload has no `as`, so
+   // neither touches the network. modulepreload actually fetches, so it needs
+   // a real file — the load event still fires synthetically either way.
+   const hrefs = ['/nope', '/nope', 'script/modulepreload.js'];
+@@ -138,9 +138,9 @@
+ }
+ </script>
+ 
+-<script id="ext_stylesheet_disabled_default">
++<script id="ext_stylesheet_disabled">
+ {
+-  // Flag defaults off — a <link rel=stylesheet> must NOT register a sheet
++  // Explicitly disabled — a <link rel=stylesheet> must NOT register a sheet
+   // on document.styleSheets and must NOT touch the network. The synthetic
+   // load event still fires (asserted by other tests above).
+   const before = document.styleSheets.length;
+diff --git a/src/browser/webapi/element/html/Image.zig b/src/browser/webapi/element/html/Image.zig
+index b1b05d2..5c8454b 100644
+--- a/src/browser/webapi/element/html/Image.zig
++++ b/src/browser/webapi/element/html/Image.zig
+@@ -439,11 +439,11 @@ pub const Build = struct {
+ 
+ const testing = @import("../../../../testing.zig");
+ test "WebApi: HTML.Image" {
+-    try testing.htmlRunner("element/html/image.html", .{});
++    try testing.htmlRunner("element/html/image.html", .{ .load_resources = .{ .image = false } });
+ }
+ 
+ test "WebApi: HTML.Image srcset" {
+-    try testing.htmlRunner("element/html/image_srcset.html", .{});
++    try testing.htmlRunner("element/html/image_srcset.html", .{ .load_resources = .{ .image = false } });
+ }
+ 
+ test "WebApi: HTML.Image fetch" {
+diff --git a/src/browser/webapi/element/html/Link.zig b/src/browser/webapi/element/html/Link.zig
+index 684c03c..25d1d85 100644
+--- a/src/browser/webapi/element/html/Link.zig
++++ b/src/browser/webapi/element/html/Link.zig
+@@ -204,7 +204,7 @@ pub const Build = struct {
+ 
+ const testing = @import("../../../../testing.zig");
+ test "WebApi: HTML.Link" {
+-    try testing.htmlRunner("element/html/link.html", .{});
++    try testing.htmlRunner("element/html/link.html", .{ .load_resources = .{ .stylesheet = false } });
+ }
+ 
+ test "WebApi: HTML.Link external stylesheet" {
+diff --git a/src/help.zon b/src/help.zon
+index dcbc783..faf02e3 100644
+--- a/src/help.zon
++++ b/src/help.zon
+@@ -422,14 +422,16 @@
+     \\          Defaults to none enabled.
+     \\  --load-resources <RESOURCE>
+     \\          Sub-resource to actually request. Can be passed multiple times.
+-    \\          Defaults to loading iframes; other resource types are disabled.
++    \\          Defaults to loading all resource types listed below.
++    \\          LP.configureLoading can disable images, subFrame, worker, or
++    \\          externalStylesheets per browser context by setting them to false.
+     \\          Allowed values:
+     \\             iframe      When enabled, <iframe> elements are fully loaded.
+     \\
+     \\             image       <img> sources, so that load/error reflects the real
+-    \\                         HTTP status. Only the response headers are read;
+-    \\                         images are never decoded, so naturalWidth and
+-    \\                         naturalHeight stay 0. Delays the window load event.
++    \\                         HTTP status. Reads up to 16 KiB to extract supported
++    \\                         image dimensions, but never decodes or renders images.
++    \\                         Delays the window load event.
+     \\
+     \\             stylesheet  Fetch external <link rel=stylesheet> resources so
+     \\                         their rules contribute to computed styles (and
+diff --git a/src/server/cdp/domains/lp.zig b/src/server/cdp/domains/lp.zig
+index ea554b8..0ca00a7 100644
+--- a/src/server/cdp/domains/lp.zig
++++ b/src/server/cdp/domains/lp.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -1045,8 +1046,8 @@ test "cdp.lp: configureLoading toggles externalStylesheets independently" {
+     const bc = try ctx.loadBrowserContext(.{});
+     _ = try bc.session.createPage();
+ 
+-    // Default is opt-in: off unless the CLI flag or CDP toggle enables it.
+-    try testing.expectEqual(false, bc.session.load_resources.stylesheet);
++    // External stylesheets are enabled by default.
++    try testing.expectEqual(true, bc.session.load_resources.stylesheet);
+ 
+     // Enable via CDP; the other two loading toggles stay at their defaults.
+     try ctx.processMessage(.{

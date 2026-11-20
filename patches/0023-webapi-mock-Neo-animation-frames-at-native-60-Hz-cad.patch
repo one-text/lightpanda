@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 15 Oct 2026 01:44:16 -0300
+Subject: [PATCH] webapi: mock Neo animation frames at native 60 Hz cadence
+
+Replace the fixed 5 ms Window and dedicated-worker requestAnimationFrame
+wait with per-global, phase-preserving 60 Hz deadlines for the Neo profile.
+Quantize deadlines to the existing millisecond scheduler instead of adding
+random timestamp noise or changing performance.now. Skip missed refreshes
+rather than accumulating a fixed 17 ms delay or running catch-up callbacks.
+
+Share one native performance timestamp among callbacks registered for the
+same pending frame. Detach that frame at first dispatch so callback and
+microtask registrations target the next frame. Refcount the shared frame
+through the existing callback completion, cancellation and task-finalizer
+paths; retain native bridge shape, IDs and exception/microtask handling.
+
+Allow scheduler tasks to retain an absolute deadline so all callbacks in a
+frame keep registration order even across clock-tick/preemption boundaries.
+Relative timeout, interval and idle scheduling remains unchanged. Reuse the
+existing per-callback tasks and runner completion accounting, not a new
+compositor or a global clock patch.
+
+Scope: a synthetic foreground display cadence, not graphics rendering,
+visibility throttling, actual vsync, ProMotion or adaptive refresh. The
+millisecond quantization is observable and is not a claim of exact Chrome
+timing. Keep iframe/worker loading defaults and benchmark assertions intact.
+
+References:
+https://www.apple.com/macbook-neo/specs/
+https://hothardware.com/reviews/apple-macbook-neo-review
+https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#animation-frames
+
+Validation before export: existing upstream tests 1658/1658; temporary
+Window/worker CDP diagnostics 35/35, including 2000-callback ordering,
+cancellation, microtasks, nested frames and pending navigation/worker
+teardown under allocation pressure. No new persistent unit tests.
+Two unchanged baseline benchmark runs: 86/111 (77.48%), up from 85/111;
+frame-cadence is the only status change. One reviewer pass completed;
+absolute-deadline ordering finding corrected and validation rerun.
+---
+ src/browser/js/Scheduler.zig                  |  7 +-
+ .../webapi/DedicatedWorkerGlobalScope.zig     |  3 +-
+ src/browser/webapi/Timers.zig                 | 72 +++++++++++++++++--
+ src/browser/webapi/Window.zig                 |  2 +-
+ 4 files changed, 76 insertions(+), 8 deletions(-)
+
+diff --git a/src/browser/js/Scheduler.zig b/src/browser/js/Scheduler.zig
+index 9e918f0..95358d7 100644
+--- a/src/browser/js/Scheduler.zig
++++ b/src/browser/js/Scheduler.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -80,6 +81,8 @@ const AddOpts = struct {
+     front: bool = false, // run before any other tasks, multi-fronts are FIFO amongst themselves
+     blocks_done: bool = true,
+     finalizer: ?Finalizer = null,
++    // Animation-frame callbacks must retain one absolute deadline and FIFO order.
++    run_at: ?u64 = null,
+ };
+ pub fn add(self: *Scheduler, ctx: *anyopaque, cb: Callback, run_in_ms: u32, opts: AddOpts) !void {
+     if (comptime lp.IS_DEBUG) {
+@@ -91,7 +94,7 @@ pub fn add(self: *Scheduler, ctx: *anyopaque, cb: Callback, run_in_ms: u32, opts
+         std.debug.assert(opts.front == false or run_in_ms == 0);
+     }
+ 
+-    const run_at = lp.datetime.milliTimestamp(.boot) + run_in_ms;
++    const run_at = opts.run_at orelse (lp.datetime.milliTimestamp(.boot) + run_in_ms);
+     const task: Task = .{
+         .ctx = ctx,
+         .callback = cb,
+@@ -103,7 +106,7 @@ pub fn add(self: *Scheduler, ctx: *anyopaque, cb: Callback, run_in_ms: u32, opts
+ 
+     if (opts.front) {
+         try self.front.push(self.allocator, task);
+-    } else if (run_in_ms == 0) {
++    } else if (run_in_ms == 0 and opts.run_at == null) {
+         try self.immediate.push(self.allocator, task);
+     } else {
+         try self.timed.push(self.allocator, task);
+diff --git a/src/browser/webapi/DedicatedWorkerGlobalScope.zig b/src/browser/webapi/DedicatedWorkerGlobalScope.zig
+index a8318c1..4fcc9e2 100644
+--- a/src/browser/webapi/DedicatedWorkerGlobalScope.zig
++++ b/src/browser/webapi/DedicatedWorkerGlobalScope.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -103,7 +104,7 @@ fn setOnMessageError(self: *DedicatedWorkerGlobalScope, setter: ?WorkerGlobalSco
+ }
+ 
+ pub fn requestAnimationFrame(self: *DedicatedWorkerGlobalScope, cb: js.Function.Global, exec: *js.Execution) !u32 {
+-    return self._proto._timers.schedule(exec, cb, 5, .{
++    return self._proto._timers.schedule(exec, cb, 0, .{
+         .repeat = false,
+         .params = &.{},
+         .mode = .animation_frame,
+diff --git a/src/browser/webapi/Timers.zig b/src/browser/webapi/Timers.zig
+index 26dc3dd..9848e1c 100644
+--- a/src/browser/webapi/Timers.zig
++++ b/src/browser/webapi/Timers.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -50,6 +51,8 @@ const Timers = @This();
+ _timer_id: u30 = 0,
+ _repeating: u32 = 0, // # of repeating timers we have
+ _callbacks: CallbackHashMap = .{},
++_animation_epoch_ms: ?u64 = null,
++_animation_frame: ?*AnimationFrame = null,
+ 
+ // We keep the depth of the timers (a setTimeout calling a setTimeout). When
+ // the timer depth reaches CLAMP_NESTING, the minimum timeout is 4ms. This is
+@@ -138,10 +141,16 @@ pub fn schedule(
+     };
+     gop.value_ptr.* = callback;
+ 
++    if (opts.mode == .animation_frame) {
++        callback.animation_frame = try self.animationFrame(exec);
++    }
++    errdefer if (callback.animation_frame) |frame| frame.release();
++
+     try exec.js.scheduler.add(callback, ScheduleCallback.run, delay, .{
+         .name = opts.name,
+         .blocks_done = opts.blocks_done and nesting <= BLOCKING_NESTING,
+         .finalizer = ScheduleCallback.cancelled,
++        .run_at = if (callback.animation_frame) |frame| frame.deadline_ms else null,
+     });
+ 
+     if (opts.repeat) {
+@@ -158,6 +167,62 @@ pub fn clear(self: *Timers, id: u32) void {
+     sc.value.removed = true;
+ }
+ 
++fn animationFrame(self: *Timers, exec: *js.Execution) !*AnimationFrame {
++    if (self._animation_frame) |frame| {
++        frame.references += 1;
++        return frame;
++    }
++
++    const arena = try exec.getArena(.tiny, "Timers.animationFrame");
++    errdefer arena.release();
++    const frame = try arena.create(AnimationFrame);
++    const now = lp.datetime.milliTimestamp(.boot);
++    const epoch = self._animation_epoch_ms orelse now;
++    self._animation_epoch_ms = epoch;
++    // Quantize a 60 Hz display to the scheduler's millisecond deadlines,
++    // retaining the phase instead of accumulating a fixed 17 ms delay.
++    const tick = (now - epoch) * 60 / 1000 + 1;
++    frame.* = .{
++        .timers = self,
++        .arena = arena,
++        .deadline_ms = epoch + (tick * 1000 + 59) / 60,
++    };
++    self._animation_frame = frame;
++    return frame;
++}
++
++const AnimationFrame = struct {
++    timers: *Timers,
++    arena: *lp.Arena,
++    deadline_ms: u64,
++    references: usize = 1,
++    timestamp: ?f64 = null,
++
++    fn release(self: *AnimationFrame) void {
++        self.references -= 1;
++        if (self.references == 0) {
++            if (self.timers._animation_frame == self) {
++                self.timers._animation_frame = null;
++            }
++            self.arena.release();
++        }
++    }
++
++    fn time(self: *AnimationFrame, exec: *js.Execution) f64 {
++        if (self.timestamp) |timestamp| return timestamp;
++        const timestamp = switch (exec.js.global) {
++            .frame => |frame| frame.window._performance.now(),
++            .worker => |worker| worker._performance.now(),
++        };
++        self.timestamp = timestamp;
++        // Requests from a callback or its microtasks belong to a later frame.
++        if (self.timers._animation_frame == self) {
++            self.timers._animation_frame = null;
++        }
++        return timestamp;
++    }
++};
++
+ // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-settimeout
+ // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timerhandler
+ // TimerHandler = Function or DOMString. When a string is passed, it is
+@@ -200,6 +265,7 @@ const ScheduleCallback = struct {
+     arena: *lp.Arena,
+     removed: bool = false,
+     params: []const js.Value.Global,
++    animation_frame: ?*AnimationFrame = null,
+ 
+     fn cancelled(ptr: *anyopaque) void {
+         var self: *ScheduleCallback = @ptrCast(@alignCast(ptr));
+@@ -207,6 +273,7 @@ const ScheduleCallback = struct {
+     }
+ 
+     fn deinit(self: *ScheduleCallback) void {
++        if (self.animation_frame) |frame| frame.release();
+         self.cb.release();
+         for (self.params) |param| {
+             param.release();
+@@ -239,10 +306,7 @@ const ScheduleCallback = struct {
+                 };
+             },
+             .animation_frame => {
+-                const now = switch (self.exec.js.global) {
+-                    .frame => |frame| frame.window._performance.now(),
+-                    .worker => |worker| worker._performance.now(),
+-                };
++                const now = self.animation_frame.?.time(self.exec);
+                 ls.toLocal(self.cb).call(void, .{now}) catch |err| {
+                     self.exec.page.recordJsError(err);
+                     log.debug(.js, "RAF", .{ .name = self.name, .err = err });
+diff --git a/src/browser/webapi/Window.zig b/src/browser/webapi/Window.zig
+index 1a3fde7..3372b3a 100644
+--- a/src/browser/webapi/Window.zig
++++ b/src/browser/webapi/Window.zig
+@@ -573,7 +573,7 @@ pub fn setImmediate(self: *Window, cb: js.Function.Global, params: []js.Value.Gl
+ }
+ 
+ pub fn requestAnimationFrame(self: *Window, cb: js.Function.Global, exec: *js.Execution) !u32 {
+-    return self._timers.schedule(exec, cb, 5, .{
++    return self._timers.schedule(exec, cb, 0, .{
+         .repeat = false,
+         .params = &.{},
+         .mode = .animation_frame,

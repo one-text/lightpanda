@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 2 Nov 2026 14:44:05 -0300
+Subject: [PATCH] http: add Chrome fetch keep-alive header
+
+Extend the existing pinned-curl HTTP/1.1 Connection default from
+navigation weight 256 to default-fetch weight 220. Emit keep-alive once,
+immediately after Host, matching local Chrome 154 recorder captures.
+
+Keep the existing explicit-header/suppression, close/reuse, TE, WebSocket
+and h2c guards intact. Internal/other requests, HTTP/1.0, HTTP/2, proxy
+CONNECT, navigation headers, TLS and the macOS persona remain unchanged.
+
+Validation: ReleaseFast build; all 1658 upstream tests; 22 temporary
+native wire checks covering pooled classification reset, redirects,
+overrides, both empty forms, close/reuse and upgrade/proxy handling.
+Recorder page comparisons against Chrome and the previous binary cover
+HTTP/2, HTTP/1.1 ALPN and no-ALPN fallback, cold and opted-in navigation
+and no-store fetch. All 12 HTTP/1.1 fetches gain the correctly positioned
+header; all 6 HTTP/2 fetches remain unchanged. Baseline TLS, other header
+names/values/order and navigation are unchanged. The full repeated TLS
+gate passes all eight scenarios with 20 processes per browser. Harness
+TypeScript and Zig formatting checks pass. Reviewer found no issues.
+No new unit tests.
+
+References: fingerprint/README.md; patches/0059; pinned curl 8.22.0.
+---
+ tools/curl_http1_profile.zig | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/tools/curl_http1_profile.zig b/tools/curl_http1_profile.zig
+index d39159c..7ca88b2 100644
+--- a/tools/curl_http1_profile.zig
++++ b/tools/curl_http1_profile.zig
+@@ -2,7 +2,7 @@
+ // Brenno Flávio <contato@brennoflavio.com.br>
+ // SPDX-License-Identifier: AGPL-3.0-or-later
+ 
+-//! Add Chrome's HTTP/1.1 navigation Connection default in pinned curl sources.
++//! Add Chrome's HTTP/1.1 navigation/fetch Connection default in pinned curl sources.
+ const std = @import("std");
+ 
+ pub fn main(init: std.process.Init) !void {
+@@ -38,9 +38,10 @@ const after =
+     \\      result = curlx_dyn_add(req, data->state.http_host);
+     \\      if(!result)
+     \\        result = curlx_dyn_addn(req, STRCONST("\r\n"));
+-    \\      /* Weight 256 identifies Lightpanda's non-internal navigations.
++    \\      /* Weights 256/220 identify non-internal navigation/default fetch.
+     \\       * Leave explicit headers and curl's late TE/upgrade handling alone. */
+-    \\      if(!result && httpversion == 11 && data->set.weight == 256 &&
++    \\      if(!result && httpversion == 11 &&
++    \\         (data->set.weight == 256 || data->set.weight == 220) &&
+     \\         !data->conn->bits.close && !data->set.reuse_forbid &&
+     \\         !data->set.http_transfer_encoding &&
+     \\         !(data->conn->scheme->protocol & (CURLPROTO_WS | CURLPROTO_WSS)) &&

@@ -1,0 +1,969 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 19 Oct 2026 17:52:29 -0300
+Subject: [PATCH] webapi: enforce a native script-element CSP subset
+
+Honor script-src-elem -> script-src -> default-src in document CSP meta
+policies and enforcing response headers. Apply parser meta elements on
+insertion (void elements have no completion callback), ignore body/detached
+meta elements, retain applied policies after mutation/removal, and combine
+policies restrictively with first-directive precedence.
+
+Check classic/module/import-map script elements at native preparation,
+including dynamic insertion. Support none/unsafe-inline, nonce allowances,
+SHA-256/384/512 inline hashes, self/scheme/HTTP(S) host sources, wildcard
+subdomains/ports and literal paths. Preserve unpolicied behavior, DOM
+contents and load bookkeeping. Avoid speculative fetches ahead of CSP
+meta parsing; restrict explicit preload hints as well.
+
+Check every script fetch redirect through a caller-owned guard that
+survives submitSync's context replacement. Retain redirect targets across
+classic/module preload adoption and recheck before evaluation, ignoring
+source paths only on redirected requests. Match effective default ports
+and HTTP-to-HTTPS upgrades.
+
+Copy policy containers for about:blank/srcdoc/blob and initiating data:
+navigations; queued navigation snapshots own their strings independently.
+Keep Page.setBypassCSP state across document replacement but reset it on
+target close. Add a native SecurityPolicyViolationEvent constructor,
+readonly prototype accessors and asynchronous trusted violation events.
+Update the existing CDP setup test for actual bypass state; add no tests.
+
+This is a bounded Chrome-shaped script policy shim, not a security boundary
+or full CSP3 implementation. It does not enforce eval/handler attributes,
+module dependencies, workers, other resource directives, report-only
+policies or reporting endpoints. Strict-dynamic trust propagation and
+external integrity hash authorization are unsupported. Host/path matching
+is lightweight rather than complete CSP URL canonicalization; violation
+source locations remain unknown (empty/zero).
+
+References:
+https://www.w3.org/TR/CSP3/
+https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-content-security-policy
+https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-setBypassCSP
+---
+ src/browser/Frame.zig                         |  25 +-
+ src/browser/ScriptManager.zig                 |  15 +
+ src/browser/ScriptManagerBase.zig             |  25 ++
+ src/browser/ScriptPolicy.zig                  | 310 ++++++++++++++++++
+ src/browser/Session.zig                       |   4 +
+ src/browser/frame/preload.zig                 |   8 +
+ src/browser/js/bridge.zig                     |   1 +
+ src/browser/webapi/Document.zig               |   2 +
+ src/browser/webapi/Event.zig                  |   3 +
+ src/browser/webapi/element/html/Meta.zig      |  10 +
+ .../event/SecurityPolicyViolationEvent.zig    | 111 +++++++
+ src/network/HttpClient.zig                    |   9 +
+ src/server/cdp/CDP.zig                        |   1 +
+ src/server/cdp/domains/page.zig               |  20 +-
+ 14 files changed, 537 insertions(+), 7 deletions(-)
+ create mode 100644 src/browser/ScriptPolicy.zig
+ create mode 100644 src/browser/webapi/event/SecurityPolicyViolationEvent.zig
+
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index 9c84179..2dc86a0 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -688,6 +688,9 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
+     self._load_state = .parsing;
+     self._last_navigate_error = null;
+     self._chrome_timing = .init();
++    if (std.ascii.startsWithIgnoreCase(request_url, "data:")) {
++        try self.document._script_policy.inherit(self.arena, &opts.initiator_script_policy);
++    }
+     switch (opts.kind) {
+         .reload => {
+             self._chrome_timing.navigation_type = "Reload";
+@@ -763,6 +766,11 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
+         if (is_blob) {
+             // strip out blob:
+             self.origin = try URL.getOrigin(self.arena, request_url[5.. :0]);
++            if (self.page.blob_urls.get(request_url)) |entry| {
++                if (self.page.findFrameByFrameId(entry.creator)) |creator| {
++                    try self.document._script_policy.inherit(self.arena, &creator.document._script_policy);
++                }
++            }
+         } else if (self.parent) |parent| {
+             self.origin = parent.origin;
+             if (is_about_blank or is_srcdoc) {
+@@ -770,12 +778,14 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
+                 // about:blank and about:srcdoc documents inherit their
+                 // creator's policy container, including the referrer policy
+                 self.referrer_policy = parent.referrer_policy;
++                try self.document._script_policy.inherit(self.arena, &parent.document._script_policy);
+             }
+         } else if (self.window._opener) |opener| {
+             self.origin = opener._frame.origin;
+             if (is_about_blank) {
+                 self.base_url = opener._frame.base();
+                 self.referrer_policy = opener._frame.referrer_policy;
++                try self.document._script_policy.inherit(self.arena, &opener._frame.document._script_policy);
+             }
+         } else {
+             self.origin = null;
+@@ -1115,6 +1125,9 @@ fn scheduleNavigationWithArena(originator: *Frame, arena: *lp.Arena, request_url
+     if (nav_opts.initiator_url == null and target.parent == null and std.mem.startsWith(u8, referrer_source, "http")) {
+         nav_opts.initiator_url = .{ .url = try arena.dupeZ(u8, referrer_source) };
+     }
++    if (std.ascii.startsWithIgnoreCase(resolved_url, "data:")) {
++        try nav_opts.initiator_script_policy.inherit(arena.allocator(), &originator.document._script_policy);
++    }
+     if (nav_opts.initiator_origin == null) {
+         if (originator.origin) |o| {
+             nav_opts.initiator_origin = try arena.dupe(u8, o);
+@@ -1580,7 +1593,9 @@ fn frameHeaderDoneCallback(transfer: *HttpClient.Transfer) !HttpClient.Transfer.
+             .name = try self.arena.dupe(u8, hdr.name),
+             .value = try self.arena.dupe(u8, hdr.value),
+         });
+-        if (std.mem.eql(u8, hdr.name, "referrer-policy")) {
++        if (std.mem.eql(u8, hdr.name, "content-security-policy")) {
++            try self.document._script_policy.add(self.arena, hdr.value, self.origin);
++        } else if (std.mem.eql(u8, hdr.name, "referrer-policy")) {
+             if (referrer.parseHeader(hdr.value)) |rp| {
+                 self.referrer_policy = rp;
+             }
+@@ -2184,6 +2199,7 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
+         .referer = try referrer.compute(self.call_arena, self.referrer_policy, referrer_source, url),
+         .referrer_policy = self.referrer_policy,
+         .initiator_origin = self.origin,
++        .initiator_script_policy = self.document._script_policy,
+     }) catch |err| {
+         // extra defensive..maybe navigate added a new frame, and the index it
+         // was added at was removed. Or maybe this frame was removed somehow
+@@ -2283,7 +2299,7 @@ pub fn openPopup(self: *Frame, opts: OpenPopupOpts) !*Frame {
+     // not impossible that navigate adds popups, so remove by index
+     errdefer _ = page.popups.swapRemove(popup_index);
+ 
+-    popup.navigate(resolved_url, .{ .reason = .script, .initiator_origin = self.origin }) catch |err| {
++    popup.navigate(resolved_url, .{ .reason = .script, .initiator_origin = self.origin, .initiator_script_policy = self.document._script_policy }) catch |err| {
+         log.debug(.frame, "popup navigate failure", .{ .url = resolved_url, .err = err });
+         return err;
+     };
+@@ -3123,6 +3139,9 @@ fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *Node,
+         // "replace all" record instead.
+         if (self._parse_mode != .fragment) {
+             self.notifyChildInserted(parent, child);
++            // Void meta elements are never popped from the parser's open
++            // element stack, so apply their CSP on insertion, not completion.
++            if (child.is(Element.Html.Meta)) |meta| try meta.processScriptPolicy(self);
+         }
+ 
+         if (child.is(Element)) |el| {
+@@ -3434,6 +3453,7 @@ fn nodeIsReady(self: *Frame, comptime from_parser: bool, node: *Node) !void {
+         };
+     } else if (node.is(Element.Html.Meta)) |meta| {
+         const frame = if (comptime from_parser) self else (node.ownerFrame(self) orelse return);
++        if (comptime !from_parser) try meta.processScriptPolicy(frame);
+         meta.processRefresh(frame) catch |err| {
+             log.debug(.frame, "frame.nodeIsReady", .{ .err = err, .element = "meta", .type = frame._type, .url = frame.url });
+             return err;
+@@ -3612,6 +3632,7 @@ pub const NavigateOpts = struct {
+     // chain's for a subframe.
+     initiator_url: ?Cookie.SiteForCookies = null,
+     initiator_origin: ?[]const u8 = null,
++    initiator_script_policy: @import("ScriptPolicy.zig") = .{},
+     force: bool = false,
+     kind: NavigationKind = .{ .push = null },
+ };
+diff --git a/src/browser/ScriptManager.zig b/src/browser/ScriptManager.zig
+index 824c7c2..e96ead2 100644
+--- a/src/browser/ScriptManager.zig
++++ b/src/browser/ScriptManager.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -166,6 +167,7 @@ pub fn preloadScript(self: *ScriptManager, element: ?*Element.Html, url: []const
+ 
+     try frame.makeRequest(.{
+         .ctx = script,
++        .redirect_guard = .{ .ctx = script, .check = Script.checkRedirect },
+         .url = owned_url,
+         .method = .GET,
+         .origin = frame.origin,
+@@ -272,6 +274,12 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
+ 
+     const remote_url = try URL.resolve(arena.allocator(), base_url, src, .{ .encoding = frame.charset });
+     script_element._executed = true;
++    if (!try frame.document._script_policy.allows(frame, element, "", remote_url)) {
++        try frame.queueElementEvent(@import("Factory.zig").protoOf(script_element), .@"error");
++        handover = true;
++        arena.release();
++        return;
++    }
+ 
+     const mode: Script.Extra.FrameExtra.Mode = blk: {
+         if (element.getAttributeInterned("async") != null) {
+@@ -377,12 +385,14 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
+                 consumed_preload = pre;
+                 script.source = pre.source;
+                 script.status = pre.status;
++                script.redirect_urls = pre.redirect_urls;
+                 script.complete = true;
+             } else {
+                 const settings = corsSettings(script_element.asElement(), kind == .module);
+ 
+                 const transfer = try self.base.client.newRequest(.{
+                     .url = remote_url,
++                    .redirect_guard = .{ .ctx = script, .check = Script.checkRedirect },
+                     .method = .GET,
+                     .origin = frame.origin,
+                     .resource_type = .script,
+@@ -432,6 +442,7 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
+ 
+         const transfer = try frame.newRequest(.{
+             .ctx = script,
++            .redirect_guard = .{ .ctx = script, .check = Script.checkRedirect },
+             .url = remote_url,
+             .method = .GET,
+             .origin = frame.origin,
+@@ -485,6 +496,10 @@ fn addInlineScript(self: *ScriptManager, script_element: *Element.Html.Script, k
+     };
+ 
+     script_element._executed = true;
++    if (!try frame.document._script_policy.allows(frame, script_element.asElement(), source, null)) {
++        arena.release();
++        return;
++    }
+ 
+     const mode: Script.Extra.FrameExtra.Mode = if (kind == .module) .@"defer" else .normal;
+     const script = try arena.create(Script);
+diff --git a/src/browser/ScriptManagerBase.zig b/src/browser/ScriptManagerBase.zig
+index 9910b6e..36620f7 100644
+--- a/src/browser/ScriptManagerBase.zig
++++ b/src/browser/ScriptManagerBase.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -216,6 +217,7 @@ pub fn preloadImport(self: *ScriptManagerBase, url: [:0]const u8, referrer: []co
+         errdefer self.async_scripts.remove(&script.node);
+         const transfer = try owner.newRequest(.{
+             .ctx = script,
++            .redirect_guard = if (opts.hint) .{ .ctx = script, .check = Script.checkRedirect } else null,
+             .url = url,
+             .method = .GET,
+             .origin = owner.origin(),
+@@ -612,6 +614,10 @@ pub const Script = struct {
+     // getAsyncImport replacing .import with .import_async) can't lose it.
+     hint_element: ?*Element.Html = null,
+ 
++    // Retained across preload adoption so a later element policy can also
++    // check hops fetched speculatively before that policy was encountered.
++    redirect_urls: std.ArrayList([:0]const u8) = .empty,
++
+     // for debugging a rare production issue
+     header_callback_called: bool = false,
+ 
+@@ -690,6 +696,17 @@ pub const Script = struct {
+         return (self.source_arena orelse self.arena).allocator();
+     }
+ 
++    pub fn checkRedirect(ctx: *anyopaque, url: [:0]const u8) !void {
++        const self: *Script = @ptrCast(@alignCast(ctx));
++        const frame = switch (self.manager.owner) {
++            .frame => |f| f,
++            else => return,
++        };
++        const element = if (self.extra == .frame) self.extra.frame.script_element.asElement() else null;
++        if (!try frame.document._script_policy.allowsRedirect(frame, element, url)) return error.CSPBlocked;
++        try self.redirect_urls.append(self.arena.allocator(), try self.arena.dupeZ(u8, url));
++    }
++
+     pub fn startCallback(transfer: *HttpClient.Transfer) !void {
+         log.debug(.http, "script fetch start", .{ .req = transfer });
+     }
+@@ -885,6 +902,14 @@ pub const Script = struct {
+             return;
+         }
+ 
++        for (self.redirect_urls.items) |redirect_url| {
++            const allowed = frame.document._script_policy.allowsRedirect(frame, fe.script_element.asElement(), redirect_url) catch false;
++            if (!allowed) {
++                self.executeCallback(comptime .wrap("error"));
++                return;
++            }
++        }
++
+         const previous_script = frame.document._current_script;
+         frame.document._current_script = fe.script_element;
+         defer frame.document._current_script = previous_script;
+diff --git a/src/browser/ScriptPolicy.zig b/src/browser/ScriptPolicy.zig
+new file mode 100644
+index 0000000..26a0c08
+--- /dev/null
++++ b/src/browser/ScriptPolicy.zig
+@@ -0,0 +1,310 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const Frame = @import("Frame.zig");
++const URL = @import("URL.zig");
++const Element = @import("webapi/Element.zig");
++const ViolationEvent = @import("webapi/event/SecurityPolicyViolationEvent.zig");
++const Allocator = std.mem.Allocator;
++const ScriptPolicy = @This();
++const whitespace = " \t\r\n\x0c";
++
++// Document-owned script-element CSP subset. Does not police eval, event-handler
++// attributes, module dependencies, workers, other resources or reporting URLs.
++policies: std.ArrayList(Policy) = .empty,
++
++const Policy = struct {
++    raw: []const u8,
++    sources: []const u8,
++    origin: []const u8,
++};
++
++pub fn add(self: *ScriptPolicy, arena: Allocator, serialized: []const u8, origin: ?[]const u8) !void {
++    // A response header can contain a comma-separated policy list. Each policy
++    // is enforced independently, including repeated response headers/meta tags.
++    var list = std.mem.splitScalar(u8, serialized, ',');
++    while (list.next()) |raw| {
++        const owned = try arena.dupe(u8, std.mem.trim(u8, raw, whitespace));
++        var elem: ?[]const u8 = null;
++        var script: ?[]const u8 = null;
++        var fallback: ?[]const u8 = null;
++        var directives = std.mem.splitScalar(u8, owned, ';');
++        while (directives.next()) |directive| {
++            var tokens = std.mem.tokenizeAny(u8, directive, whitespace);
++            const name = tokens.next() orelse continue;
++            const value = std.mem.trim(u8, tokens.rest(), whitespace);
++            // CSP ignores later occurrences of the same directive.
++            if (std.ascii.eqlIgnoreCase(name, "script-src-elem")) {
++                if (elem == null) elem = value;
++            } else if (std.ascii.eqlIgnoreCase(name, "script-src")) {
++                if (script == null) script = value;
++            } else if (std.ascii.eqlIgnoreCase(name, "default-src")) {
++                if (fallback == null) fallback = value;
++            }
++        }
++        const sources = elem orelse script orelse fallback orelse continue;
++        try self.policies.append(arena, .{
++            .raw = owned,
++            .sources = sources,
++            .origin = try arena.dupe(u8, origin orelse ""),
++        });
++    }
++}
++
++pub fn inherit(self: *ScriptPolicy, arena: Allocator, parent: *const ScriptPolicy) !void {
++    // Copy both list and strings: child additions must not mutate the parent's
++    // policy container, and an opener's page can be destroyed before a popup.
++    for (parent.policies.items) |policy| try self.add(arena, policy.raw, policy.origin);
++}
++
++pub fn allowsPreload(self: *const ScriptPolicy, frame: *Frame, url: [:0]const u8) !bool {
++    if (frame._session.bypass_csp) return true;
++    for (self.policies.items) |policy| {
++        if (!try matches(policy, "", "", url, false, frame.local_arena)) return false;
++    }
++    return true;
++}
++
++pub fn allows(self: *const ScriptPolicy, frame: *Frame, element: *Element, source: []const u8, url: ?[:0]const u8) !bool {
++    return self.check(frame, element, source, url, false);
++}
++
++pub fn allowsRedirect(self: *const ScriptPolicy, frame: *Frame, element: ?*Element, url: [:0]const u8) !bool {
++    if (element) |el| return self.check(frame, el, "", url, true);
++    if (frame._session.bypass_csp) return true;
++    for (self.policies.items) |policy| {
++        if (!try matches(policy, "", "", url, true, frame.local_arena)) return false;
++    }
++    return true;
++}
++
++fn check(self: *const ScriptPolicy, frame: *Frame, element: *Element, source: []const u8, url: ?[:0]const u8, redirected: bool) !bool {
++    if (frame._session.bypass_csp) return true;
++    const nonce = element.getAttributeSafe(.wrap("nonce")) orelse "";
++    var allowed = true;
++    for (self.policies.items) |policy| {
++        if (try matches(policy, nonce, source, url, redirected, frame.local_arena)) continue;
++        allowed = false;
++        try report(frame, element, policy, source, url);
++    }
++    return allowed;
++}
++
++fn matches(policy: Policy, nonce: []const u8, source: []const u8, url: ?[:0]const u8, redirected: bool, arena: Allocator) !bool {
++    var unsafe_inline = false;
++    var has_authorization = false;
++    var strict_dynamic = false;
++    var tokens = std.mem.tokenizeAny(u8, policy.sources, whitespace);
++    while (tokens.next()) |token| {
++        if (quotedValue(token, "nonce-")) |value| {
++            if (validBase64(value)) {
++                has_authorization = true;
++                if (nonce.len > 0 and std.mem.eql(u8, nonce, value)) return true;
++            }
++        } else if (hashValue(token)) |hash| {
++            has_authorization = true;
++            if (url == null and hashMatches(hash, source)) return true;
++        } else if (std.ascii.eqlIgnoreCase(token, "'unsafe-inline'")) {
++            unsafe_inline = true;
++        } else if (std.ascii.eqlIgnoreCase(token, "'strict-dynamic'")) {
++            strict_dynamic = true;
++        }
++    }
++    if (url == null) return unsafe_inline and !has_authorization and !strict_dynamic;
++    // Trust propagation and external-script integrity hashes are outside this
++    // subset; never silently turn strict-dynamic into an unrestricted allowlist.
++    if (strict_dynamic) return false;
++    tokens.reset();
++    while (tokens.next()) |token| {
++        if (try sourceMatches(token, policy.origin, url.?, redirected, arena)) return true;
++    }
++    return false;
++}
++
++fn quotedValue(token: []const u8, prefix: []const u8) ?[]const u8 {
++    if (token.len < prefix.len + 3 or token[0] != '\'' or token[token.len - 1] != '\'') return null;
++    if (!std.ascii.startsWithIgnoreCase(token[1..], prefix)) return null;
++    return token[1 + prefix.len .. token.len - 1];
++}
++
++fn validBase64(value: []const u8) bool {
++    const data = std.mem.trimEnd(u8, value, "=");
++    if (data.len == 0 or value.len - data.len > 2) return false;
++    for (data) |c| {
++        if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "+/-_", c) == null) return false;
++    }
++    return true;
++}
++
++const HashAlgorithm = enum { sha256, sha384, sha512 };
++const Hash = struct { algorithm: HashAlgorithm, encoded: []const u8 };
++fn hashValue(token: []const u8) ?Hash {
++    inline for (.{ "sha256", "sha384", "sha512" }) |name| {
++        if (quotedValue(token, name ++ "-")) |value| {
++            if (validBase64(value)) return .{ .algorithm = @field(HashAlgorithm, name), .encoded = value };
++        }
++    }
++    return null;
++}
++
++fn hashMatches(hash: Hash, source: []const u8) bool {
++    var digest: [64]u8 = undefined;
++    const size: usize = switch (hash.algorithm) {
++        .sha256 => blk: {
++            std.crypto.hash.sha2.Sha256.hash(source, digest[0..32], .{});
++            break :blk 32;
++        },
++        .sha384 => blk: {
++            std.crypto.hash.sha2.Sha384.hash(source, digest[0..48], .{});
++            break :blk 48;
++        },
++        .sha512 => blk: {
++            std.crypto.hash.sha2.Sha512.hash(source, &digest, .{});
++            break :blk 64;
++        },
++    };
++    var encoded: [88]u8 = undefined;
++    const actual = std.mem.trimEnd(u8, std.base64.standard.Encoder.encode(&encoded, digest[0..size]), "=");
++    const expected = std.mem.trimEnd(u8, hash.encoded, "=");
++    if (actual.len != expected.len) return false;
++    for (actual, expected) |a, b| {
++        const normalized: u8 = switch (b) {
++            '-' => '+',
++            '_' => '/',
++            else => b,
++        };
++        if (a != normalized) return false;
++    }
++    return true;
++}
++
++fn schemeMatches(expected: []const u8, actual: []const u8) bool {
++    return std.ascii.eqlIgnoreCase(expected, actual) or
++        (std.ascii.eqlIgnoreCase(expected, "http:") and std.ascii.eqlIgnoreCase(actual, "https:"));
++}
++
++fn sourceMatches(token: []const u8, origin: []const u8, url: [:0]const u8, redirected: bool, arena: Allocator) !bool {
++    if (std.ascii.eqlIgnoreCase(token, "'self'")) {
++        return origin.len > 0 and schemeMatches(URL.getProtocol(origin), URL.getProtocol(url)) and
++            std.ascii.eqlIgnoreCase(URL.getHostname(origin), URL.getHostname(url)) and
++            portsMatch(URL.getPort(origin), URL.getProtocol(origin), URL.getPort(url), URL.getProtocol(url));
++    }
++    if (token.len == 0 or token[0] == '\'') return false;
++    const protocol = URL.getProtocol(url);
++    if (std.mem.eql(u8, token, "*")) return std.mem.eql(u8, protocol, "http:") or std.mem.eql(u8, protocol, "https:");
++    if (token[token.len - 1] == ':') return schemeMatches(token, protocol);
++
++    // Host sources: optional scheme, wildcard subdomain/port, optional path.
++    const separator = std.mem.indexOf(u8, token, "://");
++    const scheme = if (separator) |i| token[0 .. i + 1] else URL.getProtocol(origin);
++    if (!schemeMatches(scheme, protocol)) return false;
++    const rest = if (separator) |i| token[i + 3 ..] else token;
++    const path_start = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
++    const authority = rest[0..path_start];
++    const wildcard_port = std.mem.endsWith(u8, authority, ":*");
++    const host_source = if (wildcard_port) authority[0 .. authority.len - 2] else authority;
++    const candidate = try std.fmt.allocPrintSentinel(arena, "{s}//{s}/", .{ scheme, host_source }, 0);
++    if (!URL.canParse(candidate, null)) return false;
++    const host = URL.getHostname(candidate);
++    const actual_host = URL.getHostname(url);
++    if (std.mem.startsWith(u8, host, "*.")) {
++        if (actual_host.len <= host.len - 1 or !std.ascii.endsWithIgnoreCase(actual_host, host[1..])) return false;
++    } else if (!std.mem.eql(u8, host, "*") and !std.ascii.eqlIgnoreCase(host, actual_host)) return false;
++    if (!wildcard_port) {
++        if (!portsMatch(URL.getPort(candidate), scheme, URL.getPort(url), protocol)) return false;
++    }
++    // CSP source paths constrain the initial request, not redirect targets.
++    if (!redirected and path_start < rest.len) {
++        const path = rest[path_start..];
++        const actual_path = URL.getPathname(url);
++        if (path[path.len - 1] == '/') return std.mem.startsWith(u8, actual_path, path);
++        return std.mem.eql(u8, actual_path, path);
++    }
++    return true;
++}
++
++fn portsMatch(expected: []const u8, scheme: []const u8, actual: []const u8, protocol: []const u8) bool {
++    const want = if (expected.len > 0) expected else defaultPort(scheme);
++    const got = if (actual.len > 0) actual else defaultPort(protocol);
++    return std.mem.eql(u8, want, got) or
++        (std.ascii.eqlIgnoreCase(scheme, "http:") and std.ascii.eqlIgnoreCase(protocol, "https:") and
++            std.mem.eql(u8, want, "80") and std.mem.eql(u8, got, "443"));
++}
++
++fn defaultPort(scheme: []const u8) []const u8 {
++    if (std.ascii.eqlIgnoreCase(scheme, "http:")) return "80";
++    if (std.ascii.eqlIgnoreCase(scheme, "https:")) return "443";
++    return "";
++}
++
++const ViolationTask = struct {
++    frame: *Frame,
++    element: *Element,
++    policy: Policy,
++    blocked: []const u8,
++    sample: []const u8,
++
++    fn cancel(ctx: *anyopaque) void {
++        const task: *ViolationTask = @ptrCast(@alignCast(ctx));
++        task.frame._factory.destroy(task);
++    }
++    fn run(ctx: *anyopaque) !?u32 {
++        const task: *ViolationTask = @ptrCast(@alignCast(ctx));
++        defer cancel(ctx);
++        const frame = task.frame;
++        const event = try ViolationEvent.initTrusted(.{
++            .documentURI = frame.url,
++            .referrer = frame._referrer orelse "",
++            .blockedURI = task.blocked,
++            .effectiveDirective = "script-src-elem",
++            .violatedDirective = "script-src-elem",
++            .originalPolicy = task.policy.raw,
++            .statusCode = frame._http_status orelse 0,
++            .sample = task.sample,
++            .bubbles = true,
++            .composed = true,
++        }, frame);
++        const node = task.element.asNode();
++        const target = if (node.isConnected() and node.getDocument(frame) == frame.document)
++            task.element.asEventTarget()
++        else
++            frame.document.asNode().asEventTarget();
++        try frame._event_manager.dispatch(target, event.asEvent());
++        return null;
++    }
++};
++
++fn report(frame: *Frame, element: *Element, policy: Policy, source: []const u8, url: ?[:0]const u8) !void {
++    var sample = false;
++    var tokens = std.mem.tokenizeAny(u8, policy.sources, whitespace);
++    while (tokens.next()) |token| {
++        if (std.ascii.eqlIgnoreCase(token, "'report-sample'")) sample = true;
++    }
++    const task = try frame._factory.create(ViolationTask{
++        .frame = frame,
++        .element = element,
++        .policy = policy,
++        .blocked = try frame.arena.dupe(u8, url orelse "inline"),
++        .sample = if (sample and url == null) try frame.arena.dupe(u8, source[0..@min(source.len, 40)]) else "",
++    });
++    errdefer frame._factory.destroy(task);
++    try frame.js.scheduler.add(task, ViolationTask.run, 0, .{
++        .name = "csp.securitypolicyviolation",
++        .finalizer = ViolationTask.cancel,
++    });
++}
+diff --git a/src/browser/Session.zig b/src/browser/Session.zig
+index 75cce4a..eb36595 100644
+--- a/src/browser/Session.zig
++++ b/src/browser/Session.zig
+@@ -3,6 +3,7 @@
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
+ // Brenno Flávio <contato@brennoflavio.com.br>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -117,6 +118,9 @@ load_resources: Config.LoadResources,
+ // opt-in unstable features (--experimental-features)
+ experimental_features: Config.ExperimentalFeatures,
+ 
++// CDP Page.setBypassCSP survives document replacement within this target.
++bypass_csp: bool = false,
++
+ /// Caller-supplied cancellation probe. `Runner._wait` polls it between
+ /// ticks; once `check` returns true the wait returns `error.Cancelled`.
+ /// The agent installs this so SIGINT can abort an in-flight tool call
+diff --git a/src/browser/frame/preload.zig b/src/browser/frame/preload.zig
+index ca7ad88..f1e633c 100644
+--- a/src/browser/frame/preload.zig
++++ b/src/browser/frame/preload.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -44,6 +45,7 @@ pub fn scriptHint(frame: *Frame, element: ?*Element.Html, href: []const u8) bool
+     if (!isRemoteScheme(resolved)) {
+         return false;
+     }
++    if (!(frame.document._script_policy.allowsPreload(frame, resolved) catch false)) return false;
+     return frame._script_manager.preloadScript(element, resolved) catch false;
+ }
+ 
+@@ -65,6 +67,7 @@ pub fn moduleHint(frame: *Frame, element: ?*Element.Html, href: []const u8) bool
+         return false;
+     }
+ 
++    if (!(frame.document._script_policy.allowsPreload(frame, resolved) catch false)) return false;
+     return frame._script_manager.base.preloadModuleHint(element, resolved, frame.url) catch false;
+ }
+ 
+@@ -78,6 +81,11 @@ pub fn prescan(frame: *Frame, html: []const u8) void {
+     if (frame.isGoingAway() or frame._parse_mode == .fragment) {
+         return;
+     }
++    // The prescanner has no policy/nonce tokens. Let the real parser handle
++    // CSP-bearing input in order rather than speculatively fetching scripts
++    // before their meta policy has been applied. False positives only skip an
++    // optimization; the normal script loader remains authoritative.
++    if (frame.document._script_policy.policies.items.len != 0 or std.ascii.indexOfIgnoreCase(html, "content-security-policy") != null) return;
+     const arena = frame.getArena(.small, "preload.prescan") catch return;
+     defer arena.release();
+ 
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 7176a97..0ab7e29 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1233,6 +1233,7 @@ pub const PageJsApis = flattenTypes(&.{
+     @import("../webapi/event/PageTransitionEvent.zig"),
+     @import("../webapi/event/PopStateEvent.zig"),
+     @import("../webapi/event/HashChangeEvent.zig"),
++    @import("../webapi/event/SecurityPolicyViolationEvent.zig"),
+     @import("../webapi/event/MediaQueryListEvent.zig"),
+     @import("../webapi/event/BeforeUnloadEvent.zig"),
+     @import("../webapi/event/StorageEvent.zig"),
+diff --git a/src/browser/webapi/Document.zig b/src/browser/webapi/Document.zig
+index e4f460b..e24fa35 100644
+--- a/src/browser/webapi/Document.zig
++++ b/src/browser/webapi/Document.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -71,6 +72,7 @@ _load_aborted: bool = false,
+ // HTML's "active parser was aborted" flag also makes open/write no-ops.
+ _active_parser_aborted: bool = false,
+ _current_script: ?*Element.Html.Script = null,
++_script_policy: @import("../ScriptPolicy.zig") = .{},
+ _elements_by_id: std.StringHashMapUnmanaged(*Element) = .empty,
+ // Track IDs that were removed from the map - they might have duplicates in the tree
+ _removed_ids: std.StringHashMapUnmanaged(void) = .empty,
+diff --git a/src/browser/webapi/Event.zig b/src/browser/webapi/Event.zig
+index 31b6cfb..512e2d1 100644
+--- a/src/browser/webapi/Event.zig
++++ b/src/browser/webapi/Event.zig
+@@ -3,6 +3,7 @@
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
+ // Brenno Flávio <contato@brennoflavio.com.br>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -92,6 +93,7 @@ pub const Type = union(enum) {
+     page_transition_event: *@import("event/PageTransitionEvent.zig"),
+     pop_state_event: *@import("event/PopStateEvent.zig"),
+     hash_change_event: *@import("event/HashChangeEvent.zig"),
++    security_policy_violation_event: *@import("event/SecurityPolicyViolationEvent.zig"),
+     media_query_list_event: *@import("event/MediaQueryListEvent.zig"),
+     before_unload_event: *@import("event/BeforeUnloadEvent.zig"),
+     storage_event: *@import("event/StorageEvent.zig"),
+@@ -211,6 +213,7 @@ pub fn is(self: *Event, comptime T: type) ?*T {
+         .page_transition_event => |e| return if (T == @import("event/PageTransitionEvent.zig")) e else null,
+         .pop_state_event => |e| return if (T == @import("event/PopStateEvent.zig")) e else null,
+         .hash_change_event => |e| return if (T == @import("event/HashChangeEvent.zig")) e else null,
++        .security_policy_violation_event => |e| return if (T == @import("event/SecurityPolicyViolationEvent.zig")) e else null,
+         .media_query_list_event => |e| return if (T == @import("event/MediaQueryListEvent.zig")) e else null,
+         .before_unload_event => |e| return if (T == @import("event/BeforeUnloadEvent.zig")) e else null,
+         .storage_event => |e| return if (T == @import("event/StorageEvent.zig")) e else null,
+diff --git a/src/browser/webapi/element/html/Meta.zig b/src/browser/webapi/element/html/Meta.zig
+index f0961ca..a9a9ac9 100644
+--- a/src/browser/webapi/element/html/Meta.zig
++++ b/src/browser/webapi/element/html/Meta.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -87,6 +88,15 @@ fn setScheme(self: *Meta, value: []const u8, frame: *Frame) !void {
+     try self.asElement().setAttributeSafe(comptime .wrap("scheme"), .wrap(value), frame);
+ }
+ 
++pub fn processScriptPolicy(self: *Meta, frame: *Frame) !void {
++    const node = self.asNode();
++    if (!node.isConnected() or !std.ascii.eqlIgnoreCase(self.getHttpEquiv(), "Content-Security-Policy")) return;
++    // CSP delivered through meta is only honored inside the document head.
++    const parent = node.parentElement() orelse return;
++    if (parent._namespace != .html or !std.mem.eql(u8, parent.getTagNameLower(), "head")) return;
++    try frame.document._script_policy.add(frame.arena, self.getContent(), frame.origin);
++}
++
+ pub fn processRefresh(self: *Meta, frame: *Frame) !void {
+     if (!std.ascii.eqlIgnoreCase(self.getHttpEquiv(), "refresh")) {
+         return;
+diff --git a/src/browser/webapi/event/SecurityPolicyViolationEvent.zig b/src/browser/webapi/event/SecurityPolicyViolationEvent.zig
+new file mode 100644
+index 0000000..a4b2e86
+--- /dev/null
++++ b/src/browser/webapi/event/SecurityPolicyViolationEvent.zig
+@@ -0,0 +1,111 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const lp = @import("lightpanda");
++const js = @import("../../js/js.zig");
++const Frame = @import("../../Frame.zig");
++const Event = @import("../Event.zig");
++const SecurityPolicyViolationEvent = @This();
++
++pub const Proto = Event;
++_proto: *Event,
++_detail: Detail,
++
++const Disposition = enum {
++    enforce,
++    report,
++    pub const js_enum_from_string = true;
++};
++const Detail = struct {
++    blockedURI: []const u8 = "",
++    columnNumber: u32 = 0,
++    disposition: Disposition = .enforce,
++    documentURI: []const u8 = "",
++    effectiveDirective: []const u8 = "",
++    lineNumber: u32 = 0,
++    originalPolicy: []const u8 = "",
++    referrer: []const u8 = "",
++    sample: []const u8 = "",
++    sourceFile: []const u8 = "",
++    statusCode: u16 = 0,
++    violatedDirective: []const u8 = "",
++};
++pub const Options = Event.inheritOptions(SecurityPolicyViolationEvent, Detail);
++
++pub fn init(typ: []const u8, opts: ?Options, frame: *Frame) !*SecurityPolicyViolationEvent {
++    return create(typ, opts orelse .{}, false, frame);
++}
++
++pub fn initTrusted(opts: Options, frame: *Frame) !*SecurityPolicyViolationEvent {
++    return create("securitypolicyviolation", opts, true, frame);
++}
++
++fn create(typ: []const u8, opts: Options, trusted: bool, frame: *Frame) !*SecurityPolicyViolationEvent {
++    const arena = try frame.getArena(.tiny, "SecurityPolicyViolationEvent");
++    errdefer arena.release();
++    var detail: Detail = undefined;
++    inline for (@import("std").meta.fields(Detail)) |field| {
++        @field(detail, field.name) = if (field.type == []const u8)
++            try arena.dupe(u8, @field(opts, field.name))
++        else
++            @field(opts, field.name);
++    }
++    const event = try frame._factory.event(arena, try lp.String.init(arena.allocator(), typ, .{}), SecurityPolicyViolationEvent{
++        ._proto = undefined,
++        ._detail = detail,
++    });
++    Event.populatePrototypes(event, opts, trusted);
++    return event;
++}
++
++pub fn asEvent(self: *SecurityPolicyViolationEvent) *Event {
++    return self._proto;
++}
++
++fn getDisposition(self: *const SecurityPolicyViolationEvent) []const u8 {
++    return @tagName(self._detail.disposition);
++}
++
++fn getter(comptime field: []const u8) fn (*const SecurityPolicyViolationEvent) @FieldType(Detail, field) {
++    return struct {
++        fn get(self: *const SecurityPolicyViolationEvent) @FieldType(Detail, field) {
++            return @field(self._detail, field);
++        }
++    }.get;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(SecurityPolicyViolationEvent);
++    pub const Meta = struct {
++        pub const name = "SecurityPolicyViolationEvent";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(SecurityPolicyViolationEvent.init, .{});
++    pub const documentURI = bridge.accessor(getter("documentURI"), null, .{});
++    pub const referrer = bridge.accessor(getter("referrer"), null, .{});
++    pub const blockedURI = bridge.accessor(getter("blockedURI"), null, .{});
++    pub const violatedDirective = bridge.accessor(getter("violatedDirective"), null, .{});
++    pub const effectiveDirective = bridge.accessor(getter("effectiveDirective"), null, .{});
++    pub const originalPolicy = bridge.accessor(getter("originalPolicy"), null, .{});
++    pub const sourceFile = bridge.accessor(getter("sourceFile"), null, .{});
++    pub const sample = bridge.accessor(getter("sample"), null, .{});
++    pub const disposition = bridge.accessor(getDisposition, null, .{});
++    pub const statusCode = bridge.accessor(getter("statusCode"), null, .{});
++    pub const lineNumber = bridge.accessor(getter("lineNumber"), null, .{});
++    pub const columnNumber = bridge.accessor(getter("columnNumber"), null, .{});
++};
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index fcde7b6..5445223 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -2298,6 +2298,13 @@ pub const Request = struct {
+     // arbitrary data that can be associated with this request
+     ctx: *anyopaque = undefined,
+ 
++    // Kept separate from ctx: submitSync replaces the response callbacks and
++    // their context, but must retain the caller's redirect admission check.
++    redirect_guard: ?struct {
++        ctx: *anyopaque,
++        check: *const fn (*anyopaque, [:0]const u8) anyerror!void,
++    } = null,
++
+     start_callback: ?StartCallback = null,
+     header_callback: HeaderCallback = Noop.headerCallback,
+     data_callback: DataCallback = Noop.dataCallback,
+@@ -3825,6 +3832,8 @@ pub const Transfer = struct {
+             break :blk resolved;
+         };
+ 
++        if (req.redirect_guard) |guard| try guard.check(guard.ctx, url);
++
+         if (req.request_mode == .cors and (URL.getUsername(url).len > 0 or URL.getPassword(url).len > 0)) {
+             const origin = req.origin orelse return error.RedirectWithCredentials;
+             if (transfer._cors_cross_origin or !URL.isSameOrigin(base, origin) or !URL.isSameOrigin(url, origin)) {
+diff --git a/src/server/cdp/CDP.zig b/src/server/cdp/CDP.zig
+index 5fc29e8..45f2f87 100644
+--- a/src/server/cdp/CDP.zig
++++ b/src/server/cdp/CDP.zig
+@@ -891,6 +891,7 @@ pub const BrowserContext = struct {
+         }
+         self.isolated_worlds.clearRetainingCapacity();
+         self.target_id = null;
++        self.session.bypass_csp = false;
+     }
+ 
+     pub fn fetchDisableForSession(self: *BrowserContext, session_id: []const u8) void {
+diff --git a/src/server/cdp/domains/page.zig b/src/server/cdp/domains/page.zig
+index 90ac400..97b0cc0 100644
+--- a/src/server/cdp/domains/page.zig
++++ b/src/server/cdp/domains/page.zig
+@@ -72,9 +72,13 @@ pub fn processMessage(cmd: *CDP.Command) !void {
+         .printToPDF => return printToPDF(cmd),
+         .getLayoutMetrics => return getLayoutMetrics(cmd),
+         .handleJavaScriptDialog => return handleJavaScriptDialog(cmd),
+-        // CSP isn't enforced, there is a single page, and no file chooser
+-        // ever opens: each of these already holds.
+-        .setBypassCSP, .bringToFront, .setInterceptFileChooserDialog => return cmd.sendResult(null, .{}),
++        .setBypassCSP => {
++            const params = (try cmd.params(struct { enabled: bool })) orelse return error.InvalidParams;
++            const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
++            bc.session.bypass_csp = params.enabled;
++            return cmd.sendResult(null, .{});
++        },
++        .bringToFront, .setInterceptFileChooserDialog => return cmd.sendResult(null, .{}),
+     }
+ }
+ 
+@@ -1232,19 +1236,25 @@ test "cdp.page: close detaches the target like Target.closeTarget" {
+     try testing.expectEqual(null, bc.target_id);
+     try testing.expectEqual(null, bc.session_id);
+ }
+-test "cdp.frame: setup no-ops" {
++test "cdp.frame: setup and CSP bypass" {
+     var ctx = try testing.context();
+     defer ctx.deinit();
+-    _ = try ctx.loadBrowserContext(.{ .id = "BID-NOOP" });
++    const bc = try ctx.loadBrowserContext(.{ .id = "BID-NOOP" });
++    try testing.expectEqual(false, bc.session.bypass_csp);
+ 
+     try ctx.processMessage(.{ .id = 1, .method = "Page.setBypassCSP", .params = .{ .enabled = true } });
+     try ctx.expectSentResult(null, .{ .id = 1 });
++    try testing.expectEqual(true, bc.session.bypass_csp);
+ 
+     try ctx.processMessage(.{ .id = 2, .method = "Page.bringToFront" });
+     try ctx.expectSentResult(null, .{ .id = 2 });
+ 
+     try ctx.processMessage(.{ .id = 3, .method = "Page.setInterceptFileChooserDialog", .params = .{ .enabled = true } });
+     try ctx.expectSentResult(null, .{ .id = 3 });
++
++    try ctx.processMessage(.{ .id = 4, .method = "Page.setBypassCSP", .params = .{ .enabled = false } });
++    try ctx.expectSentResult(null, .{ .id = 4 });
++    try testing.expectEqual(false, bc.session.bypass_csp);
+ }
+ 
+ test "cdp.frame: getFrameTree" {

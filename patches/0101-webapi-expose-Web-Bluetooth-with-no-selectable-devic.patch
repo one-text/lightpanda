@@ -1,0 +1,429 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 19 Nov 2026 21:33:06 -0300
+Subject: [PATCH] webapi: expose Web Bluetooth with no selectable devices
+
+Model the MacBook Neo Bluetooth 6 adapter using the Chromium 155 macOS surface. Honor secure contexts, policy, and transient activation. Dismiss valid requests without host scanning, device grants, or GATT.
+---
+ src/browser/js/Context.zig         |   3 +
+ src/browser/js/Env.zig             |   3 +
+ src/browser/js/bridge.zig          |   1 +
+ src/browser/webapi/Bluetooth.zig   | 235 +++++++++++++++++++++++++++++
+ src/browser/webapi/EventTarget.zig |  18 +++
+ src/browser/webapi/Navigator.zig   |   8 +
+ 6 files changed, 268 insertions(+)
+ create mode 100644 src/browser/webapi/Bluetooth.zig
+
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index c097d0f..55c96b8 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -79,6 +79,7 @@ media_device_bindings: ?struct {
+ 
+ credentials_bindings: ?@import("../webapi/CredentialsContainer.zig").Bindings = null,
+ keyboard_bindings: ?@import("../webapi/Keyboard.zig").Bindings = null,
++bluetooth_bindings: ?@import("../webapi/Bluetooth.zig").Bindings = null,
+ webgpu_bindings: ?[10]v8.Global = null,
+ webgpu_hidden: bool = false,
+ eme_bindings: ?[10]v8.Global = null,
+@@ -283,6 +284,7 @@ pub fn deinit(self: *Context) void {
+     }
+     if (self.credentials_bindings) |*bindings| bindings.deinit();
+     if (self.keyboard_bindings) |*bindings| bindings.deinit();
++    if (self.bluetooth_bindings) |*bindings| bindings.deinit();
+     if (self.webgpu_bindings) |*bindings| {
+         for (bindings) |*binding| v8.v8__Global__Reset(binding);
+     }
+@@ -334,6 +336,7 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
+             try env.setMediaDevicesExposure(self, ls.local.handle, global_obj, secure);
+             try @import("../webapi/CredentialsContainer.zig").expose(self, ls.local.handle, global_obj, secure);
+             try @import("../webapi/Keyboard.zig").expose(self, ls.local.handle, global_obj, secure);
++            try @import("../webapi/Bluetooth.zig").expose(self, ls.local.handle, global_obj, secure);
+             // With the feature disabled, Env.createContext already hid this API.
+             if (!secure and self.page.session.experimental_features.serviceworker) {
+                 env.hideServiceWorker(true, ls.local.handle, global_obj);
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 7c5b92a..e84fed6 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -461,6 +461,9 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+     errdefer if (context.keyboard_bindings) |*bindings| bindings.deinit();
+     if (comptime is_frame) try @import("../webapi/Keyboard.zig").expose(context, v8_context, global_obj, global.isSecureContext());
+ 
++    errdefer if (context.bluetooth_bindings) |*bindings| bindings.deinit();
++    if (comptime is_frame) try @import("../webapi/Bluetooth.zig").expose(context, v8_context, global_obj, global.isSecureContext());
++
+     if (comptime is_frame) try self.captureEncryptedMediaBindings(context, v8_context, global_obj);
+     errdefer if (context.eme_bindings) |*bindings| {
+         for (bindings) |*binding| v8.v8__Global__Reset(binding);
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 1464997..0a8a9da 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1278,6 +1278,7 @@ pub const PageJsApis = flattenTypes(&.{
+     @import("../webapi/Navigator.zig"),
+     @import("../webapi/CredentialsContainer.zig"),
+     @import("../webapi/Keyboard.zig"),
++    @import("../webapi/Bluetooth.zig"),
+     @import("../webapi/WebGPU.zig"),
+     @import("../webapi/NavigatorUAData.zig"),
+     @import("../webapi/Notification.zig"),
+diff --git a/src/browser/webapi/Bluetooth.zig b/src/browser/webapi/Bluetooth.zig
+new file mode 100644
+index 0000000..f01495e
+--- /dev/null
++++ b/src/browser/webapi/Bluetooth.zig
+@@ -0,0 +1,235 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const v8 = js.v8;
++const Frame = @import("../Frame.zig");
++const Navigator = @import("Navigator.zig");
++const DOMException = @import("DOMException.zig");
++const EventTarget = @import("EventTarget.zig");
++const EventManagerBase = @import("../EventManagerBase.zig");
++const Conversion = @import("media_constraints.zig");
++const policyAllows = @import("MediaDevices.zig").allowed;
++
++const Bluetooth = @This();
++pub const Proto = EventTarget;
++
++_proto: *EventTarget,
++_navigator: *Navigator,
++_events: EventManagerBase,
++
++pub fn init(navigator: *Navigator, exec: *js.Execution) !*Bluetooth {
++    return exec._factory.eventTargetWithAllocator(exec.arena, Bluetooth{
++        ._proto = undefined,
++        ._navigator = navigator,
++        ._events = .init(exec.arena),
++    });
++}
++
++fn creationContext(self: *const Bluetooth, local: *const js.Local) *const v8.Context {
++    return self._navigator.creationContext(local);
++}
++
++fn activeFrame(self: *const Bluetooth) ?*Frame {
++    const frame = self._navigator._frame orelse return null;
++    if (self._navigator._pdf_detached or frame.document._frame != frame or !frame.isSecureContext()) return null;
++    return frame;
++}
++
++fn getAvailability(self: *const Bluetooth, exec: *js.Execution) !js.Promise {
++    const local = exec.js.local.?;
++    const resolver = local.createPromiseResolver();
++    if (self.activeFrame()) |frame| {
++        // The persona has an adapter, independent of nearby peripherals.
++        try resolver.resolveValue(try local.zigValueToJs(policyAllows(frame, "bluetooth"), .{}));
++    } else {
++        try resolver.rejectValue(.{ .local = local, .handle = local.isolate.createTypeError("Document not active") });
++    }
++    return resolver.promise();
++}
++
++fn requestDevice(self: *const Bluetooth, input: ?js.Value, exec: *js.Execution) !js.Promise {
++    const local = exec.js.local.?;
++    const resolver = local.createPromiseResolver();
++    var caught: js.TryCatch = undefined;
++    caught.init(local);
++    defer caught.deinit();
++    self.request(input, exec, resolver) catch |err| {
++        if (err == error.ExecutionTerminated or exec.js.env.terminatePending()) return error.ExecutionTerminated;
++        const value = caught.exceptionValue() orelse switch (err) {
++            error.InactiveDocument => js.Value{ .local = local, .handle = local.isolate.createTypeError("Document not active") },
++            error.TypeError => js.Value{ .local = local, .handle = local.isolate.createTypeError("Invalid Bluetooth device request options") },
++            error.PolicyBlocked => try exceptionValue(exec, local, "Access to the feature \"bluetooth\" is disallowed by permissions policy.", "SecurityError"),
++            error.NoActivation => try exceptionValue(exec, local, "Must be handling a user gesture to show a permission request.", "SecurityError"),
++            else => return err,
++        };
++        try resolver.rejectValue(value);
++    };
++    return resolver.promise();
++}
++
++fn request(self: *const Bluetooth, input: ?js.Value, exec: *js.Execution, resolver: js.PromiseResolver) !void {
++    const options = try Conversion.dictionary(input);
++    const frame = self.activeFrame() orelse return error.InactiveDocument;
++    if (!policyAllows(frame, "bluetooth")) return error.PolicyBlocked;
++    const activation = self._navigator._share_activation_ms orelse return error.NoActivation;
++    if (lp.datetime.milliTimestamp(.boot) - activation >= 5000) return error.NoActivation;
++    try validateOptions(options orelse return error.TypeError);
++
++    // No host scanning or chooser UI. Dismiss the empty chooser on a later task.
++    const arena = try exec.getArena(.tiny, "Bluetooth.requestDevice");
++    errdefer arena.release();
++    const task = try arena.create(Dismissal);
++    task.* = .{ .arena = arena, .exec = exec, .resolver = try resolver.persist() };
++    errdefer task.resolver.release();
++    try exec.js.scheduler.add(task, Dismissal.run, 0, .{
++        .name = "Bluetooth.requestDevice",
++        .finalizer = Dismissal.finalize,
++    });
++}
++
++fn exceptionValue(exec: *js.Execution, local: *const js.Local, message: []const u8, name: []const u8) !js.Value {
++    const exception = try exec._factory.create(DOMException.init(message, name));
++    return local.zigValueToJs(exception, .{});
++}
++
++fn validateOptions(options: js.Object) !void {
++    const accept_all = (try options.get("acceptAllDevices")).toBool();
++    const exclusions = try options.get("exclusionFilters");
++    const filters = try options.get("filters");
++    const has_filters = !filters.isUndefined();
++    if (accept_all == has_filters or (!has_filters and !exclusions.isUndefined())) return error.TypeError;
++    if (has_filters) try validateFilters(filters);
++    if (!exclusions.isUndefined()) try validateFilters(exclusions);
++}
++
++// Check filter structure without canonicalizing UUIDs or matching peripherals.
++fn validateFilters(filters: js.Value) !void {
++    const iterator = try filters.iterator() orelse return error.TypeError;
++    var has_filter = false;
++    while (try iterator.next()) |value| {
++        errdefer Conversion.closeIterator(iterator, filters.local);
++        has_filter = true;
++        const filter = try Conversion.dictionary(value) orelse return error.TypeError;
++        var restricted = false;
++        inline for (.{ "manufacturerData", "name", "namePrefix", "services" }) |key| {
++            const member = try filter.get(key);
++            if (!member.isUndefined()) {
++                restricted = true;
++                if (comptime key[0] == 'n') {
++                    const name = try (try Conversion.domString(member)).toSlice();
++                    if (name.len > 248 or (key.len > 4 and name.len == 0)) return error.TypeError;
++                } else {
++                    const entries = try member.iterator() orelse return error.TypeError;
++                    _ = try entries.next() orelse return error.TypeError;
++                    while (try entries.next()) |_| {}
++                }
++            }
++        }
++        if (!restricted) return error.TypeError;
++    }
++    if (!has_filter) return error.TypeError;
++}
++
++const Dismissal = struct {
++    arena: *lp.Arena,
++    exec: *js.Execution,
++    resolver: js.PromiseResolver.Global,
++
++    fn run(ctx: *anyopaque) !?u32 {
++        const self: *Dismissal = @ptrCast(@alignCast(ctx));
++        defer finalize(ctx);
++        var scope: js.Local.Scope = undefined;
++        self.exec.js.localScope(&scope);
++        defer scope.deinit();
++        const exception = try exceptionValue(self.exec, &scope.local, "User cancelled the requestDevice() chooser.", "NotFoundError");
++        try self.resolver.local(&scope.local).rejectValue(exception);
++        scope.local.runMicrotasks();
++        return null;
++    }
++
++    fn finalize(ctx: *anyopaque) void {
++        const self: *Dismissal = @ptrCast(@alignCast(ctx));
++        self.resolver.release();
++        self.arena.release();
++    }
++};
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Bluetooth);
++    pub const Meta = struct {
++        pub const name = "Bluetooth";
++        pub const creation_context = Bluetooth.creationContext;
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const getAvailability = bridge.function(Bluetooth.getAvailability, .{});
++    pub const requestDevice = bridge.function(Bluetooth.requestDevice, .{});
++};
++
++pub const Bindings = struct {
++    prototype: v8.Global,
++    descriptor: v8.Global,
++    interface: v8.Global,
++    define_property: v8.Global,
++    hidden: bool = false,
++
++    pub fn deinit(self: *Bindings) void {
++        v8.v8__Global__Reset(&self.prototype);
++        v8.v8__Global__Reset(&self.descriptor);
++        v8.v8__Global__Reset(&self.interface);
++        v8.v8__Global__Reset(&self.define_property);
++    }
++};
++
++pub fn expose(ctx: *js.Context, context: *const v8.Context, global: *const v8.Object, secure: bool) !void {
++    const isolate = ctx.isolate;
++    const key = isolate.initStringHandle("bluetooth");
++    const interface_key = isolate.initStringHandle("Bluetooth");
++    if (ctx.bluetooth_bindings == null) {
++        const navigator = v8.v8__Object__Get(global, context, isolate.initStringHandle("Navigator")) orelse return error.JsException;
++        const prototype = v8.v8__Object__Get(@ptrCast(navigator), context, isolate.initStringHandle("prototype")) orelse return error.JsException;
++        const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(@ptrCast(prototype), context, key) orelse return error.JsException;
++        const interface = v8.v8__Object__Get(global, context, interface_key) orelse return error.JsException;
++        const object = v8.v8__Object__Get(global, context, isolate.initStringHandle("Object")) orelse return error.JsException;
++        const define = v8.v8__Object__Get(@ptrCast(object), context, isolate.initStringHandle("defineProperty")) orelse return error.JsException;
++        ctx.bluetooth_bindings = .{ .prototype = undefined, .descriptor = undefined, .interface = undefined, .define_property = undefined };
++        const bindings = &ctx.bluetooth_bindings.?;
++        v8.v8__Global__New(isolate.handle, prototype, &bindings.prototype);
++        v8.v8__Global__New(isolate.handle, descriptor, &bindings.descriptor);
++        v8.v8__Global__New(isolate.handle, interface, &bindings.interface);
++        v8.v8__Global__New(isolate.handle, define, &bindings.define_property);
++    }
++
++    const bindings = &ctx.bluetooth_bindings.?;
++    if (secure != bindings.hidden) return;
++    const prototype: *const v8.Object = @ptrCast(v8.v8__Global__Get(&bindings.prototype, isolate.handle).?);
++    var result: v8.MaybeBool = undefined;
++    if (secure) {
++        const define: *const v8.Function = @ptrCast(v8.v8__Global__Get(&bindings.define_property, isolate.handle).?);
++        const args = [_]?*const v8.Value{ @ptrCast(prototype), key, v8.v8__Global__Get(&bindings.descriptor, isolate.handle) };
++        _ = v8.v8__Function__Call(define, context, @ptrCast(global), args.len, &args) orelse return error.JsException;
++        v8.v8__Object__DefineOwnProperty(global, context, @ptrCast(interface_key), v8.v8__Global__Get(&bindings.interface, isolate.handle), v8.DontEnum, &result);
++    } else {
++        v8.v8__Object__Delete(prototype, context, key, &result);
++        if (!result.has_value or !result.value) return error.JsException;
++        v8.v8__Object__Delete(global, context, interface_key, &result);
++    }
++    if (!result.has_value or !result.value) return error.JsException;
++    bindings.hidden = !secure;
++}
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index 7959b89..170a7a6 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -62,6 +62,7 @@ const XMLHttpRequestEventTarget = @import("net/XMLHttpRequestEventTarget.zig");
+ const RegisterOptions = EventManager.RegisterOptions;
+ 
+ const BatteryManager = @import("BatteryManager.zig");
++const Bluetooth = @import("Bluetooth.zig");
+ const NetworkInformation = @import("NetworkInformation.zig");
+ const MediaDevices = @import("MediaDevices.zig");
+ 
+@@ -91,6 +92,7 @@ pub const Type = enum(u8) {
+     audio_node,
+     base_audio_context,
+     battery_manager,
++    bluetooth,
+     broadcast_channel,
+     cookie_store,
+     close_watcher,
+@@ -144,6 +146,7 @@ pub fn Subtype(comptime tag: Type) type {
+         .audio_node => AudioContext.Node,
+         .base_audio_context => AudioContext.Base,
+         .battery_manager => BatteryManager,
++        .bluetooth => Bluetooth,
+         .broadcast_channel => BroadcastChannel,
+         .cookie_store => CookieStore,
+         .close_watcher => CloseWatcher,
+@@ -240,6 +243,11 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
+         return !event._cancelable or !event._prevent_default;
+     }
+ 
++    if (self._type == .bluetooth) {
++        try SpeechSynthesis.dispatchDirect(self, &self.subtype(Bluetooth)._events, event, exec);
++        return !event._cancelable or !event._prevent_default;
++    }
++
+     if (self._type == .media_devices) {
+         try self.subtype(MediaDevices).dispatch(event, exec);
+         return !event._cancelable or !event._prevent_default;
+@@ -367,6 +375,10 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
+         _ = try self.subtype(BatteryManager)._events.register(self, typ, em_callback, options);
+         return;
+     }
++    if (self._type == .bluetooth) {
++        _ = try self.subtype(Bluetooth)._events.register(self, typ, em_callback, options);
++        return;
++    }
+     if (self._type == .media_devices) {
+         _ = try self.subtype(MediaDevices)._events.register(self, typ, em_callback, options);
+         return;
+@@ -430,6 +442,10 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
+         self.subtype(BatteryManager)._events.remove(self, typ, em_callback, use_capture);
+         return;
+     }
++    if (self._type == .bluetooth) {
++        self.subtype(Bluetooth)._events.remove(self, typ, em_callback, use_capture);
++        return;
++    }
+     if (self._type == .media_devices) {
+         self.subtype(MediaDevices)._events.remove(self, typ, em_callback, use_capture);
+         return;
+@@ -490,6 +506,7 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         },
+         .base_audio_context => writer.writeAll("<AudioContext>"),
+         .battery_manager => writer.writeAll("<BatteryManager>"),
++        .bluetooth => writer.writeAll("<Bluetooth>"),
+         .media_devices => writer.writeAll("<MediaDevices>"),
+         .media_source => writer.writeAll("<MediaSource>"),
+         .source_buffer_list => writer.writeAll("<SourceBufferList>"),
+@@ -532,6 +549,7 @@ pub fn toString(self: *EventTarget) []const u8 {
+         },
+         .base_audio_context => return "[object AudioContext]",
+         .battery_manager => return "[object BatteryManager]",
++        .bluetooth => return "[object Bluetooth]",
+         .broadcast_channel => return "[object BroadcastChannel]",
+         .cookie_store => return "[object CookieStore]",
+         .event_source => return "[object EventSource]",
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index 3d08902..84a1f63 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -38,6 +38,7 @@ const MediaDevices = @import("MediaDevices.zig");
+ const WebShare = @import("WebShare.zig");
+ const CredentialsContainer = @import("CredentialsContainer.zig");
+ const Keyboard = @import("Keyboard.zig");
++const Bluetooth = @import("Bluetooth.zig");
+ 
+ const Navigator = @This();
+ 
+@@ -62,6 +63,7 @@ _service_worker: ?*ServiceWorkerContainer = null,
+ _media_devices: ?*MediaDevices = null,
+ _credentials: ?*CredentialsContainer = null,
+ _keyboard: ?*Keyboard = null,
++_bluetooth: ?*Bluetooth = null,
+ _gpu: ?*@import("WebGPU.zig").GPU = null,
+ _share_pending: bool = false,
+ _share_activation_ms: ?u64 = null,
+@@ -240,6 +242,11 @@ fn getKeyboard(self: *Navigator, exec: *Execution) !*Keyboard {
+     return self._keyboard.?;
+ }
+ 
++fn getBluetooth(self: *Navigator, exec: *Execution) !*Bluetooth {
++    if (self._bluetooth == null) self._bluetooth = try Bluetooth.init(self, exec);
++    return self._bluetooth.?;
++}
++
+ fn getGPU(self: *Navigator, exec: *Execution) !*@import("WebGPU.zig").GPU {
+     if (self._gpu == null) self._gpu = try @import("WebGPU.zig").GPU.init(exec);
+     return self._gpu.?;
+@@ -394,6 +401,7 @@ pub const JsApi = struct {
+     pub const mediaDevices = bridge.accessor(Navigator.getMediaDevices, null, .{ .exposed = .window });
+     pub const credentials = bridge.accessor(Navigator.getCredentials, null, .{ .exposed = .window });
+     pub const keyboard = bridge.accessor(Navigator.getKeyboard, null, .{ .exposed = .window });
++    pub const bluetooth = bridge.accessor(Navigator.getBluetooth, null, .{ .exposed = .window });
+     pub const gpu = bridge.accessor(Navigator.getGPU, null, .{});
+     pub const serviceWorker = bridge.accessor(Navigator.getServiceWorker, null, .{});
+     pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});

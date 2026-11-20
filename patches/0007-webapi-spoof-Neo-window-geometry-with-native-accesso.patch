@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 13 Oct 2026 20:11:37 -0300
+Subject: [PATCH] webapi: spoof Neo window geometry with native accessors
+
+Expose Window.outerWidth/outerHeight, screenX/screenY and their
+screenLeft/screenTop aliases as native [Replaceable] signed-long
+accessors. Property-specific setters shadow only the assigned member,
+following the existing innerWidth/innerHeight replacement mechanism.
+
+Use the existing base MacBook Neo display profile: 1204x753 CSS pixels
+at 2x, with a 1100x650 content viewport, a 24px menu bar and auto-hidden
+Dock. Choose 78 CSS pixels of tab-strip/omnibox overhead and center the
+window horizontally, yielding 1100x728 outer geometry at (52,24).
+These are explicit spoofed assumptions, not measured Chrome defaults.
+Reuse Screen.getAvailTop for vertical placement instead of duplicating
+menu-bar policy. Oversized content remains at x=0; tiny screens are not
+artificially resized to satisfy windowed benchmark predicates.
+
+Read effective runtime viewport metrics without caching so CDP overrides,
+clearing overrides and navigation remain coherent across frames. Saturate
+height addition and clamp outer dimensions to signed-long range to avoid
+overflow on extreme emulated metrics.
+
+No new unit tests or changes to existing patches. Validate via existing
+upstream tests and temporary CDP diagnostics for native descriptors,
+replacement/alias isolation, child windows, navigation, overrides/reset,
+tiny screens and u32-limit metrics. Do not change UA/client hints, loading
+policy, GPU APIs or the benchmark predicates.
+
+References:
+https://www.apple.com/macbook-neo/specs/
+https://drafts.csswg.org/cssom-view/#extensions-to-the-window-interface
+https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/blink/renderer/core/frame/window.idl
+---
+ src/browser/webapi/Screen.zig |  2 +-
+ src/browser/webapi/Window.zig | 50 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/src/browser/webapi/Screen.zig b/src/browser/webapi/Screen.zig
+index e4bb71e..10f858e 100644
+--- a/src/browser/webapi/Screen.zig
++++ b/src/browser/webapi/Screen.zig
+@@ -66,7 +66,7 @@ fn getAvailLeft(_: *const Screen) i32 {
+     return 0;
+ }
+ 
+-fn getAvailTop(self: *const Screen, frame: *Frame) i32 {
++pub fn getAvailTop(self: *const Screen, frame: *Frame) i32 {
+     return @intCast(@min(menu_bar_height, self.getHeight(frame)));
+ }
+ 
+diff --git a/src/browser/webapi/Window.zig b/src/browser/webapi/Window.zig
+index f389ffb..1a3fde7 100644
+--- a/src/browser/webapi/Window.zig
++++ b/src/browser/webapi/Window.zig
+@@ -225,6 +225,30 @@ fn setInnerHeight(self: *Window, value: js.Value) void {
+     self.replaceGlobalProperty(value, "innerHeight");
+ }
+ 
++fn setOuterWidth(self: *Window, value: js.Value) void {
++    self.replaceGlobalProperty(value, "outerWidth");
++}
++
++fn setOuterHeight(self: *Window, value: js.Value) void {
++    self.replaceGlobalProperty(value, "outerHeight");
++}
++
++fn setScreenX(self: *Window, value: js.Value) void {
++    self.replaceGlobalProperty(value, "screenX");
++}
++
++fn setScreenY(self: *Window, value: js.Value) void {
++    self.replaceGlobalProperty(value, "screenY");
++}
++
++fn setScreenLeft(self: *Window, value: js.Value) void {
++    self.replaceGlobalProperty(value, "screenLeft");
++}
++
++fn setScreenTop(self: *Window, value: js.Value) void {
++    self.replaceGlobalProperty(value, "screenTop");
++}
++
+ fn setDevicePixelRatio(self: *Window, value: js.Value) void {
+     self.replaceGlobalProperty(value, "devicePixelRatio");
+ }
+@@ -947,6 +971,26 @@ pub fn getInnerHeight(_: *const Window, frame: *Frame) u32 {
+     return frame.page.getViewport().height;
+ }
+ 
++fn getOuterWidth(_: *const Window, frame: *Frame) i32 {
++    return @intCast(@min(frame.page.getViewport().width, std.math.maxInt(i32)));
++}
++
++fn getOuterHeight(_: *const Window, frame: *Frame) i32 {
++    // Chosen windowed Mac Chrome profile: tab strip and omnibox total 78 CSS px.
++    const height = frame.page.getViewport().height +| 78;
++    return @intCast(@min(height, std.math.maxInt(i32)));
++}
++
++fn getScreenX(_: *const Window, frame: *Frame) i32 {
++    const viewport = frame.page.getViewport();
++    const screen_width = viewport.screen_width orelse viewport.width;
++    return @intCast((screen_width -| viewport.width) / 2);
++}
++
++fn getScreenY(self: *const Window, frame: *Frame) i32 {
++    return self._screen.getAvailTop(frame);
++}
++
+ fn getDevicePixelRatio(_: *const Window, frame: *Frame) f32 {
+     return frame.page.getViewport().scale;
+ }
+@@ -1262,6 +1306,12 @@ pub const JsApi = struct {
+     // the attribute rather than throwing.
+     pub const innerWidth = bridge.accessor(Window.getInnerWidth, Window.setInnerWidth, .{});
+     pub const innerHeight = bridge.accessor(Window.getInnerHeight, Window.setInnerHeight, .{});
++    pub const outerWidth = bridge.accessor(Window.getOuterWidth, Window.setOuterWidth, .{});
++    pub const outerHeight = bridge.accessor(Window.getOuterHeight, Window.setOuterHeight, .{});
++    pub const screenX = bridge.accessor(Window.getScreenX, Window.setScreenX, .{});
++    pub const screenY = bridge.accessor(Window.getScreenY, Window.setScreenY, .{});
++    pub const screenLeft = bridge.accessor(Window.getScreenX, Window.setScreenLeft, .{});
++    pub const screenTop = bridge.accessor(Window.getScreenY, Window.setScreenTop, .{});
+     pub const devicePixelRatio = bridge.accessor(Window.getDevicePixelRatio, Window.setDevicePixelRatio, .{});
+ 
+     pub const opener = bridge.accessor(Window.getOpener, Window.setOpener, .{});

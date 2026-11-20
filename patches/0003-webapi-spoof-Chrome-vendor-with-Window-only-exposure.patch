@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 13 Oct 2026 02:33:00 -0300
+Subject: [PATCH] webapi: spoof Chrome vendor with Window-only exposure
+
+Return Google's fixed Chrome vendor string through the existing native
+Navigator accessor, preserving its descriptor and receiver checks.
+
+Remove WorkerNavigator.vendor: Blink's NavigatorID IDL exposes vendor only
+to Window. This does not alter UA, platform, or client hints.
+
+Reference: Chromium core/frame/navigator_id.cc and navigator_id.idl.
+Update the existing navigator fixture to expect Google's vendor string,
+preserving its API-shape and native-accessor checks. Benchmark sources
+are unchanged.
+---
+ src/browser/tests/navigator/navigator.html | 2 +-
+ src/browser/webapi/Navigator.zig           | 2 +-
+ src/browser/webapi/WorkerNavigator.zig     | 6 +-----
+ 3 files changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/src/browser/tests/navigator/navigator.html b/src/browser/tests/navigator/navigator.html
+index 9b9d134..0e83f95 100644
+--- a/src/browser/tests/navigator/navigator.html
++++ b/src/browser/tests/navigator/navigator.html
+@@ -24,7 +24,7 @@
+   testing.expectEqual(true, navigator.hardwareConcurrency > 0);
+   testing.expectEqual(4, navigator.hardwareConcurrency);
+   testing.expectEqual(0, navigator.maxTouchPoints);
+-  testing.expectEqual('', navigator.vendor);
++  testing.expectEqual('Google Inc.', navigator.vendor);
+   testing.expectEqual('Gecko', navigator.product);
+   testing.expectEqual(false, navigator.javaEnabled());
+   testing.expectEqual(false, navigator.webdriver);
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index af1e84c..82bbf27 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -106,7 +106,7 @@ fn getMaxTouchPoints(_: *const Navigator) u32 {
+ }
+ 
+ pub fn getVendor(_: *const Navigator) []const u8 {
+-    return "";
++    return "Google Inc.";
+ }
+ 
+ pub fn getProduct(_: *const Navigator) []const u8 {
+diff --git a/src/browser/webapi/WorkerNavigator.zig b/src/browser/webapi/WorkerNavigator.zig
+index bbc9264..6768811 100644
+--- a/src/browser/webapi/WorkerNavigator.zig
++++ b/src/browser/webapi/WorkerNavigator.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -78,10 +79,6 @@ fn getDeviceMemory(_: *const WorkerNavigator) f64 {
+     return Navigator.getDeviceMemory(&Navigator.init);
+ }
+ 
+-fn getVendor(_: *const WorkerNavigator) []const u8 {
+-    return Navigator.getVendor(&Navigator.init);
+-}
+-
+ fn getProduct(_: *const WorkerNavigator) []const u8 {
+     return Navigator.getProduct(&Navigator.init);
+ }
+@@ -125,7 +122,6 @@ pub const JsApi = struct {
+     pub const onLine = bridge.accessor(WorkerNavigator.getOnLine, null, .{});
+     pub const hardwareConcurrency = bridge.accessor(WorkerNavigator.getHardwareConcurrency, null, .{});
+     pub const deviceMemory = bridge.accessor(WorkerNavigator.getDeviceMemory, null, .{});
+-    pub const vendor = bridge.accessor(WorkerNavigator.getVendor, null, .{});
+     pub const product = bridge.accessor(WorkerNavigator.getProduct, null, .{});
+     pub const globalPrivacyControl = bridge.accessor(WorkerNavigator.getGlobalPrivacyControl, null, .{});
+ 

@@ -1,0 +1,621 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 14 Oct 2026 19:02:06 -0300
+Subject: [PATCH] webapi: mock ordinary-page Chrome namespace natively
+
+Expose per-realm window.chrome from the Window-only V8 snapshot before
+page scripts and interface constructors. Use ordinary namespace objects,
+not a Chrome interface, and leave extension-only runtime APIs absent.
+
+Model the Chrome 155 uninstalled app surface: native non-constructible
+methods, enums, no-op isInstalled setter, argument errors, and an async
+installState callback owned by the context scheduler. csi/loadTimes are
+anonymous constructible native functions with fresh plain-object results,
+native data property descriptors and no-op setters. Keep result backing
+values in V8 private properties, not host-object internal fields, so
+structured cloning, messaging and native argument validation remain safe.
+
+Record per-document wall/monotonic clock anchors and actual response-start,
+DOMContentLoaded-end and load-end timestamps. Preserve navigation kinds;
+read ALPN while the TLS connection is live rather than equating negotiation
+with HTTP/2. No renderer, app installation or extension host is added; paint
+and alternate-protocol observations remain zero/false in this mock.
+
+Reference contract is pinned to Chromium 155.0.8059.40:
+- chrome/renderer/loadtimes_bindings.cc
+- chrome/renderer/extensions/api/app_hooks_delegate.cc
+- content/public/renderer/chrome_object_extensions_utils.cc
+https://chromium.googlesource.com/chromium/src/+/155.0.8059.40/
+Supplemental desktop Chrome 154 introspection verified descriptors,
+constructibility, optional callback arguments and native setter behavior;
+it is not claimed to be a macOS reference execution.
+
+Temporary diagnostics cover namespace/function descriptors, iframe
+navigation, worker absence, GC/retained values, structuredClone and
+MessageChannel delivery, slow-body response timing, HTTP/1.1 with/without
+ALPN and HTTP/2. No new unit tests or benchmark predicates are added.
+---
+ src/browser/Frame.zig         |  30 ++++
+ src/browser/js/Env.zig        |   3 +
+ src/browser/js/Snapshot.zig   |   9 +-
+ src/browser/webapi/Chrome.zig | 282 ++++++++++++++++++++++++++++++++++
+ src/network/HttpClient.zig    |  15 +-
+ src/network/http.zig          |  14 ++
+ src/sys/libcrypto.zig         |   3 +
+ src/sys/libcurl.zig           |   9 ++
+ 8 files changed, 359 insertions(+), 6 deletions(-)
+ create mode 100644 src/browser/webapi/Chrome.zig
+
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index 2cca158..63451d1 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -45,6 +45,7 @@ const EventTarget = @import("webapi/EventTarget.zig");
+ const Element = @import("webapi/Element.zig");
+ const HtmlElement = @import("webapi/element/Html.zig");
+ const Window = @import("webapi/Window.zig");
++const Chrome = @import("webapi/Chrome.zig");
+ const Cookie = @import("webapi/storage/Cookie.zig");
+ const Location = @import("webapi/Location.zig");
+ const Document = @import("webapi/Document.zig");
+@@ -219,6 +220,7 @@ _ce_reactions: CustomElementReactions,
+ _factory: *Factory,
+ 
+ _load_state: LoadState = .waiting,
++_chrome_timing: Chrome.Timing,
+ 
+ // The navigation response's MIME essence, recorded when the first chunk
+ // arrives and applied to the new document (document.contentType) once the
+@@ -369,6 +371,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
+         ._ce_reactions = .{ .allocator = arena },
+         ._event_manager = EventManager.init(arena, self),
+         ._http_owner = undefined,
++        ._chrome_timing = .init(),
+     };
+     self._queued_events = &self._queued_events_1;
+ 
+@@ -678,6 +681,28 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
+     const session = self._session;
+     self._load_state = .parsing;
+     self._last_navigate_error = null;
++    self._chrome_timing = .init();
++    switch (opts.kind) {
++        .reload => {
++            self._chrome_timing.navigation_type = "Reload";
++            self._chrome_timing.transition = 16;
++        },
++        .traverse => {
++            self._chrome_timing.navigation_type = "BackForward";
++            self._chrome_timing.transition = 6;
++        },
++        else => switch (opts.reason) {
++            .anchor => {
++                self._chrome_timing.navigation_type = "LinkClicked";
++                self._chrome_timing.transition = 0;
++            },
++            .form => {
++                self._chrome_timing.navigation_type = "FormSubmitted";
++                self._chrome_timing.transition = 0;
++            },
++            else => {},
++        },
++    }
+ 
+     const page = self.page;
+     const page_scope = page.logScope();
+@@ -1294,6 +1319,7 @@ fn _documentIsLoaded(self: *Frame) !void {
+         event,
+     );
+ 
++    self._chrome_timing.dom_loaded = self._chrome_timing.epochNow();
+     self._session.notification.dispatch(.frame_dom_content_loaded, &.{
+         .req_id = self._req_id,
+         .frame_id = self._frame_id,
+@@ -1417,6 +1443,7 @@ fn _documentIsComplete(self: *Frame) !void {
+         try self._event_manager.dispatchDirect(window_target, event, self.window._on_load, .{ .inject_target = false, .context = "page load" });
+     }
+ 
++    self._chrome_timing.loaded = self._chrome_timing.epochNow();
+     self._session.notification.dispatch(.frame_loaded, &.{
+         .req_id = self._req_id,
+         .frame_id = self._frame_id,
+@@ -1537,6 +1564,9 @@ fn frameHeaderDoneCallback(transfer: *HttpClient.Transfer) !HttpClient.Transfer.
+         });
+     }
+ 
++    self._chrome_timing.commit = self._chrome_timing.epochAt(transfer._timing.response_start);
++    self._chrome_timing.protocol = transfer._timing.protocol;
++    self._chrome_timing.alpn_negotiated = transfer._timing.alpn_negotiated;
+     self._http_status = transfer.responseStatus();
+     self._bot_challenge = transfer.botChallenge();
+     for (transfer.responseHeaders()) |hdr| {
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 97b98ee..50d476f 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -967,12 +967,14 @@ const PrivateSymbols = struct {
+     child_nodes: Private,
+     get_battery: Private,
+     network_information: Private,
++    chrome_result: Private,
+ 
+     fn init(isolate: *v8.Isolate) PrivateSymbols {
+         return .{
+             .child_nodes = Private.init(isolate, "child_nodes"),
+             .get_battery = Private.init(isolate, "get_battery"),
+             .network_information = Private.init(isolate, "network_information"),
++            .chrome_result = Private.init(isolate, "chrome_result"),
+         };
+     }
+ 
+@@ -980,6 +982,7 @@ const PrivateSymbols = struct {
+         self.child_nodes.deinit();
+         self.get_battery.deinit();
+         self.network_information.deinit();
++        self.chrome_result.deinit();
+     }
+ };
+ 
+diff --git a/src/browser/js/Snapshot.zig b/src/browser/js/Snapshot.zig
+index 8a471c7..c9e7f51 100644
+--- a/src/browser/js/Snapshot.zig
++++ b/src/browser/js/Snapshot.zig
+@@ -22,6 +22,7 @@ const lp = @import("lightpanda");
+ 
+ const js = @import("js.zig");
+ const WasmStreaming = @import("WasmStreaming.zig");
++const Chrome = @import("../webapi/Chrome.zig");
+ const bridge = @import("bridge.zig");
+ const reflect = @import("../reflect.zig");
+ 
+@@ -316,6 +317,7 @@ fn createSnapshotContext(
+     v8.v8__Context__SetAlignedPointerInEmbedderData(context, 1, null);
+ 
+     const global_obj = v8.v8__Context__Global(context);
++    if (comptime realm == .window) try Chrome.install(isolate, context.?, global_obj.?);
+ 
+     // Attach constructors for this context's APIs to the global, and for any
+     // type with members tagged [Exposed=Window]/[Exposed=Worker], prune the
+@@ -442,7 +444,7 @@ fn memberExposed(value: anytype) Caller.Function.Opts.Exposed {
+ fn countExternalReferences() comptime_int {
+     @setEvalBranchQuota(100_000);
+ 
+-    var count: comptime_int = 0;
++    var count: comptime_int = Chrome.callbacks.len;
+ 
+     // +1 for the illegal constructor callback shared by various types
+     count += 1;
+@@ -522,6 +524,11 @@ fn collectExternalReferences() [countExternalReferences()]isize {
+     var idx: usize = 0;
+     var references = std.mem.zeroes([countExternalReferences()]isize);
+ 
++    inline for (Chrome.callbacks) |callback| {
++        references[idx] = @bitCast(@intFromPtr(&callback));
++        idx += 1;
++    }
++
+     references[idx] = @bitCast(@intFromPtr(&illegalConstructorCallback));
+     idx += 1;
+ 
+diff --git a/src/browser/webapi/Chrome.zig b/src/browser/webapi/Chrome.zig
+new file mode 100644
+index 0000000..d940de6
+--- /dev/null
++++ b/src/browser/webapi/Chrome.zig
+@@ -0,0 +1,282 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Frame = @import("../Frame.zig");
++const v8 = js.v8;
++
++// Ordinary web-page Chrome bindings, not an extension environment. Installed in
++// the page snapshot so each realm owns its objects before any page code runs.
++pub const callbacks = .{ loadTimes, csi, getDetails, getIsInstalled, installState, runningState, installedGetter, emptySetter, resultGetter };
++
++pub const Timing = struct {
++    epoch: u64,
++    boot: u64,
++    commit: f64 = 0,
++    dom_loaded: f64 = 0,
++    loaded: f64 = 0,
++    navigation_type: []const u8 = "Other",
++    transition: u8 = 15,
++    protocol: []const u8 = "",
++    alpn_negotiated: bool = false,
++
++    pub fn init() Timing {
++        return .{ .epoch = lp.datetime.microTimestamp(.real), .boot = lp.datetime.microTimestamp(.boot) };
++    }
++
++    pub fn elapsed(self: *const Timing) f64 {
++        return @as(f64, @floatFromInt(lp.datetime.microTimestamp(.boot) -| self.boot)) / 1000.0;
++    }
++
++    pub fn epochAt(self: *const Timing, boot: u64) f64 {
++        if (boot == 0) return 0;
++        return @as(f64, @floatFromInt(self.epoch + (boot -| self.boot))) / 1_000_000.0;
++    }
++
++    pub fn epochNow(self: *const Timing) f64 {
++        return self.epochAt(lp.datetime.microTimestamp(.boot));
++    }
++};
++
++pub fn install(isolate: *v8.Isolate, context: *const v8.Context, global: *const v8.Object) !void {
++    const chrome = v8.v8__Object__New(isolate).?;
++    try define(isolate, context, chrome, "loadTimes", @ptrCast(v8.v8__Function__New__DEFAULT(context, loadTimes).?));
++    try define(isolate, context, chrome, "csi", @ptrCast(v8.v8__Function__New__DEFAULT(context, csi).?));
++
++    const app_template = v8.v8__ObjectTemplate__New__DEFAULT(isolate).?;
++    v8.v8__ObjectTemplate__SetNativeDataProperty__DEFAULT2(app_template, @ptrCast(str(isolate, "isInstalled")), installedGetter, emptySetter);
++    const app = v8.v8__ObjectTemplate__NewInstance(app_template, context).?;
++    inline for (.{ .{ "getDetails", getDetails }, .{ "getIsInstalled", getIsInstalled }, .{ "installState", installState }, .{ "runningState", runningState } }) |entry| {
++        const template = v8.v8__FunctionTemplate__New__Config(isolate, &.{
++            .callback = entry[1],
++            .data = null,
++            .signature = null,
++            .length = 0,
++            .behavior = v8.kConstructorBehavior_Throw,
++            .side_effect_type = v8.kSideEffectType_HasSideEffect,
++        }).?;
++        const function = v8.v8__FunctionTemplate__GetFunction(template, context).?;
++        v8.v8__Function__SetName(function, str(isolate, entry[0]));
++        try define(isolate, context, app, entry[0], @ptrCast(function));
++    }
++    const install_state = v8.v8__Object__New(isolate).?;
++    inline for (.{ .{ "DISABLED", "disabled" }, .{ "INSTALLED", "installed" }, .{ "NOT_INSTALLED", "not_installed" } }) |entry| {
++        try define(isolate, context, install_state, entry[0], @ptrCast(str(isolate, entry[1])));
++    }
++    try define(isolate, context, app, "InstallState", @ptrCast(install_state));
++    const running_state = v8.v8__Object__New(isolate).?;
++    inline for (.{ .{ "CANNOT_RUN", "cannot_run" }, .{ "READY_TO_RUN", "ready_to_run" }, .{ "RUNNING", "running" } }) |entry| {
++        try define(isolate, context, running_state, entry[0], @ptrCast(str(isolate, entry[1])));
++    }
++    try define(isolate, context, app, "RunningState", @ptrCast(running_state));
++    try define(isolate, context, chrome, "app", @ptrCast(app));
++    try define(isolate, context, global, "chrome", @ptrCast(chrome));
++}
++
++fn str(isolate: *v8.Isolate, value: []const u8) *const v8.String {
++    return v8.v8__String__NewFromUtf8(isolate, value.ptr, v8.kNormal, @intCast(value.len)).?;
++}
++
++fn define(isolate: *v8.Isolate, context: *const v8.Context, object: *const v8.Object, name: []const u8, value: *const v8.Value) !void {
++    var result: v8.MaybeBool = undefined;
++    v8.v8__Object__DefineOwnProperty(object, context, @ptrCast(str(isolate, name)), value, v8.None, &result);
++    if (!result.has_value or !result.value) return error.ChromePropertyFailed;
++}
++
++fn respond(info: *const v8.FunctionCallbackInfo, value: *const v8.Value) void {
++    var result: v8.ReturnValue = undefined;
++    v8.v8__FunctionCallbackInfo__GetReturnValue(info, &result);
++    v8.v8__ReturnValue__Set(result, value);
++}
++
++fn invalidInvocation(info: *const v8.FunctionCallbackInfo, comptime signature: []const u8) void {
++    const isolate = v8.v8__FunctionCallbackInfo__GetIsolate(info).?;
++    _ = v8.v8__Isolate__ThrowException(isolate, v8.v8__Exception__TypeError(str(isolate, "Error in invocation of app." ++ signature ++ ": ")));
++}
++
++fn getDetails(info_: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
++    const info = info_.?;
++    if (v8.v8__FunctionCallbackInfo__Length(info) != 0) return invalidInvocation(info, "getDetails()");
++    respond(info, v8.v8__Null(v8.v8__FunctionCallbackInfo__GetIsolate(info)).?);
++}
++
++fn getIsInstalled(info_: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
++    const info = info_.?;
++    if (v8.v8__FunctionCallbackInfo__Length(info) != 0) return invalidInvocation(info, "getIsInstalled()");
++    respond(info, @ptrCast(v8.v8__Boolean__New(v8.v8__FunctionCallbackInfo__GetIsolate(info), false).?));
++}
++
++fn runningState(info_: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
++    const info = info_.?;
++    if (v8.v8__FunctionCallbackInfo__Length(info) != 0) return invalidInvocation(info, "runningState()");
++    respond(info, @ptrCast(str(v8.v8__FunctionCallbackInfo__GetIsolate(info).?, "cannot_run")));
++}
++
++fn installState(info_: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
++    const info = info_.?;
++    const count = v8.v8__FunctionCallbackInfo__Length(info);
++    if (count > 1) return invalidInvocation(info, "installState(optional function callback)");
++    if (count == 0) return;
++    const callback = v8.v8__FunctionCallbackInfo__INDEX(info, 0).?;
++    if (v8.v8__Value__IsNullOrUndefined(callback)) return;
++    if (!v8.v8__Value__IsFunction(callback)) return invalidInvocation(info, "installState(optional function callback)");
++    var caller: js.Caller = undefined;
++    if (!caller.initFromHandle(info)) return;
++    defer caller.deinit();
++    const local = &caller.local;
++    scheduleInstallState(local, @ptrCast(callback)) catch {
++        _ = v8.v8__Isolate__ThrowException(local.isolate.handle, local.isolate.createError("Unable to schedule app.installState"));
++    };
++}
++
++fn scheduleInstallState(local: *const js.Local, callback: *const v8.Function) !void {
++    const arena = try local.ctx.execution.getArena(.tiny, "chrome.app.installState");
++    errdefer arena.release();
++    const task = try arena.create(InstallTask);
++    task.* = .{ .ctx = local.ctx, .callback = try (js.Function{ .local = local, .handle = callback }).persist(), .arena = arena };
++    errdefer task.callback.deinit();
++    try local.ctx.scheduler.add(task, InstallTask.run, 0, .{ .name = "chrome.app.installState", .finalizer = InstallTask.finalize });
++}
++
++const InstallTask = struct {
++    ctx: *js.Context,
++    callback: js.Function.Global,
++    arena: *lp.Arena,
++
++    fn finalize(data: *anyopaque) void {
++        const self: *InstallTask = @ptrCast(@alignCast(data));
++        self.callback.deinit();
++        self.arena.release();
++    }
++
++    fn run(data: *anyopaque) !?u32 {
++        const self: *InstallTask = @ptrCast(@alignCast(data));
++        defer finalize(data);
++        var scope: js.Local.Scope = undefined;
++        self.ctx.localScope(&scope);
++        defer scope.deinit();
++        try self.callback.local(&scope.local).call(void, .{"not_installed"});
++        return null;
++    }
++};
++
++fn installedGetter(_: ?*const v8.Name, info_: ?*const v8.PropertyCallbackInfo) callconv(.c) void {
++    const info = info_.?;
++    var result: v8.ReturnValue = undefined;
++    v8.v8__PropertyCallbackInfo__GetReturnValue(info, &result);
++    v8.v8__ReturnValue__Set(result, @ptrCast(v8.v8__Boolean__New(v8.v8__PropertyCallbackInfo__GetIsolate(info), false)));
++}
++
++fn emptySetter(_: ?*const v8.Name, _: ?*const v8.Value, _: ?*const v8.PropertyCallbackInfo) callconv(.c) void {}
++
++// Result values live entirely in V8, so they remain readable after their frame
++// is removed or navigated. Native data properties match Chromium's no-op setter.
++fn resultObject(isolate: *v8.Isolate, context: *const v8.Context, values: anytype) !*const v8.Object {
++    const template = v8.v8__ObjectTemplate__New__DEFAULT(isolate).?;
++    const data = v8.v8__Object__New(isolate).?;
++    const fields = @typeInfo(@TypeOf(values)).@"struct".fields;
++    // V8 prepends native data properties when instantiating a template.
++    inline for (0..fields.len) |i| {
++        const field = fields[fields.len - 1 - i];
++        const value = @field(values, field.name);
++        const handle: *const v8.Value = switch (@TypeOf(value)) {
++            f64 => @ptrCast(v8.v8__Number__New(isolate, value).?),
++            bool => @ptrCast(v8.v8__Boolean__New(isolate, value).?),
++            []const u8 => @ptrCast(str(isolate, value)),
++            else => @compileError("Unsupported Chrome result field"),
++        };
++        try define(isolate, context, data, field.name, handle);
++        v8.v8__ObjectTemplate__SetNativeDataProperty__DEFAULT2(template, @ptrCast(str(isolate, field.name)), resultGetter, emptySetter);
++    }
++    const object = v8.v8__ObjectTemplate__NewInstance(template, context).?;
++    const ctx, _ = js.Context.fromIsolate(.{ .handle = isolate }) orelse return error.ChromeContextMissing;
++    const key: *const v8.Private = @ptrCast(v8.v8__Global__Get(&ctx.env.private_symbols.chrome_result.handle, isolate).?);
++    var result: v8.MaybeBool = undefined;
++    v8.v8__Object__SetPrivate(object, context, key, @ptrCast(data), &result);
++    if (!result.has_value or !result.value) return error.ChromePropertyFailed;
++    v8.v8__Object__SetPrototype(object, context, v8.v8__Object__GetPrototype(data), &result);
++    if (!result.has_value or !result.value) return error.ChromePrototypeFailed;
++    return object;
++}
++
++fn resultGetter(name: ?*const v8.Name, info_: ?*const v8.PropertyCallbackInfo) callconv(.c) void {
++    const info = info_.?;
++    const isolate = v8.v8__PropertyCallbackInfo__GetIsolate(info).?;
++    const context = v8.v8__Isolate__GetCurrentContext(isolate).?;
++    // Despite its name, the C binding returns info.Holder(), not the receiver.
++    // Reflect.get with a foreign receiver must still read this result's values.
++    const holder = v8.v8__PropertyCallbackInfo__This(info).?;
++    const ctx, _ = js.Context.fromIsolate(.{ .handle = isolate }) orelse return;
++    const key: *const v8.Private = @ptrCast(v8.v8__Global__Get(&ctx.env.private_symbols.chrome_result.handle, isolate).?);
++    const backing = v8.v8__Object__GetPrivate(holder, context, key) orelse return;
++    if (!v8.v8__Value__IsObject(backing)) return;
++    const data: *const v8.Object = @ptrCast(backing);
++    const value = v8.v8__Object__Get(data, context, @ptrCast(name)) orelse return;
++    var result: v8.ReturnValue = undefined;
++    v8.v8__PropertyCallbackInfo__GetReturnValue(info, &result);
++    v8.v8__ReturnValue__Set(result, value);
++}
++
++fn currentFrame(isolate: *v8.Isolate) ?*Frame {
++    const context = v8.v8__Isolate__GetCurrentContext(isolate) orelse return null;
++    const ctx: *js.Context = @ptrCast(@alignCast(v8.v8__Context__GetAlignedPointerFromEmbedderData(context, 1) orelse return null));
++    return switch (ctx.global) {
++        .frame => |frame| frame,
++        .worker => null,
++    };
++}
++
++fn csi(info_: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
++    const info = info_.?;
++    const isolate = v8.v8__FunctionCallbackInfo__GetIsolate(info).?;
++    const frame = currentFrame(isolate) orelse return respond(info, v8.v8__Null(isolate).?);
++    const timing = &frame._chrome_timing;
++    const result = resultObject(isolate, v8.v8__Isolate__GetCurrentContext(isolate).?, .{
++        .startE = @floor(@as(f64, @floatFromInt(timing.epoch)) / 1000.0),
++        .onloadT = @floor(timing.dom_loaded * 1000.0),
++        .pageT = timing.elapsed(),
++        .tran = @as(f64, @floatFromInt(timing.transition)),
++    }) catch return;
++    respond(info, @ptrCast(result));
++}
++
++fn loadTimes(info_: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
++    const info = info_.?;
++    const isolate = v8.v8__FunctionCallbackInfo__GetIsolate(info).?;
++    const frame = currentFrame(isolate) orelse return respond(info, v8.v8__Null(isolate).?);
++    const timing = &frame._chrome_timing;
++    const protocol = timing.protocol;
++    const multiplexed = std.mem.eql(u8, protocol, "h2") or std.mem.eql(u8, protocol, "h3");
++    const result = resultObject(isolate, v8.v8__Isolate__GetCurrentContext(isolate).?, .{
++        .requestTime = @as(f64, @floatFromInt(timing.epoch)) / 1_000_000.0,
++        .startLoadTime = @as(f64, @floatFromInt(timing.epoch)) / 1_000_000.0,
++        .commitLoadTime = timing.commit,
++        .finishDocumentLoadTime = timing.dom_loaded,
++        .finishLoadTime = timing.loaded,
++        .firstPaintTime = @as(f64, 0),
++        .firstPaintAfterLoadTime = @as(f64, 0),
++        .navigationType = timing.navigation_type,
++        .wasFetchedViaSpdy = multiplexed,
++        .wasNpnNegotiated = timing.alpn_negotiated,
++        .npnNegotiatedProtocol = if (timing.alpn_negotiated) protocol else @as([]const u8, ""),
++        .wasAlternateProtocolAvailable = false,
++        .connectionInfo = if (protocol.len != 0) protocol else @as([]const u8, "unknown"),
++    }) catch return;
++    respond(info, @ptrCast(result));
++}
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index b99e378..fcde7b6 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -4067,10 +4067,8 @@ pub const Transfer = struct {
+         self.abortParked(error.AbortAuthChallenge);
+     }
+ 
+-    // The only reason we hook into this is to try to detect bad responses which
+-    // makes it so we can't re-use the connection. We're quick to return a
+-    // connection to the pool, so this is the first and last place we can check
+-    // this in all cases
++    // Capture TLS negotiation while curl still has its live connection, and
++    // detect invalid body announcements before returning it to the pool.
+     fn headerCallback(buffer: [*]const u8, chunk_count: usize, chunk_len: usize, data: *anyopaque) callconv(.c) usize {
+         if (comptime lp.IS_DEBUG) {
+             // libcurl emits 1 header line at a time
+@@ -4080,7 +4078,13 @@ pub const Transfer = struct {
+         const line = buffer[0..chunk_len];
+         if (std.mem.startsWith(u8, line, "HTTP/")) {
+             const conn: *http.Connection = @ptrCast(@alignCast(data));
+-            conn.transport.http.res.status_text = .fromStatusLine(line);
++            const transfer = conn.transport.http;
++            transfer.res.status_text = .fromStatusLine(line);
++            const alpn = if (std.mem.startsWith(u8, transfer.req.url, "https://"))
++                conn.getAlpnProtocol() catch @as([]const u8, "")
++            else
++                "";
++            transfer._timing.alpn_negotiated = alpn.len != 0;
+             return chunk_len;
+         }
+ 
+@@ -4510,6 +4514,7 @@ const ResourceTiming = struct {
+     encoded_body_size: u64 = 0,
+     decoded_body_size: u64 = 0,
+     protocol: []const u8 = "",
++    alpn_negotiated: bool = false,
+     cache: CacheState = .none,
+     // Cleared by the first redirect response that fails the TAO check.
+     timing_allow: bool = true,
+diff --git a/src/network/http.zig b/src/network/http.zig
+index b66d3f7..f01896d 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -636,6 +637,19 @@ pub const Connection = struct {
+         return @enumFromInt(version);
+     }
+ 
++    // The returned slice belongs to the live TLS connection.
++    pub fn getAlpnProtocol(self: *const Connection) ![]const u8 {
++        var info: ?*libcurl.CurlTlsSessionInfo = null;
++        try libcurl.curl_easy_getinfo(self._easy, .tls_ssl_ptr, &info);
++        const session = info orelse return "";
++        if (session.backend != libcurl.ssl_backend_openssl) return "";
++        const ssl = session.internals orelse return "";
++        var data: ?[*]const u8 = null;
++        var len: c_uint = 0;
++        crypto.SSL_get0_alpn_selected(@ptrCast(ssl), &data, &len);
++        return if (data) |ptr| ptr[0..len] else "";
++    }
++
+     pub fn getConnectHeader(self: *const Connection, name: [:0]const u8, index: usize) ?HeaderValue {
+         var hdr: ?*libcurl.CurlHeader = null;
+         libcurl.curl_easy_header(self._easy, name, index, .connect, -1, &hdr) catch |err| {
+diff --git a/src/sys/libcrypto.zig b/src/sys/libcrypto.zig
+index 33d4428..7dc433c 100644
+--- a/src/sys/libcrypto.zig
++++ b/src/sys/libcrypto.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -175,6 +176,8 @@ pub extern fn X509_STORE_load_locations(store: *X509_STORE, file: ?[*:0]const u8
+ 
+ const struct_ssl_ctx_st = opaque {};
+ pub const SSL_CTX = struct_ssl_ctx_st;
++pub const SSL = opaque {};
++pub extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *?[*]const u8, len: *c_uint) void;
+ pub extern fn SSL_CTX_set1_verify_cert_store(ctx: ?*SSL_CTX, store: ?*X509_STORE) c_int;
+ 
+ /// Returns the desired digest by its name.
+diff --git a/src/sys/libcurl.zig b/src/sys/libcurl.zig
+index 588b7ac..8385ad5 100644
+--- a/src/sys/libcurl.zig
++++ b/src/sys/libcurl.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -248,6 +249,9 @@ const CurlMOption = enum(c.CURLMoption) {
+     max_connects = c.CURLMOPT_MAXCONNECTS,
+ };
+ 
++pub const CurlTlsSessionInfo = c.struct_curl_tlssessioninfo;
++pub const ssl_backend_openssl = c.CURLSSLBACKEND_OPENSSL;
++
+ pub const CurlInfo = enum(c.CURLINFO) {
+     effective_url = c.CURLINFO_EFFECTIVE_URL,
+     private = c.CURLINFO_PRIVATE,
+@@ -263,6 +267,7 @@ pub const CurlInfo = enum(c.CURLINFO) {
+     starttransfer_time_t = c.CURLINFO_STARTTRANSFER_TIME_T,
+     size_download_t = c.CURLINFO_SIZE_DOWNLOAD_T,
+     http_version = c.CURLINFO_HTTP_VERSION,
++    tls_ssl_ptr = c.CURLINFO_TLS_SSL_PTR,
+     num_connects = c.CURLINFO_NUM_CONNECTS,
+     conn_id = c.CURLINFO_CONN_ID,
+ };
+@@ -697,6 +702,10 @@ pub fn curl_easy_getinfo(easy: *Curl, comptime info: CurlInfo, out: anytype) Err
+             const p: *c.curl_off_t = out;
+             break :blk c.curl_easy_getinfo(easy, inf, p);
+         },
++        .tls_ssl_ptr => blk: {
++            const p: *?*c.struct_curl_tlssessioninfo = out;
++            break :blk c.curl_easy_getinfo(easy, inf, p);
++        },
+         .private => blk: {
+             const p: **anyopaque = out;
+             break :blk c.curl_easy_getinfo(easy, inf, p);

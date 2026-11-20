@@ -1,0 +1,1077 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 5 Nov 2026 16:20:26 -0300
+Subject: [PATCH] webapi: add native media source and recorder capability
+ probes
+
+Expose MediaSource and MediaRecorder with codec-aware static MIME probes
+for the desktop Mac Chrome persona, independent of host codecs. Preserve
+native EventTarget inheritance, argument coercion, invalid-receiver checks,
+and standard closed/inactive-state exceptions.
+
+Provide independently retained empty SourceBufferLists, dedicated-worker
+MediaSource/handle exposure, and empty native MediaStreams for recorder
+construction. Keep callback cycles collectible and clean up once/abort
+listeners. Attachment, handle transfer, live tracks and encoding remain
+outside this capability patch.
+
+Pass media-source-recorder-capabilities: benchmark 124/130 with no prior
+passes regressed; existing upstream tests 1658/1658. Validate 256 temporary
+API/GC checks in the debug build. Address reviewer findings for extended
+VP9/AV1 strings, buffer-list iteration and BigInt rejection.
+---
+ src/browser/js/Env.zig               |   9 ++
+ src/browser/js/bridge.zig            |   5 +-
+ src/browser/webapi/AbortSignal.zig   |   9 +-
+ src/browser/webapi/EventTarget.zig   |  28 ++++
+ src/browser/webapi/MediaRecorder.zig | 168 ++++++++++++++++++++
+ src/browser/webapi/MediaSource.zig   | 223 +++++++++++++++++++++++++++
+ src/browser/webapi/MediaStream.zig   | 110 +++++++++++++
+ src/browser/webapi/media_events.zig  | 147 ++++++++++++++++++
+ src/browser/webapi/media_mime.zig    | 176 +++++++++++++++++++++
+ 9 files changed, 872 insertions(+), 3 deletions(-)
+ create mode 100644 src/browser/webapi/MediaRecorder.zig
+ create mode 100644 src/browser/webapi/MediaSource.zig
+ create mode 100644 src/browser/webapi/MediaStream.zig
+ create mode 100644 src/browser/webapi/media_events.zig
+ create mode 100644 src/browser/webapi/media_mime.zig
+
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index d5fd109..0c6f4f4 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -1124,6 +1124,9 @@ const PrivateSymbols = struct {
+     chrome_result: Private,
+     speech_callbacks: Private,
+     font_face_resolver: Private,
++    media_source_buffers: Private,
++    media_active_source_buffers: Private,
++    media_source_handle: Private,
+ 
+     fn init(isolate: *v8.Isolate) PrivateSymbols {
+         return .{
+@@ -1133,6 +1136,9 @@ const PrivateSymbols = struct {
+             .chrome_result = Private.init(isolate, "chrome_result"),
+             .speech_callbacks = Private.init(isolate, "speech_callbacks"),
+             .font_face_resolver = Private.init(isolate, "font_face_resolver"),
++            .media_source_buffers = Private.init(isolate, "media_source_buffers"),
++            .media_active_source_buffers = Private.init(isolate, "media_active_source_buffers"),
++            .media_source_handle = Private.init(isolate, "media_source_handle"),
+         };
+     }
+ 
+@@ -1143,6 +1149,9 @@ const PrivateSymbols = struct {
+         self.chrome_result.deinit();
+         self.speech_callbacks.deinit();
+         self.font_face_resolver.deinit();
++        self.media_source_buffers.deinit();
++        self.media_active_source_buffers.deinit();
++        self.media_source_handle.deinit();
+     }
+ };
+ 
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index f2068a8..356ef6f 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1032,6 +1032,9 @@ pub const PageJsApis = flattenTypes(&.{
+     @import("../webapi/WebRTC.zig"),
+     @import("../webapi/EncryptedMedia.zig"),
+     @import("../webapi/AudioContext.zig"),
++    @import("../webapi/MediaSource.zig"),
++    @import("../webapi/MediaRecorder.zig"),
++    @import("../webapi/MediaStream.zig"),
+     @import("../webapi/SpeechSynthesis.zig"),
+     @import("../webapi/VideoDecoder.zig"),
+     @import("../webapi/SpeechSynthesisVoice.zig"),
+@@ -1445,7 +1448,7 @@ const worker_extended_apis = worker_common_apis ++ [_]type{
+     @import("../webapi/FileReaderSync.zig"),
+ };
+ 
+-pub const DedicatedWorkerJsApis = flattenTypes(&([_]type{ @import("../webapi/DedicatedWorkerGlobalScope.zig"), @import("../webapi/VideoDecoder.zig") } ++ worker_extended_apis));
++pub const DedicatedWorkerJsApis = flattenTypes(&([_]type{ @import("../webapi/DedicatedWorkerGlobalScope.zig"), @import("../webapi/VideoDecoder.zig"), @import("../webapi/MediaSource.zig") } ++ worker_extended_apis));
+ pub const SharedWorkerJsApis = flattenTypes(&([_]type{@import("../webapi/SharedWorkerGlobalScope.zig")} ++ worker_extended_apis));
+ 
+ pub const ServiceWorkerJsApis = flattenTypes(&([_]type{
+diff --git a/src/browser/webapi/AbortSignal.zig b/src/browser/webapi/AbortSignal.zig
+index 735f905..571f81f 100644
+--- a/src/browser/webapi/AbortSignal.zig
++++ b/src/browser/webapi/AbortSignal.zig
+@@ -44,6 +44,7 @@ const Dependend = union(enum) {
+     audio_listener: *@import("AudioContext.zig").ListenerRoot,
+     eme_listener: *@import("EncryptedMedia.zig").Session.ListenerRoot,
+     rtc_listener: *@import("WebRTC.zig").ListenerRoot,
++    media_listener: *@import("media_events.zig").ListenerRoot,
+ 
+     // Returns false if the dependent was already aborted, in which case no
+     // abort event must be dispatched for it.
+@@ -58,14 +59,14 @@ const Dependend = union(enum) {
+                 try dep.markAborted(exec);
+                 return true;
+             },
+-            .scheduler_task, .audio_listener, .eme_listener, .rtc_listener => return false,
++            .scheduler_task, .audio_listener, .eme_listener, .rtc_listener, .media_listener => return false,
+         }
+     }
+ 
+     fn dispatchAbortEvent(self: Dependend, exec: *const Execution) !void {
+         switch (self) {
+             .signal => |dep| try dep.dispatchAbortEvent(exec),
+-            .model_context_tool, .scheduler_task, .audio_listener, .eme_listener, .rtc_listener => {},
++            .model_context_tool, .scheduler_task, .audio_listener, .eme_listener, .rtc_listener, .media_listener => {},
+         }
+     }
+ };
+@@ -165,6 +166,10 @@ fn markAborted(self: *AbortSignal, reason_: ?Reason, exec: *const Execution) !vo
+             _ = self._dependents.swapRemove(index);
+             dep.rtc_listener.signal = null;
+             dep.rtc_listener.abort(exec);
++        } else if (dep == .media_listener) {
++            _ = self._dependents.swapRemove(index);
++            dep.media_listener.signal = null;
++            dep.media_listener.abort(exec);
+         } else if (dep == .eme_listener) {
+             _ = self._dependents.swapRemove(index);
+             dep.eme_listener.signal = null;
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index 8b5ed90..ffc35fa 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -71,6 +71,9 @@ const VideoDecoder = @import("VideoDecoder.zig");
+ const WebRTC = @import("WebRTC.zig");
+ const AudioContext = @import("AudioContext.zig");
+ const MediaKeySession = @import("EncryptedMedia.zig").Session;
++const MediaSource = @import("MediaSource.zig");
++const MediaRecorder = @import("MediaRecorder.zig");
++const MediaStream = @import("MediaStream.zig");
+ 
+ const EventTarget = @This();
+ 
+@@ -97,6 +100,10 @@ pub const Type = enum(u8) {
+     idb_request,
+     idb_transaction,
+     media_devices,
++    media_source,
++    source_buffer_list,
++    media_recorder,
++    media_stream,
+     media_key_session,
+     media_query_list,
+     message_port,
+@@ -144,6 +151,10 @@ pub fn Subtype(comptime tag: Type) type {
+         .idb_request => IDBRequest,
+         .idb_transaction => IDBTransaction,
+         .media_devices => MediaDevices,
++        .media_source => MediaSource,
++        .source_buffer_list => MediaSource.List,
++        .media_recorder => MediaRecorder,
++        .media_stream => MediaStream,
+         .media_key_session => MediaKeySession,
+         .media_query_list => MediaQueryList,
+         .message_port => MessagePort,
+@@ -235,6 +246,10 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
+     }
+ 
+     switch (self._type) {
++        inline .media_source, .source_buffer_list, .media_recorder, .media_stream => |tag| {
++            try self.subtype(Subtype(tag))._events.dispatch(event, exec);
++            return !event._cancelable or !event._prevent_default;
++        },
+         inline .audio_node, .base_audio_context => |tag| {
+             try self.subtype(Subtype(tag))._audio.dispatchAt(self, event, exec);
+             return !event._cancelable or !event._prevent_default;
+@@ -352,6 +367,7 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
+         return;
+     }
+     switch (self._type) {
++        inline .media_source, .source_buffer_list, .media_recorder, .media_stream => |tag| return self.subtype(Subtype(tag))._events.register(typ, em_callback, options, exec),
+         .speech_synthesis => {
+             _ = try self.subtype(SpeechSynthesis)._events.register(self, typ, em_callback, options);
+             return;
+@@ -410,6 +426,10 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
+         return;
+     }
+     switch (self._type) {
++        inline .media_source, .source_buffer_list, .media_recorder, .media_stream => |tag| {
++            self.subtype(Subtype(tag))._events.remove(typ, em_callback, use_capture, exec);
++            return;
++        },
+         inline .audio_node, .base_audio_context => |tag| {
+             self.subtype(Subtype(tag))._audio.removeListenerAt(self, typ, em_callback, use_capture, exec);
+             return;
+@@ -453,6 +473,10 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         .base_audio_context => writer.writeAll("<AudioContext>"),
+         .battery_manager => writer.writeAll("<BatteryManager>"),
+         .media_devices => writer.writeAll("<MediaDevices>"),
++        .media_source => writer.writeAll("<MediaSource>"),
++        .source_buffer_list => writer.writeAll("<SourceBufferList>"),
++        .media_recorder => writer.writeAll("<MediaRecorder>"),
++        .media_stream => writer.writeAll("<MediaStream>"),
+         .media_key_session => writer.writeAll("<MediaKeySession>"),
+         .media_query_list => writer.writeAll("<MediaQueryList>"),
+         .message_port => writer.writeAll("<MessagePort>"),
+@@ -498,6 +522,10 @@ pub fn toString(self: *EventTarget) []const u8 {
+         .idb_request => return "[object IDBRequest]",
+         .idb_transaction => return "[object IDBTransaction]",
+         .media_devices => return "[object MediaDevices]",
++        .media_source => return "[object MediaSource]",
++        .source_buffer_list => return "[object SourceBufferList]",
++        .media_recorder => return "[object MediaRecorder]",
++        .media_stream => return "[object MediaStream]",
+         .media_key_session => return "[object MediaKeySession]",
+         .media_query_list => return "[object MediaQueryList]",
+         .message_port => return "[object MessagePort]",
+diff --git a/src/browser/webapi/MediaRecorder.zig b/src/browser/webapi/MediaRecorder.zig
+new file mode 100644
+index 0000000..29ce6b5
+--- /dev/null
++++ b/src/browser/webapi/MediaRecorder.zig
+@@ -0,0 +1,168 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const EventTarget = @import("EventTarget.zig");
++const MediaStream = @import("MediaStream.zig");
++const Events = @import("media_events.zig");
++const Speech = @import("SpeechSynthesis.zig");
++const Conversion = @import("media_constraints.zig");
++const Mime = @import("media_mime.zig");
++
++const MediaRecorder = @This();
++pub const Proto = EventTarget;
++_proto: *EventTarget,
++_arena: *lp.Arena,
++_rc: lp.RC = .{},
++_events: Events,
++_handlers: [6]Speech.Handler = undefined,
++_stream: *MediaStream,
++_mime: []const u8,
++_audio: u32 = 128000,
++_video: u32 = 2500000,
++_mode: []const u8 = "variable",
++
++fn init(stream: *MediaStream, input: ?js.Value, exec: *js.Execution) !*MediaRecorder {
++    var audio: u32 = 128000;
++    var video: u32 = 2500000;
++    var mode: []const u8 = "variable";
++    var mime: []const u8 = "";
++    // Dictionary members are converted in Web IDL lexicographic order.
++    if (try Conversion.dictionary(input)) |options| {
++        const bitrate_mode = try options.get("audioBitrateMode");
++        if (!bitrate_mode.isUndefined()) {
++            mode = try (try Conversion.domString(bitrate_mode)).toSlice();
++            if (!std.mem.eql(u8, mode, "variable") and !std.mem.eql(u8, mode, "constant")) return error.TypeError;
++        }
++        const a = try options.get("audioBitsPerSecond");
++        if (!a.isUndefined()) audio = try a.toU32();
++        const total = try options.get("bitsPerSecond");
++        const bits: ?u32 = if (total.isUndefined()) null else try total.toU32();
++        const m = try options.get("mimeType");
++        if (!m.isUndefined()) mime = try (try Conversion.domString(m)).toSlice();
++        const v = try options.get("videoBitsPerSecond");
++        if (!v.isUndefined()) video = try v.toU32();
++        const count = try options.get("videoKeyFrameIntervalCount");
++        if (!count.isUndefined()) _ = try count.toU32();
++        const duration = try options.get("videoKeyFrameIntervalDuration");
++        if (!duration.isUndefined()) {
++            const number = try duration.toZig(f64);
++            if (!std.math.isFinite(number)) return error.TypeError;
++        }
++        if (bits) |b| {
++            audio = @intFromFloat(@as(f64, @floatFromInt(b)) * 0.1);
++            video = b - audio;
++        }
++    }
++    if (!try Mime.supported(mime, .recorder, exec.call_arena)) return error.NotSupported;
++    const arena = try exec.getArena(.small, "MediaRecorder");
++    var arena_owned = true;
++    errdefer if (arena_owned) arena.release();
++    const self = try exec._factory.eventTargetWithAllocator(arena.allocator(), MediaRecorder{
++        ._proto = undefined,
++        ._arena = arena,
++        ._rc = lp.RC.init(1),
++        ._events = .init(arena),
++        ._stream = stream,
++        ._mime = try arena.dupe(u8, mime),
++        ._audio = audio,
++        ._video = video,
++        ._mode = try arena.dupe(u8, mode),
++    });
++    stream.acquireRef();
++    self._events.handlers(&self._handlers, &.{ "start", "stop", "dataavailable", "pause", "resume", "error" }, self._proto);
++    arena_owned = false;
++    defer self.releaseRef(exec.page);
++    const local = exec.js.local.?;
++    const data = try Speech.callbackData(self._proto, local);
++    if (!(data.defineOwnProperty("stream", try local.zigValueToJs(stream, .{}), 0) orelse false)) return error.JsException;
++    return self;
++}
++pub fn acquireRef(self: *MediaRecorder) void {
++    self._rc.acquire();
++}
++pub fn releaseRef(self: *MediaRecorder, page: *Page) void {
++    self._rc.release(self, page);
++}
++pub fn deinit(self: *MediaRecorder, page: *Page) void {
++    self._events.deinit(&self._handlers);
++    self._stream.releaseRef(page);
++    self._arena.release();
++}
++fn isTypeSupported(value: js.Value, exec: *js.Execution) !bool {
++    return Mime.probe(value, .recorder, exec);
++}
++fn getStream(self: *const MediaRecorder) *MediaStream {
++    return self._stream;
++}
++fn mimeType(self: *const MediaRecorder) []const u8 {
++    return self._mime;
++}
++fn state(_: *const MediaRecorder) []const u8 {
++    return "inactive";
++}
++fn audioBitsPerSecond(self: *const MediaRecorder) u32 {
++    return self._audio;
++}
++fn videoBitsPerSecond(self: *const MediaRecorder) u32 {
++    return self._video;
++}
++fn audioBitrateMode(self: *const MediaRecorder) []const u8 {
++    return self._mode;
++}
++fn start(_: *MediaRecorder, timeslice: ?js.Value) !void {
++    if (timeslice) |value| {
++        if (!value.isUndefined()) _ = try value.toU32();
++    }
++    // All constructible streams have no live tracks. Do not fake encoded data.
++    return error.NotSupported;
++}
++fn stop(_: *MediaRecorder) void {}
++fn inactive(_: *MediaRecorder) !void {
++    return error.InvalidStateError;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(MediaRecorder);
++    pub const Meta = struct {
++        pub const name = "MediaRecorder";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(init, .{});
++    pub const isTypeSupported = bridge.function(MediaRecorder.isTypeSupported, .{ .static = true });
++    pub const stream = bridge.accessor(getStream, null, .{});
++    pub const mimeType = bridge.accessor(MediaRecorder.mimeType, null, .{});
++    pub const state = bridge.accessor(MediaRecorder.state, null, .{});
++    pub const audioBitsPerSecond = bridge.accessor(MediaRecorder.audioBitsPerSecond, null, .{});
++    pub const videoBitsPerSecond = bridge.accessor(MediaRecorder.videoBitsPerSecond, null, .{});
++    pub const audioBitrateMode = bridge.accessor(MediaRecorder.audioBitrateMode, null, .{});
++    pub const start = bridge.function(MediaRecorder.start, .{});
++    pub const stop = bridge.function(MediaRecorder.stop, .{});
++    pub const pause = bridge.function(inactive, .{});
++    pub const @"resume" = bridge.function(inactive, .{});
++    pub const requestData = bridge.function(inactive, .{});
++    pub const onstart = bridge.accessor(Speech.Binding(MediaRecorder, 0).get, Speech.Binding(MediaRecorder, 0).set, .{});
++    pub const onstop = bridge.accessor(Speech.Binding(MediaRecorder, 1).get, Speech.Binding(MediaRecorder, 1).set, .{});
++    pub const ondataavailable = bridge.accessor(Speech.Binding(MediaRecorder, 2).get, Speech.Binding(MediaRecorder, 2).set, .{});
++    pub const onpause = bridge.accessor(Speech.Binding(MediaRecorder, 3).get, Speech.Binding(MediaRecorder, 3).set, .{});
++    pub const onresume = bridge.accessor(Speech.Binding(MediaRecorder, 4).get, Speech.Binding(MediaRecorder, 4).set, .{});
++    pub const onerror = bridge.accessor(Speech.Binding(MediaRecorder, 5).get, Speech.Binding(MediaRecorder, 5).set, .{});
++};
+diff --git a/src/browser/webapi/MediaSource.zig b/src/browser/webapi/MediaSource.zig
+new file mode 100644
+index 0000000..8d22362
+--- /dev/null
++++ b/src/browser/webapi/MediaSource.zig
+@@ -0,0 +1,223 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const EventTarget = @import("EventTarget.zig");
++const Events = @import("media_events.zig");
++const Speech = @import("SpeechSynthesis.zig");
++const Conversion = @import("media_constraints.zig");
++const Mime = @import("media_mime.zig");
++
++const MediaSource = @This();
++pub fn registerTypes() []const type {
++    return &.{ MediaSource, List, Handle };
++}
++pub const Proto = EventTarget;
++_proto: *EventTarget,
++_arena: *lp.Arena,
++_rc: lp.RC = .{},
++_events: Events,
++_handlers: [3]Speech.Handler = undefined,
++_source_buffers: ?*List = null,
++_active_buffers: ?*List = null,
++_handle: ?*Handle = null,
++
++fn init(exec: *js.Execution) !*MediaSource {
++    const arena = try exec.getArena(.small, "MediaSource");
++    errdefer arena.release();
++    const self = try exec._factory.eventTargetWithAllocator(arena.allocator(), MediaSource{
++        ._proto = undefined,
++        ._arena = arena,
++        ._events = .init(arena),
++    });
++    self._events.handlers(&self._handlers, &.{ "sourceopen", "sourceended", "sourceclose" }, self._proto);
++    return self;
++}
++pub fn acquireRef(self: *MediaSource) void {
++    self._rc.acquire();
++}
++pub fn releaseRef(self: *MediaSource, page: *Page) void {
++    self._rc.release(self, page);
++}
++pub fn deinit(self: *MediaSource, page: *Page) void {
++    self._events.deinit(&self._handlers);
++    if (self._source_buffers) |list| list.releaseRef(page);
++    if (self._active_buffers) |list| list.releaseRef(page);
++    self._arena.release();
++}
++fn readyState(_: *const MediaSource) []const u8 {
++    return "closed";
++}
++fn duration(_: *const MediaSource) f64 {
++    return std.math.nan(f64);
++}
++fn setDuration(_: *MediaSource, value: f64) !void {
++    if (std.math.isNan(value) or value < 0) return error.InvalidAccessError;
++    return error.InvalidStateError;
++}
++fn canConstructInDedicatedWorker() bool {
++    return true;
++}
++fn sourceBuffers(self: *MediaSource, exec: *js.Execution) !*List {
++    return self.buffers(&self._source_buffers, exec);
++}
++fn activeSourceBuffers(self: *MediaSource, exec: *js.Execution) !*List {
++    return self.buffers(&self._active_buffers, exec);
++}
++fn buffers(_: *MediaSource, slot: *?*List, exec: *js.Execution) !*List {
++    if (slot.*) |list| return list;
++    const list = try List.init(exec);
++    list.acquireRef();
++    slot.* = list;
++    return list;
++}
++fn handle(self: *MediaSource) !*Handle {
++    if (self._handle) |value| return value;
++    const value = try self._arena.create(Handle);
++    value.* = .{ .source = self };
++    self._handle = value;
++    return value;
++}
++fn isTypeSupported(value: js.Value, exec: *js.Execution) !bool {
++    return Mime.probe(value, .source, exec);
++}
++fn addSourceBuffer(_: *MediaSource, value: js.Value, exec: *js.Execution) !void {
++    const text = try (try Conversion.domString(value)).toSlice();
++    if (text.len == 0) return error.TypeError;
++    if (!try Mime.supported(text, .source, exec.call_arena)) return error.NotSupported;
++    // No attachment/decoder backend: the source remains closed.
++    return error.InvalidStateError;
++}
++fn removeSourceBuffer(_: *MediaSource, _: js.Value) !void {
++    // There can be no native SourceBuffer before a source is attached.
++    return error.TypeError;
++}
++fn endOfStream(_: *MediaSource, value: ?js.Value) !void {
++    if (value) |v| {
++        if (!v.isUndefined()) {
++            const text = try (try Conversion.domString(v)).toSlice();
++            if (!std.mem.eql(u8, text, "network") and !std.mem.eql(u8, text, "decode")) return error.TypeError;
++        }
++    }
++    return error.InvalidStateError;
++}
++fn setLiveSeekableRange(_: *MediaSource, start: f64, end: f64) !void {
++    if (!std.math.isFinite(start) or !std.math.isFinite(end)) return error.TypeError;
++    return error.InvalidStateError;
++}
++fn clearLiveSeekableRange(_: *MediaSource) !void {
++    return error.InvalidStateError;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(MediaSource);
++    pub const Meta = struct {
++        pub const name = "MediaSource";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(init, .{});
++    pub const isTypeSupported = bridge.function(MediaSource.isTypeSupported, .{ .static = true });
++    pub const canConstructInDedicatedWorker = bridge.accessor(MediaSource.canConstructInDedicatedWorker, null, .{ .static = true });
++    pub const readyState = bridge.accessor(MediaSource.readyState, null, .{});
++    pub const duration = bridge.accessor(MediaSource.duration, setDuration, .{});
++    pub const sourceBuffers = bridge.accessor(MediaSource.sourceBuffers, null, .{ .cache = .{ .private = "media_source_buffers" } });
++    pub const activeSourceBuffers = bridge.accessor(MediaSource.activeSourceBuffers, null, .{ .cache = .{ .private = "media_active_source_buffers" } });
++    pub const handle = bridge.accessor(MediaSource.handle, null, .{ .exposed = .worker, .cache = .{ .private = "media_source_handle" } });
++    pub const addSourceBuffer = bridge.function(MediaSource.addSourceBuffer, .{});
++    pub const removeSourceBuffer = bridge.function(MediaSource.removeSourceBuffer, .{});
++    pub const endOfStream = bridge.function(MediaSource.endOfStream, .{});
++    pub const setLiveSeekableRange = bridge.function(MediaSource.setLiveSeekableRange, .{});
++    pub const clearLiveSeekableRange = bridge.function(MediaSource.clearLiveSeekableRange, .{});
++    pub const onsourceopen = bridge.accessor(Speech.Binding(MediaSource, 0).get, Speech.Binding(MediaSource, 0).set, .{});
++    pub const onsourceended = bridge.accessor(Speech.Binding(MediaSource, 1).get, Speech.Binding(MediaSource, 1).set, .{});
++    pub const onsourceclose = bridge.accessor(Speech.Binding(MediaSource, 2).get, Speech.Binding(MediaSource, 2).set, .{});
++};
++
++pub const List = struct {
++    pub const Proto = EventTarget;
++    _proto: *EventTarget,
++    _arena: *lp.Arena,
++    _rc: lp.RC = .{},
++    _events: Events,
++    _handlers: [2]Speech.Handler = undefined,
++
++    fn init(exec: *js.Execution) !*List {
++        const arena = try exec.getArena(.small, "SourceBufferList");
++        errdefer arena.release();
++        const self = try exec._factory.eventTargetWithAllocator(arena.allocator(), List{
++            ._proto = undefined,
++            ._arena = arena,
++            ._events = .init(arena),
++        });
++        self._events.handlers(&self._handlers, &.{ "addsourcebuffer", "removesourcebuffer" }, self._proto);
++        return self;
++    }
++    pub fn acquireRef(self: *List) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *List, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *List, _: *Page) void {
++        self._events.deinit(&self._handlers);
++        self._arena.release();
++    }
++    fn length(_: *const List) u32 {
++        return 0;
++    }
++    fn index(_: *const List, _: u32) !js.Undefined {
++        return error.NotHandled;
++    }
++    fn indexes(_: *const List, exec: *js.Execution) js.Array {
++        return exec.js.local.?.newArray(0);
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(List);
++        pub const Meta = struct {
++            pub const name = "SourceBufferList";
++            pub const array_iterator = true;
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const length = bridge.accessor(List.length, null, .{});
++        pub const @"[]" = bridge.indexed(index, indexes, .{});
++        pub const onaddsourcebuffer = bridge.accessor(Speech.Binding(List, 0).get, Speech.Binding(List, 0).set, .{});
++        pub const onremovesourcebuffer = bridge.accessor(Speech.Binding(List, 1).get, Speech.Binding(List, 1).set, .{});
++    };
++};
++
++pub const Handle = struct {
++    source: *MediaSource,
++    pub fn acquireRef(self: *Handle) void {
++        self.source.acquireRef();
++    }
++    pub fn releaseRef(self: *Handle, page: *Page) void {
++        self.source.releaseRef(page);
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Handle);
++        pub const Meta = struct {
++            pub const name = "MediaSourceHandle";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++    };
++};
+diff --git a/src/browser/webapi/MediaStream.zig b/src/browser/webapi/MediaStream.zig
+new file mode 100644
+index 0000000..ad79d49
+--- /dev/null
++++ b/src/browser/webapi/MediaStream.zig
+@@ -0,0 +1,110 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const EventTarget = @import("EventTarget.zig");
++const Events = @import("media_events.zig");
++const Speech = @import("SpeechSynthesis.zig");
++const Conversion = @import("media_constraints.zig");
++
++const MediaStream = @This();
++pub const Proto = EventTarget;
++_proto: *EventTarget,
++_arena: *lp.Arena,
++_rc: lp.RC = .{},
++_events: Events,
++_handlers: [2]Speech.Handler = undefined,
++_id: [36]u8 = undefined,
++
++// Capture is denied by MediaDevices; only empty streams can be produced.
++fn init(input: ?js.Value, exec: *js.Execution) !*MediaStream {
++    if (input) |value| {
++        if (!value.isUndefined()) {
++            const stream = if (value.isObject()) value.toZig(*MediaStream) catch null else null;
++            if (stream == null) {
++                const iterator = try value.iterator() orelse return error.TypeError;
++                if (try iterator.next() != null) {
++                    Conversion.closeIterator(iterator, exec.js.local.?);
++                    return error.TypeError;
++                }
++            }
++        }
++    }
++    const arena = try exec.getArena(.small, "MediaStream");
++    errdefer arena.release();
++    const self = try exec._factory.eventTargetWithAllocator(arena.allocator(), MediaStream{
++        ._proto = undefined,
++        ._arena = arena,
++        ._events = .init(arena),
++    });
++    @import("../../id.zig").uuidv4(&self._id);
++    self._events.handlers(&self._handlers, &.{ "addtrack", "removetrack" }, self._proto);
++    return self;
++}
++pub fn acquireRef(self: *MediaStream) void {
++    self._rc.acquire();
++}
++pub fn releaseRef(self: *MediaStream, page: *Page) void {
++    self._rc.release(self, page);
++}
++pub fn deinit(self: *MediaStream, _: *Page) void {
++    self._events.deinit(&self._handlers);
++    self._arena.release();
++}
++fn id(self: *const MediaStream) []const u8 {
++    return &self._id;
++}
++fn active(_: *const MediaStream) bool {
++    return false;
++}
++fn getTracks(_: *const MediaStream, exec: *js.Execution) js.Array {
++    return exec.js.local.?.newArray(0);
++}
++fn getTrackById(_: *const MediaStream, input: js.Value) !?js.Value {
++    _ = try Conversion.domString(input);
++    return null;
++}
++fn track(_: *MediaStream, _: js.Value) !void {
++    // No native MediaStreamTrack exists; arbitrary objects are not tracks.
++    return error.TypeError;
++}
++fn clone(_: *const MediaStream, exec: *js.Execution) !*MediaStream {
++    return init(null, exec);
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(MediaStream);
++    pub const Meta = struct {
++        pub const name = "MediaStream";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const constructor = bridge.constructor(init, .{});
++    pub const id = bridge.accessor(MediaStream.id, null, .{});
++    pub const active = bridge.accessor(MediaStream.active, null, .{});
++    pub const getTracks = bridge.function(MediaStream.getTracks, .{});
++    pub const getAudioTracks = bridge.function(MediaStream.getTracks, .{});
++    pub const getVideoTracks = bridge.function(MediaStream.getTracks, .{});
++    pub const getTrackById = bridge.function(MediaStream.getTrackById, .{});
++    pub const addTrack = bridge.function(track, .{});
++    pub const removeTrack = bridge.function(track, .{});
++    pub const clone = bridge.function(MediaStream.clone, .{});
++    pub const onaddtrack = bridge.accessor(Speech.Binding(MediaStream, 0).get, Speech.Binding(MediaStream, 0).set, .{});
++    pub const onremovetrack = bridge.accessor(Speech.Binding(MediaStream, 1).get, Speech.Binding(MediaStream, 1).set, .{});
++};
+diff --git a/src/browser/webapi/media_events.zig b/src/browser/webapi/media_events.zig
+new file mode 100644
+index 0000000..57cb749
+--- /dev/null
++++ b/src/browser/webapi/media_events.zig
+@@ -0,0 +1,147 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Event = @import("Event.zig");
++const EventTarget = @import("EventTarget.zig");
++const EventManagerBase = @import("../EventManagerBase.zig");
++const Speech = @import("SpeechSynthesis.zig");
++
++const Events = @This();
++arena: *lp.Arena,
++target: *EventTarget = undefined,
++manager: EventManagerBase,
++roots: std.DoublyLinkedList = .{},
++pool: std.heap.MemoryPool(ListenerRoot) = .empty,
++local: ?*const js.Local = null,
++
++pub fn init(arena: *lp.Arena) Events {
++    return .{ .arena = arena, .manager = .init(arena.allocator()) };
++}
++pub fn handlers(self: *Events, slots: []Speech.Handler, names: []const []const u8, target: *EventTarget) void {
++    self.target = target;
++    for (slots, names) |*slot, name| slot.* = .{ .target = target, .events = &self.manager, .name = name, .weak = true };
++}
++pub fn deinit(self: *Events, slots: []Speech.Handler) void {
++    for (slots) |*handler| handler.deinit();
++    while (self.roots.first) |node| {
++        const root: *ListenerRoot = @fieldParentPtr("node", node);
++        root.listener.on_remove = null;
++        root.dispose(null);
++    }
++}
++pub fn register(self: *Events, typ: []const u8, callback: EventManagerBase.Callback, options: EventManagerBase.RegisterOptions, exec: *js.Execution) !void {
++    const listener = (try self.manager.register(self.target, typ, callback, options)) orelse return;
++    const slot = switch (listener.function) {
++        .value => |v| v.slot,
++        .object => |v| v.slot,
++        .string => unreachable,
++    };
++    errdefer {
++        self.manager.remove(self.target, typ, callback, options.capture);
++        slot.release();
++    }
++    const root = try self.pool.create(self.arena.allocator());
++    errdefer self.pool.destroy(root);
++    const value = switch (callback) {
++        .function => |f| js.Value{ .local = f.local, .handle = @ptrCast(f.handle) },
++        .object => |o| o.toValue(),
++    };
++    const data = try Speech.callbackData(self.target, exec.js.local.?);
++    root.* = .{ .owner = self, .listener = listener, .slot = slot, .data = try data.persist(), .signal = options.signal };
++    errdefer root.data.release();
++    const key = try std.fmt.bufPrint(&root.key, "listener{d}", .{@intFromPtr(root)});
++    root.key_len = key.len;
++    if (!(data.defineOwnProperty(key, value, 0) orelse false)) return error.JsException;
++    if (options.signal) |signal| try signal._dependents.append(exec.arena, .{ .media_listener = root });
++    js.v8.v8__Global__SetWeak(&slot.handle);
++    js.v8.v8__Global__SetWeak(&root.data.slot.handle);
++    self.roots.append(&root.node);
++    listener.on_remove = .{ .ctx = root, .callback = ListenerRoot.removed };
++}
++pub fn remove(self: *Events, typ: []const u8, callback: EventManagerBase.Callback, capture: bool, exec: *js.Execution) void {
++    const previous = self.local;
++    self.local = exec.js.local.?;
++    defer self.local = previous;
++    self.manager.remove(self.target, typ, callback, capture);
++}
++pub fn dispatch(self: *Events, event: *Event, exec: *js.Execution) !void {
++    var scope: js.Local.Scope = undefined;
++    exec.js.localScope(&scope);
++    defer scope.deinit();
++    const local = &scope.local;
++    const previous = self.local;
++    self.local = local;
++    defer self.local = previous;
++    // Retained Events must keep their native target alive.
++    const wrapper = try local.zigValueToJs(event, .{});
++    const owner = try local.zigValueToJs(self.target, .{});
++    const key: *const js.v8.Private = @ptrCast(js.v8.v8__Global__Get(&local.ctx.env.private_symbols.speech_callbacks.handle, local.isolate.handle).?);
++    var saved: js.v8.MaybeBool = undefined;
++    js.v8.v8__Object__SetPrivate(@ptrCast(wrapper.handle), local.handle, key, owner.handle, &saved);
++    if (!saved.has_value or !saved.value) return error.JsException;
++    try Speech.dispatchDirect(self.target, &self.manager, event, exec);
++}
++pub const ListenerRoot = struct {
++    owner: *Events,
++    listener: *EventManagerBase.Listener,
++    slot: *js.GlobalSlot,
++    data: js.Object.Global,
++    signal: ?*@import("AbortSignal.zig"),
++    node: std.DoublyLinkedList.Node = .{},
++    key: [32]u8 = undefined,
++    key_len: usize = 0,
++
++    fn dispose(self: *ListenerRoot, local: ?*const js.Local) void {
++        if (local) |l| {
++            if (js.v8.v8__Global__Get(&self.data.slot.handle, l.isolate.handle)) |data| {
++                var deleted: js.v8.MaybeBool = undefined;
++                js.v8.v8__Object__Delete(@ptrCast(data), l.handle, @ptrCast(l.newString(self.key[0..self.key_len]).handle), &deleted);
++            }
++        }
++        if (self.signal) |signal| {
++            for (signal._dependents.items, 0..) |dep, i| {
++                if (dep == .media_listener and dep.media_listener == self) {
++                    _ = signal._dependents.swapRemove(i);
++                    break;
++                }
++            }
++        }
++        self.slot.release();
++        self.data.release();
++        self.owner.roots.remove(&self.node);
++        self.owner.pool.destroy(self);
++    }
++    fn removed(ptr: *anyopaque) void {
++        const self: *ListenerRoot = @ptrCast(@alignCast(ptr));
++        self.dispose(self.owner.local);
++    }
++    pub fn abort(self: *ListenerRoot, exec: *const js.Execution) void {
++        var scope: js.Local.Scope = undefined;
++        exec.js.localScope(&scope);
++        defer scope.deinit();
++        _ = scope.local.zigValueToJs(self.owner.target, .{}) catch return;
++        const owner = self.owner;
++        const previous = owner.local;
++        owner.local = &scope.local;
++        defer owner.local = previous;
++        const list = owner.manager.getListeners(owner.target, self.listener.typ) orelse return;
++        owner.manager.removeListener(list, self.listener);
++    }
++};
+diff --git a/src/browser/webapi/media_mime.zig b/src/browser/webapi/media_mime.zig
+new file mode 100644
+index 0000000..2d83cec
+--- /dev/null
++++ b/src/browser/webapi/media_mime.zig
+@@ -0,0 +1,176 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const js = @import("../js/js.zig");
++const Conversion = @import("media_constraints.zig");
++
++pub const Api = enum { source, recorder };
++const Container = enum { webm, mp4, aac, mpeg };
++const Mime = struct { container: Container, audio: bool, codecs: ?[]const u8 };
++
++// Fixed desktop Chrome capabilities, independent of installed host codecs.
++pub fn supported(input: []const u8, api: Api, allocator: std.mem.Allocator) !bool {
++    if (input.len == 0) return api == .recorder;
++    const mime = (try parse(input, allocator)) orelse return false;
++    if (mime.container == .aac or mime.container == .mpeg) return api == .source and mime.codecs == null;
++    const codecs = mime.codecs orelse return true;
++    if (codecs.len == 0) return true;
++    var it = std.mem.splitScalar(u8, codecs, ',');
++    while (it.next()) |part| {
++        const codec = std.mem.trim(u8, part, " \t");
++        if (codec.len == 0 or !codecSupported(codec, mime, api)) return false;
++    }
++    return true;
++}
++pub fn probe(value: js.Value, api: Api, exec: *js.Execution) !bool {
++    const text = try (try Conversion.domString(value)).toSlice();
++    return supported(text, api, exec.call_arena);
++}
++fn codecSupported(codec: []const u8, mime: Mime, api: Api) bool {
++    if (mime.container == .webm) {
++        if (std.mem.eql(u8, codec, "opus")) return true;
++        if (std.mem.eql(u8, codec, "vorbis")) return api == .source;
++        if (mime.audio) return false;
++        return std.mem.eql(u8, codec, "vp8") or std.mem.eql(u8, codec, "vp8.0") or
++            std.mem.eql(u8, codec, "vp9") or std.mem.eql(u8, codec, "vp9.0") or validVp9(codec) or validAv1(codec);
++    }
++    if (std.mem.eql(u8, codec, "opus") or std.mem.eql(u8, codec, "mp4a.40.2") or std.mem.eql(u8, codec, "mp4a.40.5") or std.mem.eql(u8, codec, "mp4a.40.29")) return true;
++    if (std.mem.eql(u8, codec, "flac")) return api == .source;
++    if (mime.audio) return false;
++    return validAvc(codec) or validAv1(codec) or validVp9(codec);
++}
++fn validAvc(codec: []const u8) bool {
++    if (codec.len != 11 or (!std.mem.startsWith(u8, codec, "avc1.") and !std.mem.startsWith(u8, codec, "avc3."))) return false;
++    for (codec[5..]) |c| if (!std.ascii.isHex(c)) return false;
++    const profile = std.fmt.parseUnsigned(u8, codec[5..7], 16) catch return false;
++    _ = std.fmt.parseUnsigned(u8, codec[7..9], 16) catch return false;
++    const level = std.fmt.parseUnsigned(u8, codec[9..11], 16) catch return false;
++    const levels = [_]u8{ 9, 10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52 };
++    return (profile == 0x42 or profile == 0x4d or profile == 0x58 or profile == 0x64) and std.mem.indexOfScalar(u8, &levels, level) != null;
++}
++fn validVp9(codec: []const u8) bool {
++    var parts = std.mem.splitScalar(u8, codec, '.');
++    if (!std.mem.eql(u8, parts.next().?, "vp09")) return false;
++    const profile = parts.next() orelse return false;
++    const level = parts.next() orelse return false;
++    const depth = parts.next() orelse return false;
++    const p = decimal(profile, 2) orelse return false;
++    const l = decimal(level, 2) orelse return false;
++    const d = decimal(depth, 2) orelse return false;
++    const levels = [_]u8{ 10, 11, 20, 21, 30, 31, 40, 41, 50, 51, 52, 60, 61, 62 };
++    if ((p != 0 and p != 2) or !(if (p == 0) d == 8 else d == 10 or d == 12) or std.mem.indexOfScalar(u8, &levels, l) == null) return false;
++    var index: usize = 0;
++    while (parts.next()) |part| : (index += 1) {
++        const value = decimal(part, 2) orelse return false;
++        if (index >= 5) return false;
++        const valid = switch (index) {
++            0 => value <= 3,
++            1, 2, 3 => color(value, index - 1),
++            4 => value <= 1,
++            else => unreachable,
++        };
++        if (!valid) return false;
++    }
++    return true;
++}
++fn validAv1(codec: []const u8) bool {
++    var parts = std.mem.splitScalar(u8, codec, '.');
++    if (!std.mem.eql(u8, parts.next().?, "av01")) return false;
++    const profile = parts.next() orelse return false;
++    const level = parts.next() orelse return false;
++    const depth = parts.next() orelse return false;
++    if (!std.mem.eql(u8, profile, "0") or level.len != 3 or depth.len != 2) return false;
++    const l = decimal(level[0..2], 2) orelse return false;
++    if (l > 23 or (level[2] != 'M' and level[2] != 'H') or (!std.mem.eql(u8, depth, "08") and !std.mem.eql(u8, depth, "10"))) return false;
++    var index: usize = 0;
++    while (parts.next()) |part| : (index += 1) {
++        if (index >= 6) return false;
++        const width: usize = switch (index) {
++            0, 5 => 1,
++            1 => 3,
++            else => 2,
++        };
++        const value = decimal(part, width) orelse return false;
++        const valid = switch (index) {
++            0, 5 => value <= 1,
++            1 => part[0] <= '1' and part[1] <= '1' and part[2] <= '3' and ((part[0] == '1' and part[1] == '1') or part[2] == '0'),
++            2, 3, 4 => color(value, index - 2),
++            else => unreachable,
++        };
++        if (!valid) return false;
++    }
++    return true;
++}
++fn decimal(input: []const u8, width: usize) ?u8 {
++    if (input.len != width) return null;
++    for (input) |c| if (!std.ascii.isDigit(c)) return null;
++    return std.fmt.parseUnsigned(u8, input, 10) catch null;
++}
++fn color(value: u16, index: usize) bool {
++    const values: []const u8 = switch (index) {
++        0 => &.{ 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 22 },
++        1 => &.{ 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 },
++        2 => &.{ 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 },
++        else => unreachable,
++    };
++    return value <= 255 and std.mem.indexOfScalar(u8, values, @intCast(value)) != null;
++}
++fn token(value: []const u8) bool {
++    if (value.len == 0) return false;
++    for (value) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) == null) return false;
++    return true;
++}
++fn parse(input: []const u8, allocator: std.mem.Allocator) !?Mime {
++    const semi = std.mem.indexOfScalar(u8, input, ';') orelse input.len;
++    const essence = std.mem.trim(u8, input[0..semi], " \t\r\n");
++    const container: Container, const audio: bool = if (std.ascii.eqlIgnoreCase(essence, "video/webm")) .{ .webm, false } else if (std.ascii.eqlIgnoreCase(essence, "audio/webm")) .{ .webm, true } else if (std.ascii.eqlIgnoreCase(essence, "video/mp4")) .{ .mp4, false } else if (std.ascii.eqlIgnoreCase(essence, "audio/mp4")) .{ .mp4, true } else if (std.ascii.eqlIgnoreCase(essence, "audio/aac")) .{ .aac, true } else if (std.ascii.eqlIgnoreCase(essence, "audio/mpeg")) .{ .mpeg, true } else return null;
++    var result: Mime = .{ .container = container, .audio = audio, .codecs = null };
++    var rest = input[semi..];
++    while (rest.len != 0) {
++        rest = std.mem.trimStart(u8, rest[1..], " \t");
++        if (rest.len == 0) break;
++        const eq = std.mem.indexOfAny(u8, rest, "=;") orelse return null;
++        const key = std.mem.trimEnd(u8, rest[0..eq], " \t");
++        if (rest[eq] != '=' or !token(key)) return null;
++        rest = std.mem.trimStart(u8, rest[eq + 1 ..], " \t");
++        var value: []const u8 = undefined;
++        if (rest.len != 0 and rest[0] == '"') {
++            var decoded: std.ArrayList(u8) = .empty;
++            var i: usize = 1;
++            while (i < rest.len and rest[i] != '"') : (i += 1) {
++                if (rest[i] == '\\') {
++                    i += 1;
++                    if (i == rest.len) return null;
++                }
++                if (rest[i] < 0x20 and rest[i] != '\t') return null;
++                try decoded.append(allocator, rest[i]);
++            }
++            if (i == rest.len) return null;
++            value = decoded.items;
++            rest = std.mem.trimStart(u8, rest[i + 1 ..], " \t");
++            if (rest.len != 0 and rest[0] != ';') return null;
++        } else {
++            const end = std.mem.indexOfScalar(u8, rest, ';') orelse rest.len;
++            value = std.mem.trimEnd(u8, rest[0..end], " \t");
++            if (!token(value)) return null;
++            rest = rest[end..];
++        }
++        if (std.ascii.eqlIgnoreCase(key, "codecs") and result.codecs == null) result.codecs = value;
++    }
++    return result;
++}

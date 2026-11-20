@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 12 Nov 2026 20:17:19 -0300
+Subject: [PATCH] webapi: expose Location URL attributes as unforgeable own
+ properties
+
+Bind href, search, hash, pathname, hostname, host, port, origin and protocol
+as enumerable, non-configurable own accessors using the existing
+LegacyUnforgeable binding support. Keep getter, setter and navigation
+behavior unchanged.
+
+Sephora copies window.location through an Object.keys-based helper. The
+prototype-only bindings produced a copy without pathname, causing
+isCustomerServicePage() to throw while checkout helper 39776 was being
+initialized and leaving the server-rendered Add to Basket button disabled.
+With the native bindings fixed, the actual proxied product page mounts
+React and enables the button without a JavaScript shim or button mutation.
+
+Update the two existing Location setter assertions to inspect the instance
+rather than Location.prototype. No new upstream tests are added.
+
+Reference: https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-location-interface
+Validation: release build and all 1658 upstream tests pass. Captured Sephora
+location-copy code now succeeds in both Chrome and Lightpanda. The live
+proxied SKU 2968907 page returns HTTP 200 and has an enabled basket button
+at all three observations. Other existing page errors remain out of scope.
+---
+ src/browser/tests/window/location.html |  4 ++--
+ src/browser/webapi/Location.zig        | 19 ++++++++++---------
+ 2 files changed, 12 insertions(+), 11 deletions(-)
+
+diff --git a/src/browser/tests/window/location.html b/src/browser/tests/window/location.html
+index 17e38a7..283e9c6 100644
+--- a/src/browser/tests/window/location.html
++++ b/src/browser/tests/window/location.html
+@@ -25,11 +25,11 @@
+ </script>
+ 
+ <script id=location_pathname_setter>
+-  testing.expectEqual('function', typeof Object.getOwnPropertyDescriptor(Location.prototype, 'pathname').set);
++  testing.expectEqual('function', typeof Object.getOwnPropertyDescriptor(location, 'pathname').set);
+ </script>
+ 
+ <script id=location_search_setter>
+-  testing.expectEqual('function', typeof Object.getOwnPropertyDescriptor(Location.prototype, 'search').set);
++  testing.expectEqual('function', typeof Object.getOwnPropertyDescriptor(location, 'search').set);
+ </script>
+ 
+ <div id="sec1"></div>
+diff --git a/src/browser/webapi/Location.zig b/src/browser/webapi/Location.zig
+index 488e19c..a9a8417 100644
+--- a/src/browser/webapi/Location.zig
++++ b/src/browser/webapi/Location.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -158,19 +159,19 @@ pub const JsApi = struct {
+     };
+ 
+     pub const toString = bridge.function(Location.toString, .{});
+-    pub const href = bridge.accessor(Location.toString, setHref, .{});
++    pub const href = bridge.accessor(Location.toString, setHref, .{ .unforgeable = true, .deletable = false });
+     fn setHref(self: *const Location, url: [:0]const u8, frame: *Frame) !void {
+         return self.assign(url, frame);
+     }
+ 
+-    pub const search = bridge.accessor(Location.getSearch, Location.setSearch, .{});
+-    pub const hash = bridge.accessor(Location.getHash, Location.setHash, .{});
+-    pub const pathname = bridge.accessor(Location.getPathname, Location.setPathname, .{});
+-    pub const hostname = bridge.accessor(Location.getHostname, null, .{});
+-    pub const host = bridge.accessor(Location.getHost, null, .{});
+-    pub const port = bridge.accessor(Location.getPort, null, .{});
+-    pub const origin = bridge.accessor(Location.getOrigin, null, .{});
+-    pub const protocol = bridge.accessor(Location.getProtocol, null, .{});
++    pub const search = bridge.accessor(Location.getSearch, Location.setSearch, .{ .unforgeable = true, .deletable = false });
++    pub const hash = bridge.accessor(Location.getHash, Location.setHash, .{ .unforgeable = true, .deletable = false });
++    pub const pathname = bridge.accessor(Location.getPathname, Location.setPathname, .{ .unforgeable = true, .deletable = false });
++    pub const hostname = bridge.accessor(Location.getHostname, null, .{ .unforgeable = true, .deletable = false });
++    pub const host = bridge.accessor(Location.getHost, null, .{ .unforgeable = true, .deletable = false });
++    pub const port = bridge.accessor(Location.getPort, null, .{ .unforgeable = true, .deletable = false });
++    pub const origin = bridge.accessor(Location.getOrigin, null, .{ .unforgeable = true, .deletable = false });
++    pub const protocol = bridge.accessor(Location.getProtocol, null, .{ .unforgeable = true, .deletable = false });
+     pub const assign = bridge.function(Location.assign, .{});
+     pub const replace = bridge.function(Location.replace, .{});
+     pub const reload = bridge.function(Location.reload, .{});

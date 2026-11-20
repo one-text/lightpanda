@@ -1,0 +1,388 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 5 Nov 2026 13:45:27 -0300
+Subject: [PATCH] webapi: add native silent audio analyser nodes
+
+Expose AnalyserNode and BaseAudioContext.createAnalyser with native
+inheritance, options, validated properties and bounded typed-array
+readbacks for the source-free audio graph. Silence uses standard float
+and byte representations, independent of host audio hardware.
+
+Support analyser routing and disconnect overloads while preserving
+destination sink behavior. Own nodes in reclaimable arenas, retain their
+context and connected wrappers, and remove listener/signal roots safely
+on collection. Coerce channel enums through Web IDL string conversion.
+
+Pass audio-analyser-functional: benchmark 123/130, existing tests
+1658/1658, and 203 temporary API/GC checks. Non-silent sources, offline
+rendering and spectral processing remain outside this patch.
+---
+ src/browser/webapi/AudioContext.zig | 268 ++++++++++++++++++++++++----
+ src/browser/webapi/EventTarget.zig  |  10 +-
+ 2 files changed, 243 insertions(+), 35 deletions(-)
+
+diff --git a/src/browser/webapi/AudioContext.zig b/src/browser/webapi/AudioContext.zig
+index f8c2ccf..cc14e12 100644
+--- a/src/browser/webapi/AudioContext.zig
++++ b/src/browser/webapi/AudioContext.zig
+@@ -28,7 +28,7 @@ const Speech = @import("SpeechSynthesis.zig");
+ const Audio = @This();
+ 
+ pub fn registerTypes() []const type {
+-    return &.{ Audio, Base, Node, Destination };
++    return &.{ Audio, Base, Node, Destination, Analyser };
+ }
+ 
+ pub const Proto = Base;
+@@ -206,9 +206,10 @@ pub const ListenerRoot = struct {
+     fn dispose(self: *ListenerRoot, local: ?*const js.Local) void {
+         const audio = self.audio;
+         if (local) |l| {
+-            const data = self.data.local(l);
+-            var deleted: js.v8.MaybeBool = undefined;
+-            js.v8.v8__Object__Delete(data.handle, l.handle, @ptrCast(l.newString(self.key[0..self.key_len]).handle), &deleted);
++            if (js.v8.v8__Global__Get(&self.data.slot.handle, l.isolate.handle)) |data| {
++                var deleted: js.v8.MaybeBool = undefined;
++                js.v8.v8__Object__Delete(@ptrCast(data), l.handle, @ptrCast(l.newString(self.key[0..self.key_len]).handle), &deleted);
++            }
+         }
+         if (self.signal) |signal| {
+             for (signal._dependents.items, 0..) |dep, i| {
+@@ -464,6 +465,9 @@ pub const Base = struct {
+         try self._audio.linkWrappers(exec.js.local.?);
+         return self._audio._destination;
+     }
++    fn createAnalyser(self: *Base, exec: *js.Execution) !*Analyser {
++        return Analyser.init(self, null, exec);
++    }
+     fn getSampleRate(self: *const Base) f64 {
+         return self._audio._sample_rate;
+     }
+@@ -486,6 +490,7 @@ pub const Base = struct {
+             pub const prototype_chain = bridge.prototypeChain();
+             pub var class_id: bridge.ClassId = undefined;
+         };
++        pub const createAnalyser = bridge.function(Base.createAnalyser, .{});
+         pub const destination = bridge.accessor(getDestination, null, .{});
+         pub const sampleRate = bridge.accessor(getSampleRate, null, .{});
+         pub const currentTime = bridge.accessor(getCurrentTime, null, .{});
+@@ -500,14 +505,20 @@ pub const Node = struct {
+     _audio: *Audio,
+     _type: Type = .audio_destination_node,
+     _channels: u32 = 2,
+-    _mode: []const u8 = "explicit",
+-    _interpretation: []const u8 = "speakers",
+-    pub const Type = enum { audio_destination_node };
+-    pub fn Subtype(comptime _: Type) type {
+-        return Destination;
++    _mode: Mode = .explicit,
++    _interpretation: Interpretation = .speakers,
++    _connections: std.ArrayList(*Node) = .empty,
++    pub const Type = enum { audio_destination_node, analyser_node };
++    const Mode = enum { max, @"clamped-max", explicit };
++    const Interpretation = enum { speakers, discrete };
++    pub fn Subtype(comptime tag: Type) type {
++        return switch (tag) {
++            .audio_destination_node => Destination,
++            .analyser_node => Analyser,
++        };
+     }
+-    pub fn subtype(self: *Node, comptime _: type) *Destination {
+-        return @ptrFromInt(@intFromPtr(self) + comptime Factory.protoOffset(Destination));
++    pub fn subtype(self: *Node, comptime T: type) *T {
++        return @ptrFromInt(@intFromPtr(self) + comptime Factory.protoOffset(T));
+     }
+     pub fn acquireRef(self: *Node) void {
+         self._audio.acquireRef();
+@@ -522,43 +533,80 @@ pub const Node = struct {
+     fn getInputs(_: *const Node) u32 {
+         return 1;
+     }
+-    fn getOutputs(_: *const Node) u32 {
+-        return 0;
++    fn getOutputs(self: *const Node) u32 {
++        return if (self._type == .analyser_node) 1 else 0;
+     }
+     fn getChannels(self: *const Node) u32 {
+         return self._channels;
+     }
+     fn setChannels(self: *Node, count: u32) !void {
+         if (count == 0) return error.NotSupported;
+-        if (count > 2) return error.IndexSizeError;
++        if (self._type == .analyser_node) {
++            if (count > 32) return error.NotSupported;
++        } else if (count > 2) return error.IndexSizeError;
+         self._channels = count;
+     }
+     fn getMode(self: *const Node) []const u8 {
+-        return self._mode;
++        return @tagName(self._mode);
+     }
+-    fn setMode(self: *Node, value: []const u8) void {
+-        inline for (.{ "max", "clamped-max", "explicit" }) |mode| {
+-            if (std.mem.eql(u8, value, mode)) self._mode = mode;
+-        }
++    fn setMode(self: *Node, value: js.Value) !void {
++        self._mode = std.meta.stringToEnum(Mode, try value.toStringSlice()) orelse return error.TypeError;
+     }
+     fn getInterpretation(self: *const Node) []const u8 {
+-        return self._interpretation;
++        return @tagName(self._interpretation);
+     }
+-    fn setInterpretation(self: *Node, value: []const u8) void {
+-        inline for (.{ "speakers", "discrete" }) |mode| {
+-            if (std.mem.eql(u8, value, mode)) self._interpretation = mode;
+-        }
++    fn setInterpretation(self: *Node, value: js.Value) !void {
++        self._interpretation = std.meta.stringToEnum(Interpretation, try value.toStringSlice()) orelse return error.TypeError;
+     }
+-    fn connect(self: *Node, destination: *Node, _: ?u32, _: ?u32) !*Node {
+-        if (self._audio != destination._audio) return error.InvalidAccessError;
+-        // The destination is a sink, so no output index can be connected.
+-        return error.IndexSizeError;
++    fn linkContext(self: *Node, local: *const js.Local) !void {
++        try self._audio.linkWrappers(local);
++        const data = try Speech.callbackData(self._proto, local);
++        const context = try local.zigValueToJs(self._audio, .{});
++        if (!(data.defineOwnProperty("context", context, 0) orelse false)) return error.JsException;
+     }
+-    fn disconnect(_: *Node, destination: ?js.Value, _: ?u32, _: ?u32) !void {
+-        const value = destination orelse return;
+-        if (value.isNumber()) return error.IndexSizeError;
+-        _ = try value.toZig(*Node);
+-        return error.InvalidAccessError;
++    fn connect(self: *Node, destination: *Node, output: ?u32, input: ?u32, exec: *js.Execution) !*Node {
++        if (self._audio != destination._audio) return error.InvalidAccessError;
++        if ((output orelse 0) >= self.getOutputs() or (input orelse 0) >= destination.getInputs()) return error.IndexSizeError;
++        for (self._connections.items) |node| {
++            if (node == destination) return destination;
++        }
++        try self._connections.ensureUnusedCapacity(self.subtype(Analyser)._arena.allocator(), 1);
++        const local = exec.js.local.?;
++        const data = try Speech.callbackData(self._proto, local);
++        var buffer: [40]u8 = undefined;
++        const key = try std.fmt.bufPrint(&buffer, "connection{d}", .{@intFromPtr(destination)});
++        const wrapper = try local.zigValueToJs(destination, .{});
++        if (!(data.defineOwnProperty(key, wrapper, 0) orelse false)) return error.JsException;
++        self._connections.appendAssumeCapacity(destination);
++        return destination;
++    }
++    fn removeConnection(self: *Node, index: usize, local: *const js.Local) !void {
++        const data = try Speech.callbackData(self._proto, local);
++        var buffer: [40]u8 = undefined;
++        const key = try std.fmt.bufPrint(&buffer, "connection{d}", .{@intFromPtr(self._connections.items[index])});
++        var deleted: js.v8.MaybeBool = undefined;
++        js.v8.v8__Object__Delete(data.handle, local.handle, @ptrCast(local.newString(key).handle), &deleted);
++        if (!deleted.has_value or !deleted.value) return error.JsException;
++        _ = self._connections.swapRemove(index);
++    }
++    fn disconnect(self: *Node, args: []const js.Value, exec: *js.Execution) !void {
++        const local = exec.js.local.?;
++        if (args.len > 0) {
++            const value = args[0];
++            const target = if (value.isObject()) value.toZig(*Node) catch null else null;
++            if (target) |destination| {
++                if (args.len > 1 and try args[1].toU32() >= self.getOutputs()) return error.IndexSizeError;
++                if (args.len > 2 and try args[2].toU32() >= destination.getInputs()) return error.IndexSizeError;
++                for (self._connections.items, 0..) |node, i| {
++                    if (node == destination) return self.removeConnection(i, local);
++                }
++                return error.InvalidAccessError;
++            }
++            // Only the one-argument overload accepts a numeric output index.
++            if (args.len > 1) return error.TypeError;
++            if (try value.toU32() >= self.getOutputs()) return error.IndexSizeError;
++        }
++        while (self._connections.items.len > 0) try self.removeConnection(self._connections.items.len - 1, local);
+     }
+     pub const JsApi = struct {
+         pub const bridge = js.Bridge(Node);
+@@ -578,6 +626,160 @@ pub const Node = struct {
+     };
+ };
+ 
++pub const Analyser = struct {
++    pub const Proto = Node;
++    _proto: *Node,
++    _arena: *lp.Arena,
++    _rc: lp.RC = .{},
++    _fft_size: u32 = 2048,
++    _min_decibels: f64 = -100,
++    _max_decibels: f64 = -30,
++    _smoothing: f64 = 0.8,
++
++    const Options = struct {
++        channelCount: u32 = 2,
++        channelCountMode: ?js.Value = null,
++        channelInterpretation: ?js.Value = null,
++        fftSize: u32 = 2048,
++        maxDecibels: f64 = -30,
++        minDecibels: f64 = -100,
++        smoothingTimeConstant: f64 = 0.8,
++    };
++
++    fn init(context: *Base, options_: ?Analyser.Options, exec: *js.Execution) !*Analyser {
++        const options = options_ orelse Analyser.Options{};
++        var value = Analyser{ ._proto = undefined, ._arena = undefined, ._min_decibels = options.minDecibels, ._max_decibels = options.maxDecibels };
++        try value.setFftSize(options.fftSize);
++        try value.setMinDecibels(options.minDecibels);
++        try value.setMaxDecibels(options.maxDecibels);
++        try value.setSmoothing(options.smoothingTimeConstant);
++        var node = Node{ ._proto = undefined, ._audio = context._audio, ._type = .analyser_node, ._mode = .max };
++        try node.setChannels(options.channelCount);
++        if (options.channelCountMode) |mode| try node.setMode(mode);
++        if (options.channelInterpretation) |interpretation| try node.setInterpretation(interpretation);
++        const arena = try exec.getArena(.tiny, "AnalyserNode");
++        value._arena = arena;
++        const self = Factory.chainedWithAllocator(arena.allocator(), .{
++            EventTarget{ ._type = .audio_node },
++            node,
++            value,
++        }) catch |err| {
++            arena.release();
++            return err;
++        };
++        context._audio.acquireRef();
++        // Hold the native node until wrapper creation has either succeeded or failed.
++        self.acquireRef();
++        defer self.releaseRef(exec.page);
++        try self._proto.linkContext(exec.js.local.?);
++        return self;
++    }
++    pub fn acquireRef(self: *Analyser) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *Analyser, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *Analyser, page: *Page) void {
++        const audio = self._proto._audio;
++        var entry = audio._listener_roots.first;
++        while (entry) |node| {
++            const root: *ListenerRoot = @fieldParentPtr("node", node);
++            entry = node.next;
++            if (root.target != self._proto._proto) continue;
++            const listener = root.listener;
++            const list = audio._events.getListeners(root.target, listener.typ).?;
++            // Detach signal dependents immediately, even during another target's dispatch.
++            listener.on_remove = null;
++            audio._events.removeListener(list, listener);
++            root.dispose(null);
++        }
++        self._arena.release();
++        audio.releaseRef(page);
++    }
++    fn creationContext(self: *const Analyser, local: *const js.Local) *const js.v8.Context {
++        return self._proto._audio.creationContext(local);
++    }
++    fn getFftSize(self: *const Analyser) u32 {
++        return self._fft_size;
++    }
++    fn setFftSize(self: *Analyser, value: u32) !void {
++        if (value < 32 or value > 32768 or !std.math.isPowerOfTwo(value)) return error.IndexSizeError;
++        self._fft_size = value;
++    }
++    fn getFrequencyBinCount(self: *const Analyser) u32 {
++        return self._fft_size / 2;
++    }
++    fn getMinDecibels(self: *const Analyser) f64 {
++        return self._min_decibels;
++    }
++    fn setMinDecibels(self: *Analyser, value: f64) !void {
++        if (!std.math.isFinite(value)) return error.TypeError;
++        if (value >= self._max_decibels) return error.IndexSizeError;
++        self._min_decibels = value;
++    }
++    fn getMaxDecibels(self: *const Analyser) f64 {
++        return self._max_decibels;
++    }
++    fn setMaxDecibels(self: *Analyser, value: f64) !void {
++        if (!std.math.isFinite(value)) return error.TypeError;
++        if (value <= self._min_decibels) return error.IndexSizeError;
++        self._max_decibels = value;
++    }
++    fn getSmoothing(self: *const Analyser) f64 {
++        return self._smoothing;
++    }
++    fn setSmoothing(self: *Analyser, value: f64) !void {
++        if (!std.math.isFinite(value)) return error.TypeError;
++        if (value < 0 or value > 1) return error.IndexSizeError;
++        self._smoothing = value;
++    }
++    fn readback(comptime T: type, array: js.Value, count: u32, silence: T) !void {
++        if (comptime T == f32) {
++            if (!array.isFloat32Array()) return error.TypeError;
++        } else {
++            if (!array.isUint8Array()) return error.TypeError;
++        }
++        const buffer = js.v8.v8__ArrayBufferView__Buffer(@ptrCast(array.handle)).?;
++        if (js.arrayBufferIsShared(buffer)) return error.TypeError;
++        const values = try array.toZig([]T);
++        // The supported graph has no signal sources: all inputs are silence.
++        @memset(values[0..@min(values.len, count)], silence);
++    }
++    fn getFloatFrequencyData(self: *const Analyser, array: js.Value) !void {
++        try readback(f32, array, self.getFrequencyBinCount(), -std.math.inf(f32));
++    }
++    fn getByteFrequencyData(self: *const Analyser, array: js.Value) !void {
++        try readback(u8, array, self.getFrequencyBinCount(), 0);
++    }
++    fn getFloatTimeDomainData(self: *const Analyser, array: js.Value) !void {
++        try readback(f32, array, self._fft_size, 0);
++    }
++    fn getByteTimeDomainData(self: *const Analyser, array: js.Value) !void {
++        try readback(u8, array, self._fft_size, 128);
++    }
++
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Analyser);
++        pub const Meta = struct {
++            pub const name = "AnalyserNode";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub const creation_context = Analyser.creationContext;
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const constructor = bridge.constructor(Analyser.init, .{});
++        pub const fftSize = bridge.accessor(getFftSize, setFftSize, .{});
++        pub const frequencyBinCount = bridge.accessor(getFrequencyBinCount, null, .{});
++        pub const minDecibels = bridge.accessor(getMinDecibels, setMinDecibels, .{});
++        pub const maxDecibels = bridge.accessor(getMaxDecibels, setMaxDecibels, .{});
++        pub const smoothingTimeConstant = bridge.accessor(getSmoothing, setSmoothing, .{});
++        pub const getFloatFrequencyData = bridge.function(Analyser.getFloatFrequencyData, .{});
++        pub const getByteFrequencyData = bridge.function(Analyser.getByteFrequencyData, .{});
++        pub const getFloatTimeDomainData = bridge.function(Analyser.getFloatTimeDomainData, .{});
++        pub const getByteTimeDomainData = bridge.function(Analyser.getByteTimeDomainData, .{});
++    };
++};
++
+ pub const Destination = struct {
+     pub const Proto = Node;
+     _proto: *Node,
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index d9ae3ab..8b5ed90 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -446,7 +446,10 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         .worker_global_scope => writer.writeAll("<WorkerGlobalScope>"),
+         .xhr => writer.writeAll("<XMLHttpRequestEventTarget>"),
+         .abort_signal => writer.writeAll("<AbortSignal>"),
+-        .audio_node => writer.writeAll("<AudioDestinationNode>"),
++        .audio_node => switch (self.subtype(AudioContext.Node)._type) {
++            .audio_destination_node => writer.writeAll("<AudioDestinationNode>"),
++            .analyser_node => writer.writeAll("<AnalyserNode>"),
++        },
+         .base_audio_context => writer.writeAll("<AudioContext>"),
+         .battery_manager => writer.writeAll("<BatteryManager>"),
+         .media_devices => writer.writeAll("<MediaDevices>"),
+@@ -479,7 +482,10 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+ pub fn toString(self: *EventTarget) []const u8 {
+     return switch (self._type) {
+         .abort_signal => return "[object AbortSignal]",
+-        .audio_node => return "[object AudioDestinationNode]",
++        .audio_node => return switch (self.subtype(AudioContext.Node)._type) {
++            .audio_destination_node => "[object AudioDestinationNode]",
++            .analyser_node => "[object AnalyserNode]",
++        },
+         .base_audio_context => return "[object AudioContext]",
+         .battery_manager => return "[object BatteryManager]",
+         .broadcast_channel => return "[object BroadcastChannel]",

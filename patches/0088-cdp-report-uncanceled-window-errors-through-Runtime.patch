@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Fri, 13 Nov 2026 01:55:04 -0300
+Subject: [PATCH] cdp: report uncanceled window errors through Runtime
+
+Window.reportError previously dispatched error events and only logged the
+uncanceled result, leaving React recoverable errors invisible to CDP and
+Playwright pageerror consumers (Sephora S01-A).
+
+Dispatch a synchronous host exception notification after cancellation has
+been decided, including the no-listener path. Snapshot inert error text in
+owned storage across reentrant listeners, retain the original value and
+native stack, and report nested listener/onerror failures without recursive
+window event dispatch. Do not read page-controlled diagnostic getters.
+
+Subscribe each attached Runtime session independently and wrap the original
+value in its originating context on that session. Use negative host IDs to
+avoid V8 exception-ID collisions and the console object group so diagnostic
+clear commands release the handles. Serialize native stack frames and enable
+bounded native stack capture in release builds as well as Debug.
+
+Keep window ErrorEvent source-location correction, promise-rejection
+reporting, Sephora auth readiness and basket functionality outside this fix.
+
+Validated with the existing 1,658 upstream tests and temporary CDP/Playwright
+controls for cancellation, recursive errors, arbitrary values, inert getters,
+multiple sessions, contexts, handle cleanup and reentrant message lifetime.
+No new upstream tests are added.
+---
+ src/Notification.zig               | 11 ++++
+ src/browser/js/Env.zig             |  5 +-
+ src/browser/js/Inspector.zig       |  2 +-
+ src/browser/webapi/Window.zig      | 63 +++++++++++++---------
+ src/server/cdp/CDP.zig             | 21 +++++++-
+ src/server/cdp/domains/runtime.zig | 86 +++++++++++++++++++++++++++++-
+ 6 files changed, 156 insertions(+), 32 deletions(-)
+
+diff --git a/src/Notification.zig b/src/Notification.zig
+index ab43e73..82b5d25 100644
+--- a/src/Notification.zig
++++ b/src/Notification.zig
+@@ -94,6 +94,7 @@ const EventListeners = struct {
+     javascript_dialog_opening: List = .{},
+     console_message: List = .{},
+     runtime_console_message: List = .{},
++    runtime_exception: List = .{},
+     model_context_tool_added: List = .{},
+     model_context_tool_removed: List = .{},
+     cookie_changed: List = .{},
+@@ -125,6 +126,7 @@ const Events = union(enum) {
+     javascript_dialog_opening: *const JavascriptDialogOpening,
+     console_message: *const ConsoleMessage,
+     runtime_console_message: *const ConsoleMessage,
++    runtime_exception: *const RuntimeException,
+     model_context_tool_added: *const ModelContextToolEvent,
+     model_context_tool_removed: *const ModelContextToolEvent,
+     cookie_changed: *const CookieChanged,
+@@ -348,6 +350,15 @@ pub const ConsoleMessageType = enum {
+     dirxml,
+ };
+ 
++// Borrowed for synchronous dispatch only. The value's local identifies the
++// originating context; its handles and the native stack stay live in the caller.
++pub const RuntimeException = struct {
++    value: js.Value,
++    timestamp: u64,
++    message: []const u8,
++    stack: ?*const js.v8.StackTrace,
++};
++
+ pub const ConsoleMessage = struct {
+     timestamp: u64,
+     source: enum {
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 28999a4..735fda2 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -179,9 +179,8 @@ pub fn init(app: *App, opts: InitOpts) !Env {
+     v8.v8__Isolate__SetFatalErrorHandler(isolate_handle, fatalCallback);
+     v8.v8__Isolate__SetOOMErrorHandler(isolate_handle, oomCallback);
+ 
+-    if (comptime lp.IS_DEBUG) {
+-        v8.v8__Isolate__SetCaptureStackTraceForUncaughtExceptions(isolate_handle, true, 64);
+-    }
++    // Host-reported exceptions need native stacks in release CDP sessions too.
++    v8.v8__Isolate__SetCaptureStackTraceForUncaughtExceptions(isolate_handle, true, 64);
+ 
+     isolate.enter();
+     errdefer isolate.exit();
+diff --git a/src/browser/js/Inspector.zig b/src/browser/js/Inspector.zig
+index f6f312e..6d55081 100644
+--- a/src/browser/js/Inspector.zig
++++ b/src/browser/js/Inspector.zig
+@@ -29,7 +29,7 @@ const CONTEXT_GROUP_ID = 1;
+ const CLIENT_TRUST_LEVEL = 1;
+ 
+ // V8's default Error mirror reads .stack even without a preview. Limit the
+-// embedder description override to this synchronous console argument wrap.
++// embedder description override to synchronous diagnostic argument wrapping.
+ threadlocal var console_error: ?struct {
+     client: *v8.InspectorClientImpl,
+     value: *const v8.Value,
+diff --git a/src/browser/webapi/Window.zig b/src/browser/webapi/Window.zig
+index b503d8b..11e3dd8 100644
+--- a/src/browser/webapi/Window.zig
++++ b/src/browser/webapi/Window.zig
+@@ -634,31 +634,38 @@ fn cancelIdleCallback(self: *Window, id: u32) void {
+ }
+ 
+ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
+-    // Per spec's "in error reporting mode": an exception thrown while an
+-    // error is being reported (e.g. by an "error" listener) is not reported
+-    // again, which would otherwise recurse without bound.
++    frame.page.recordJsError(error.JsException);
++
++    // Snapshot diagnostics before listeners can mutate the error. Neither the
++    // formatter nor the native stack API evaluates page-controlled getters.
++    const allocator = err.local.ctx.env.allocator;
++    const message = try std.fmt.allocPrint(allocator, "{f}", .{err});
++    defer allocator.free(message);
++    const report: Notification.RuntimeException = .{
++        .value = err,
++        .timestamp = lp.datetime.milliTimestamp(.real),
++        .message = message,
++        .stack = if (err.isNativeError()) js.v8.v8__Exception__GetStackTrace(err.handle) else null,
++    };
++
++    // In error reporting mode, skip recursive event dispatch but still report
++    // the nested exception to the host, just as for an uncanceled error event.
+     if (self._reporting_error) {
++        reportUncanceledError(frame, &report);
+         return;
+     }
+-
+-    frame.page.recordJsError(error.JsException);
++    self._reporting_error = true;
++    defer self._reporting_error = false;
+ 
+     const target = self.asEventTarget();
+     if (!frame._event_manager.hasDirectListeners(target, "error", self._on_error)) {
+-        if (comptime lp.IS_TEST == false) {
+-            log.debug(.js, "window.reportError", .{
+-                .message = err.toStringSlice() catch "Unknown error",
+-            });
+-        }
++        reportUncanceledError(frame, &report);
+         return;
+     }
+ 
+-    self._reporting_error = true;
+-    defer self._reporting_error = false;
+-
+     const error_event = try ErrorEvent.initTrusted(comptime .wrap("error"), .{
+         .@"error" = try err.persist(),
+-        .message = err.toStringSlice() catch "Unknown error",
++        .message = report.message,
+         .bubbles = false,
+         .cancelable = true,
+     }, frame.page);
+@@ -672,14 +679,22 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
+         frame.js.localScope(&ls);
+         defer ls.deinit();
+ 
++        var caught: js.TryCatch = undefined;
++        caught.init(&ls.local);
++        defer caught.deinit();
+         const local_func = ls.toLocal(on_error);
+-        const result = local_func.call(js.Value, .{
++        const result = local_func.callRethrow(js.Value, .{
+             error_event._message,
+             error_event._filename,
+             error_event._line_number,
+             error_event._column_number,
+             err,
+-        }) catch null;
++        }) catch blk: {
++            if (caught.exceptionValue()) |exception| {
++                try self.reportError(exception, frame);
++            }
++            break :blk null;
++        };
+ 
+         // Per spec: returning true from onerror cancels the event
+         if (result) |r| {
+@@ -699,15 +714,15 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
+         .run_microtasks = false,
+     });
+ 
++    if (!event._prevent_default) {
++        reportUncanceledError(frame, &report);
++    }
++}
++
++fn reportUncanceledError(frame: *Frame, report: *const Notification.RuntimeException) void {
++    frame.page.session.notification.dispatch(.runtime_exception, report);
+     if (comptime lp.IS_TEST == false) {
+-        if (!event._prevent_default) {
+-            log.debug(.js, "window.reportError", .{
+-                .message = error_event._message,
+-                .filename = error_event._filename,
+-                .line_number = error_event._line_number,
+-                .column_number = error_event._column_number,
+-            });
+-        }
++        log.debug(.js, "window.reportError", .{ .message = report.message });
+     }
+ }
+ 
+diff --git a/src/server/cdp/CDP.zig b/src/server/cdp/CDP.zig
+index 45f2f87..28b8b44 100644
+--- a/src/server/cdp/CDP.zig
++++ b/src/server/cdp/CDP.zig
+@@ -412,6 +412,16 @@ pub const BrowserContext = struct {
+         parent_id: ?[]const u8,
+         bc: *BrowserContext,
+         inspector_session: js.Inspector.Session,
++        // Host reports use negative IDs, separate from V8's positive IDs.
++        exception_id: i32 = 0,
++
++        fn onRuntimeException(ctx: *anyopaque, report: *const Notification.RuntimeException) !void {
++            const self: *AttachedSession = @ptrCast(@alignCast(ctx));
++            const arena = self.bc.acquireNotificationArena();
++            defer self.bc.releaseNotificationArena();
++            self.exception_id -= 1;
++            return @import("domains/runtime.zig").exceptionThrown(arena, self, report);
++        }
+ 
+         /// V8 -> this session. Stamp OUR id on responses and events.
+         pub fn onInspectorResponse(ctx: *anyopaque, _: u32, msg: []const u8) void {
+@@ -928,12 +938,18 @@ pub const BrowserContext = struct {
+         self.notification.unregister(.console_message, self);
+     }
+ 
+-    pub fn runtimeEnable(self: *BrowserContext) !void {
++    pub fn runtimeEnable(self: *BrowserContext, session_id: ?[]const u8) !void {
++        const id = session_id orelse self.session_id orelse return error.SessionNotAttached;
++        const attached = self.attached_sessions.get(id) orelse return error.SessionNotAttached;
+         try self.notification.register(.runtime_console_message, self, onRuntimeConsoleMessage);
++        try self.notification.register(.runtime_exception, attached, AttachedSession.onRuntimeException);
+     }
+ 
+-    pub fn runtimeDisable(self: *BrowserContext) void {
++    pub fn runtimeDisable(self: *BrowserContext, session_id: ?[]const u8) !void {
++        const id = session_id orelse self.session_id orelse return error.SessionNotAttached;
++        const attached = self.attached_sessions.get(id) orelse return error.SessionNotAttached;
+         self.notification.unregister(.runtime_console_message, self);
++        self.notification.unregister(.runtime_exception, attached);
+     }
+ 
+     // Registers for the download notifications dispatched by Frame when a
+@@ -1243,6 +1259,7 @@ pub const BrowserContext = struct {
+     }
+ 
+     fn destroySession(self: *BrowserContext, attached: *AttachedSession) void {
++        self.notification.unregisterAll(attached);
+         attached.inspector_session.deinit();
+         self.cdp.allocator.destroy(attached);
+     }
+diff --git a/src/server/cdp/domains/runtime.zig b/src/server/cdp/domains/runtime.zig
+index f9fbb60..cd8a6dc 100644
+--- a/src/server/cdp/domains/runtime.zig
++++ b/src/server/cdp/domains/runtime.zig
+@@ -67,13 +67,13 @@ pub fn processMessage(cmd: *CDP.Command) !void {
+ 
+ fn enable(cmd: *CDP.Command) !void {
+     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+-    try bc.runtimeEnable();
++    try bc.runtimeEnable(cmd.input.session_id);
+     return sendInspector(cmd);
+ }
+ 
+ fn disable(cmd: *CDP.Command) !void {
+     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+-    bc.runtimeDisable();
++    try bc.runtimeDisable(cmd.input.session_id);
+     return sendInspector(cmd);
+ }
+ 
+@@ -164,6 +164,88 @@ pub fn consoleMessage(arena: Allocator, bc: *CDP.BrowserContext, event: *const N
+     }, .{ .session_id = session_id });
+ }
+ 
++const CallFrame = struct {
++    functionName: []const u8,
++    scriptId: []const u8,
++    url: []const u8,
++    lineNumber: i32,
++    columnNumber: i32,
++};
++
++const StackTrace = struct {
++    callFrames: []const CallFrame,
++};
++
++pub fn exceptionThrown(arena: Allocator, attached: *CDP.BrowserContext.AttachedSession, report: *const Notification.RuntimeException) !void {
++    // Enter the originating world, not the main frame's default world. The
++    // report's local handles remain rooted by the synchronous dispatch caller.
++    var ls: js.Local.Scope = undefined;
++    report.value.local.ctx.localScope(&ls);
++    defer ls.deinit();
++    const local = &ls.local;
++
++    var frames: std.ArrayList(CallFrame) = .empty;
++    var description: std.Io.Writer.Allocating = .init(arena);
++    try description.writer.writeAll(report.message);
++    if (report.stack) |stack| {
++        const count = js.v8.v8__StackTrace__GetFrameCount(stack);
++        for (0..@intCast(count)) |i| {
++            const frame = js.v8.v8__StackTrace__GetFrame(stack, local.isolate.handle, @intCast(i)) orelse continue;
++            const name = try nativeString(arena, local, js.v8.v8__StackFrame__GetFunctionName(frame));
++            const url = try nativeString(arena, local, js.v8.v8__StackFrame__GetScriptNameOrSourceURL(frame));
++            const line = js.v8.v8__StackFrame__GetLineNumber(frame);
++            const column = js.v8.v8__StackFrame__GetColumn(frame);
++            try frames.append(arena, .{
++                .functionName = name,
++                .scriptId = try std.fmt.allocPrint(arena, "{d}", .{js.v8.v8__StackFrame__GetScriptId(frame)}),
++                .url = url,
++                .lineNumber = @max(0, line - 1),
++                .columnNumber = @max(0, column - 1),
++            });
++            try description.writer.print("\n    at {s} ({s}:{d}:{d})", .{
++                if (name.len == 0) "<anonymous>" else name,
++                if (url.len == 0) "<anonymous>" else url,
++                line,
++                column,
++            });
++        }
++    }
++
++    // V8 releases the diagnostic "console" group across sessions when the
++    // client calls Runtime.discardConsoleEntries or the page clears its console.
++    const remote = try attached.inspector_session.getConsoleRemoteObject(local, report.value);
++    defer remote.deinit();
++    var exception: RemoteObject = .{
++        .type = try remote.getType(arena),
++        .subtype = try remote.getSubtype(arena),
++        .className = try remote.getClassName(arena),
++        .description = if (report.value.isNativeError()) description.written() else try remote.getDescription(arena),
++        .objectId = try remote.getObjectId(arena),
++    };
++    try exception.setPrimitive(arena, report.value);
++
++    const first = if (frames.items.len == 0) null else frames.items[0];
++    return attached.bc.cdp.sendEvent("Runtime.exceptionThrown", .{
++        .timestamp = report.timestamp,
++        .exceptionDetails = .{
++            .exceptionId = attached.exception_id,
++            .text = "Uncaught",
++            .lineNumber = if (first) |f| f.lineNumber else 0,
++            .columnNumber = if (first) |f| f.columnNumber else 0,
++            .scriptId = if (first) |f| f.scriptId else @as(?[]const u8, null),
++            .url = if (first) |f| (if (f.url.len == 0) null else f.url) else @as(?[]const u8, null),
++            .stackTrace = if (first != null) StackTrace{ .callFrames = frames.items } else @as(?StackTrace, null),
++            .exception = exception,
++            .executionContextId = attached.bc.inspector().getContextId(local),
++        },
++    }, .{ .session_id = attached.id });
++}
++
++fn nativeString(arena: Allocator, local: *const js.Local, handle: ?*const js.v8.String) ![]const u8 {
++    const str: js.String = .{ .local = local, .handle = handle orelse return "" };
++    return str.toSliceWithAlloc(arena);
++}
++
+ const testing = @import("../testing.zig");
+ 
+ test "cdp.runtime: inspector-handled methods pass through" {

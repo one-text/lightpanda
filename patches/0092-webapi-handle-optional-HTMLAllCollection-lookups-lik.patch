@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 17 Nov 2026 14:39:41 -0300
+Subject: [PATCH] webapi: handle optional HTMLAllCollection lookups like Chrome
+
+The Sephora SDK invokes document.all() with zero arguments. The old bridge
+required an argument and threw TypeError; Chrome returns null. Accept the
+optional legacy lookup argument, preserve explicit null DOMString conversion,
+recognize canonical array-index strings, and return null for callable misses.
+Share this lookup algorithm with item(), including its optional-argument arity,
+while leaving absent indexed/named properties undefined and Symbols rejected.
+
+Update three existing callable-miss expectations rather than adding tests.
+Temporary isolated local Chrome/native reductions verify omitted/undefined/null,
+index/name/object/Symbol coercion, selected element identity, and item arity.
+All 1658 upstream tests pass. Scoped VM/native-binding captures confirm the SDK
+call changes from InvalidArgument/TypeError to a null return. No binary POST
+is recorded in that diagnostic follow-up; this is not a complete submission fix.
+
+Temporary Promise/VM/binding hooks were removed from the development worktree.
+---
+ .../tests/document/all_collection.html        |  6 +--
+ .../webapi/collections/HTMLAllCollection.zig  | 41 +++++++++++--------
+ 2 files changed, 26 insertions(+), 21 deletions(-)
+
+diff --git a/src/browser/tests/document/all_collection.html b/src/browser/tests/document/all_collection.html
+index 9711e5a..eed2e7e 100644
+--- a/src/browser/tests/document/all_collection.html
++++ b/src/browser/tests/document/all_collection.html
+@@ -51,10 +51,10 @@
+     testing.expectEqual('DIV', document.all(4).tagName);
+     testing.expectEqual('DIV', document.all('first').tagName);
+     testing.expectEqual('First', document.all('first').textContent);
+-    testing.expectEqual(undefined, document.all('second'));
++    testing.expectEqual(null, document.all('second'));
+     testing.expectEqual('P', document.all('third').tagName);
+-    testing.expectEqual(undefined, document.all(999));
+-    testing.expectEqual(undefined, document.all('nonexistent'));
++    testing.expectEqual(null, document.all(999));
++    testing.expectEqual(null, document.all('nonexistent'));
+ 
+     let count = 0;
+     for (const el of document.all) {
+diff --git a/src/browser/webapi/collections/HTMLAllCollection.zig b/src/browser/webapi/collections/HTMLAllCollection.zig
+index 03e0cb7..13d11a0 100644
+--- a/src/browser/webapi/collections/HTMLAllCollection.zig
++++ b/src/browser/webapi/collections/HTMLAllCollection.zig
+@@ -1,6 +1,8 @@
+ // Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
++// Copyright (C) 2026 Brenno Flávio
+ //
+ // Francis Bouvier <francis@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ // Pierre Tachoire <pierre@lightpanda.io>
+ //
+ // This program is free software: you can redistribute it and/or modify
+@@ -81,15 +83,25 @@ fn isAllNamed(el: *Element) bool {
+     };
+ }
+ 
+-const CAllAsFunctionArg = union(enum) {
+-    index: u32,
+-    id: []const u8,
+-};
+-pub fn callable(self: *HTMLAllCollection, arg: CAllAsFunctionArg, frame: *Frame) ?*Element {
+-    return switch (arg) {
+-        .index => |i| self.getAtIndex(i, frame),
+-        .id => |id| self.getByName(id, frame),
+-    };
++pub fn callable(self: *HTMLAllCollection, args: []const js.Value, frame: *Frame) !?*Element {
++    if (args.len == 0 or args[0].isUndefined()) return null;
++    if (args[0].isSymbol()) return error.TypeError;
++    const name = try args[0].toStringSlice();
++    if (name.len == 0) return null;
++
++    // Only canonical array-index strings select an indexed element.
++    if (name.len == 1 or name[0] != '0') {
++        var digits = true;
++        for (name) |c| if (!std.ascii.isDigit(c)) {
++            digits = false;
++            break;
++        };
++        if (digits) {
++            const index = std.fmt.parseInt(u32, name, 10) catch null;
++            if (index) |i| if (i != std.math.maxInt(u32)) return self.getAtIndex(i, frame);
++        }
++    }
++    return self.getByName(name, frame);
+ }
+ 
+ pub fn iterator(self: *HTMLAllCollection, exec: *const Execution) !*Iterator {
+@@ -135,19 +147,12 @@ pub const JsApi = struct {
+         }
+     }.wrap, .{ .null_as_undefined = true });
+ 
+-    pub const item = bridge.function(struct {
+-        fn wrap(self: *HTMLAllCollection, index: i32, frame: *Frame) ?*Element {
+-            if (index < 0) {
+-                return null;
+-            }
+-            return self.getAtIndex(@intCast(index), frame);
+-        }
+-    }.wrap, .{});
++    pub const item = bridge.function(HTMLAllCollection.callable, .{});
+ 
+     pub const namedItem = bridge.function(HTMLAllCollection.getByName, .{});
+     pub const symbol_iterator = bridge.iterator(HTMLAllCollection.iterator, .{});
+ 
+-    pub const callable = bridge.callable(HTMLAllCollection.callable, .{ .null_as_undefined = true });
++    pub const callable = bridge.callable(HTMLAllCollection.callable, .{});
+ };
+ 
+ const testing = @import("../../../testing.zig");

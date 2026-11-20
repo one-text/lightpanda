@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 19 Nov 2026 21:12:10 -0300
+Subject: [PATCH] webapi: expose a static macOS keyboard layout
+
+Expose navigator.keyboard on secure windows with a read-only iterable
+KeyboardLayoutMap. Use the existing frame policy helper for keyboard-map
+and leave input dispatch, fullscreen, and Keyboard Lock unchanged.
+
+Derive the 47 unmodified letter, digit, and punctuation entries from
+Chromium 155.0.8059.40 kWritingSystemKeyDomCodes and VS Code en.darwin.ts
+(com.apple.keylayout.US). The static U.S. ANSI persona does not query a
+host layout or claim an exact macOS capture of international entries or
+Blink iteration order.
+---
+ src/browser/js/Context.zig       |   3 +
+ src/browser/js/Env.zig           |   3 +
+ src/browser/js/bridge.zig        |   1 +
+ src/browser/webapi/Keyboard.zig  | 222 +++++++++++++++++++++++++++++++
+ src/browser/webapi/Navigator.zig |   8 ++
+ 5 files changed, 237 insertions(+)
+ create mode 100644 src/browser/webapi/Keyboard.zig
+
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index 5f09565..c097d0f 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -78,6 +78,7 @@ media_device_bindings: ?struct {
+ } = null,
+ 
+ credentials_bindings: ?@import("../webapi/CredentialsContainer.zig").Bindings = null,
++keyboard_bindings: ?@import("../webapi/Keyboard.zig").Bindings = null,
+ webgpu_bindings: ?[10]v8.Global = null,
+ webgpu_hidden: bool = false,
+ eme_bindings: ?[10]v8.Global = null,
+@@ -281,6 +282,7 @@ pub fn deinit(self: *Context) void {
+         for (&bindings.interfaces) |*binding| v8.v8__Global__Reset(binding);
+     }
+     if (self.credentials_bindings) |*bindings| bindings.deinit();
++    if (self.keyboard_bindings) |*bindings| bindings.deinit();
+     if (self.webgpu_bindings) |*bindings| {
+         for (bindings) |*binding| v8.v8__Global__Reset(binding);
+     }
+@@ -331,6 +333,7 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
+             try @import("../webapi/CloseWatcher.zig").expose(self, ls.local.handle, global_obj, secure);
+             try env.setMediaDevicesExposure(self, ls.local.handle, global_obj, secure);
+             try @import("../webapi/CredentialsContainer.zig").expose(self, ls.local.handle, global_obj, secure);
++            try @import("../webapi/Keyboard.zig").expose(self, ls.local.handle, global_obj, secure);
+             // With the feature disabled, Env.createContext already hid this API.
+             if (!secure and self.page.session.experimental_features.serviceworker) {
+                 env.hideServiceWorker(true, ls.local.handle, global_obj);
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 227c730..7c5b92a 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -458,6 +458,9 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+     errdefer if (context.credentials_bindings) |*bindings| bindings.deinit();
+     if (comptime is_frame) try @import("../webapi/CredentialsContainer.zig").expose(context, v8_context, global_obj, global.isSecureContext());
+ 
++    errdefer if (context.keyboard_bindings) |*bindings| bindings.deinit();
++    if (comptime is_frame) try @import("../webapi/Keyboard.zig").expose(context, v8_context, global_obj, global.isSecureContext());
++
+     if (comptime is_frame) try self.captureEncryptedMediaBindings(context, v8_context, global_obj);
+     errdefer if (context.eme_bindings) |*bindings| {
+         for (bindings) |*binding| v8.v8__Global__Reset(binding);
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index fb1f7e8..1464997 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1277,6 +1277,7 @@ pub const PageJsApis = flattenTypes(&.{
+     @import("../webapi/ModelContext.zig"),
+     @import("../webapi/Navigator.zig"),
+     @import("../webapi/CredentialsContainer.zig"),
++    @import("../webapi/Keyboard.zig"),
+     @import("../webapi/WebGPU.zig"),
+     @import("../webapi/NavigatorUAData.zig"),
+     @import("../webapi/Notification.zig"),
+diff --git a/src/browser/webapi/Keyboard.zig b/src/browser/webapi/Keyboard.zig
+new file mode 100644
+index 0000000..ee55b87
+--- /dev/null
++++ b/src/browser/webapi/Keyboard.zig
+@@ -0,0 +1,222 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Navigator = @import("Navigator.zig");
++const DOMException = @import("DOMException.zig");
++const Page = @import("../Page.zig");
++const v8 = js.v8;
++
++const Keyboard = @This();
++_navigator: *Navigator,
++
++pub fn registerTypes() []const type {
++    return &.{ Keyboard, KeyboardLayoutMap, KeyIterator, ValueIterator, EntryIterator };
++}
++
++pub fn init(navigator: *Navigator, exec: *js.Execution) !*Keyboard {
++    return exec._factory.create(Keyboard{ ._navigator = navigator });
++}
++
++fn creationContext(self: *const Keyboard, local: *const js.Local) *const v8.Context {
++    return self._navigator.creationContext(local);
++}
++
++fn getLayoutMap(self: *const Keyboard, exec: *js.Execution) !js.Promise {
++    const detached = DOMException.init("Current frame is detached.", "InvalidStateError");
++    const frame = self._navigator._frame orelse return reject(exec, detached);
++    if (self._navigator._pdf_detached or frame.document._frame != frame or !frame.isSecureContext()) return reject(exec, detached);
++    if (frame.parent != null and !@import("MediaDevices.zig").allowed(frame, "keyboard-map")) {
++        return reject(exec, DOMException.init(
++            "getLayoutMap() must be called from a top-level browsing context or allowed by the permission policy.",
++            "SecurityError",
++        ));
++    }
++    const map = try exec._factory.create(KeyboardLayoutMap{});
++    const local = exec.js.local.?;
++    const resolver = local.createPromiseResolver();
++    try resolver.resolveValue(try local.zigValueToJs(map, .{}));
++    return resolver.promise();
++}
++
++fn reject(exec: *js.Execution, exception: DOMException) !js.Promise {
++    const local = exec.js.local.?;
++    const resolver = local.createPromiseResolver();
++    try resolver.rejectValue(try local.zigValueToJs(try exec._factory.create(exception), .{}));
++    return resolver.promise();
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Keyboard);
++    pub const Meta = struct {
++        pub const name = "Keyboard";
++        pub const creation_context = Keyboard.creationContext;
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const getLayoutMap = bridge.function(Keyboard.getLayoutMap, .{});
++};
++
++// Unmodified writing-system keys for the fixed macOS U.S. ANSI persona.
++// This is layout data, not a hardware inventory or host input-source lookup.
++const Pair = struct { []const u8, []const u8 };
++const layout = [_]Pair{
++    .{ "Backquote", "`" },  .{ "Digit1", "1" }, .{ "Digit2", "2" }, .{ "Digit3", "3" },      .{ "Digit4", "4" },
++    .{ "Digit5", "5" },     .{ "Digit6", "6" }, .{ "Digit7", "7" }, .{ "Digit8", "8" },      .{ "Digit9", "9" },
++    .{ "Digit0", "0" },     .{ "Minus", "-" },  .{ "Equal", "=" },  .{ "KeyQ", "q" },        .{ "KeyW", "w" },
++    .{ "KeyE", "e" },       .{ "KeyR", "r" },   .{ "KeyT", "t" },   .{ "KeyY", "y" },        .{ "KeyU", "u" },
++    .{ "KeyI", "i" },       .{ "KeyO", "o" },   .{ "KeyP", "p" },   .{ "BracketLeft", "[" }, .{ "BracketRight", "]" },
++    .{ "Backslash", "\\" }, .{ "KeyA", "a" },   .{ "KeyS", "s" },   .{ "KeyD", "d" },        .{ "KeyF", "f" },
++    .{ "KeyG", "g" },       .{ "KeyH", "h" },   .{ "KeyJ", "j" },   .{ "KeyK", "k" },        .{ "KeyL", "l" },
++    .{ "Semicolon", ";" },  .{ "Quote", "'" },  .{ "KeyZ", "z" },   .{ "KeyX", "x" },        .{ "KeyC", "c" },
++    .{ "KeyV", "v" },       .{ "KeyB", "b" },   .{ "KeyN", "n" },   .{ "KeyM", "m" },        .{ "Comma", "," },
++    .{ "Period", "." },     .{ "Slash", "/" },
++};
++
++const KeyboardLayoutMap = struct {
++    _rc: lp.RC = .{},
++
++    pub fn acquireRef(self: *KeyboardLayoutMap) void {
++        self._rc.acquire();
++    }
++    pub fn releaseRef(self: *KeyboardLayoutMap, page: *Page) void {
++        self._rc.release(self, page);
++    }
++    pub fn deinit(self: *KeyboardLayoutMap, page: *Page) void {
++        page.factory.destroy(self);
++    }
++
++    fn size(_: *const KeyboardLayoutMap) u32 {
++        return layout.len;
++    }
++    fn get(_: *const KeyboardLayoutMap, code: js.Value) !?[]const u8 {
++        const key = try (try @import("media_constraints.zig").domString(code)).toSlice();
++        for (layout) |pair| {
++            if (std.mem.eql(u8, key, pair[0])) return pair[1];
++        }
++        return null;
++    }
++    fn has(self: *const KeyboardLayoutMap, code: js.Value) !bool {
++        return (try self.get(code)) != null;
++    }
++    fn keys(_: *const KeyboardLayoutMap, exec: *js.Execution) !*KeyIterator {
++        return KeyIterator.init(.{}, exec);
++    }
++    fn values(_: *const KeyboardLayoutMap, exec: *js.Execution) !*ValueIterator {
++        return ValueIterator.init(.{}, exec);
++    }
++    fn entries(_: *const KeyboardLayoutMap, exec: *js.Execution) !*EntryIterator {
++        return EntryIterator.init(.{}, exec);
++    }
++    fn forEach(self: *KeyboardLayoutMap, callback: js.Function, this_arg: ?js.Value, exec: *js.Execution) !void {
++        const receiver = this_arg orelse try exec.js.local.?.zigValueToJs(js.Undefined{}, .{});
++        for (layout) |pair| {
++            try callback.callWithThisRethrow(void, receiver, .{ pair[1], pair[0], self });
++        }
++    }
++
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(KeyboardLayoutMap);
++        pub const Meta = struct {
++            pub const name = "KeyboardLayoutMap";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const size = bridge.accessor(KeyboardLayoutMap.size, null, .{});
++        pub const get = bridge.function(KeyboardLayoutMap.get, .{ .null_as_undefined = true });
++        pub const has = bridge.function(KeyboardLayoutMap.has, .{});
++        pub const keys = bridge.function(KeyboardLayoutMap.keys, .{});
++        pub const values = bridge.function(KeyboardLayoutMap.values, .{});
++        pub const entries = bridge.function(KeyboardLayoutMap.entries, .{});
++        pub const forEach = bridge.function(KeyboardLayoutMap.forEach, .{});
++    };
++};
++
++const LayoutIterator = struct {
++    index: usize = 0,
++    pub fn next(self: *LayoutIterator, _: *js.Execution) ?Pair {
++        if (self.index == layout.len) return null;
++        defer self.index += 1;
++        return layout[self.index];
++    }
++};
++const Entry = @import("collections/iterator.zig").Entry;
++const KeyIterator = Entry(LayoutIterator, "0");
++const ValueIterator = Entry(LayoutIterator, "1");
++const EntryIterator = Entry(LayoutIterator, null);
++
++const names = [_][]const u8{ "keyboard", "Keyboard", "KeyboardLayoutMap" };
++
++pub const Bindings = struct {
++    prototype: v8.Global,
++    define_property: v8.Global,
++    descriptors: [names.len]v8.Global,
++    hidden: bool = false,
++
++    pub fn deinit(self: *Bindings) void {
++        v8.v8__Global__Reset(&self.prototype);
++        v8.v8__Global__Reset(&self.define_property);
++        for (&self.descriptors) |*descriptor| v8.v8__Global__Reset(descriptor);
++    }
++};
++
++pub fn expose(ctx: *js.Context, context: *const v8.Context, global: *const v8.Object, secure: bool) !void {
++    const isolate = ctx.isolate;
++    if (ctx.keyboard_bindings == null) {
++        const navigator = v8.v8__Object__Get(global, context, isolate.initStringHandle("Navigator")) orelse return error.JsException;
++        const prototype = v8.v8__Object__Get(@ptrCast(navigator), context, isolate.initStringHandle("prototype")) orelse return error.JsException;
++        const object = v8.v8__Object__Get(global, context, isolate.initStringHandle("Object")) orelse return error.JsException;
++        const define = v8.v8__Object__Get(@ptrCast(object), context, isolate.initStringHandle("defineProperty")) orelse return error.JsException;
++        const map = v8.v8__Object__Get(global, context, isolate.initStringHandle("KeyboardLayoutMap")) orelse return error.JsException;
++        const map_prototype = v8.v8__Object__Get(@ptrCast(map), context, isolate.initStringHandle("prototype")) orelse return error.JsException;
++        const entries = v8.v8__Object__Get(@ptrCast(map_prototype), context, isolate.initStringHandle("entries")) orelse return error.JsException;
++        var result: v8.MaybeBool = undefined;
++        v8.v8__Object__DefineOwnProperty(@ptrCast(map_prototype), context, @ptrCast(v8.v8__Symbol__GetIterator(isolate.handle)), entries, v8.DontEnum, &result);
++        if (!result.has_value or !result.value) return error.JsException;
++
++        var descriptors: [names.len]*const v8.Value = undefined;
++        for (names, &descriptors, 0..) |name, *descriptor, i| {
++            const target = if (i == 0) @as(*const v8.Object, @ptrCast(prototype)) else global;
++            descriptor.* = v8.v8__Object__GetOwnPropertyDescriptor(target, context, isolate.initStringHandle(name)) orelse return error.JsException;
++        }
++        ctx.keyboard_bindings = .{ .prototype = undefined, .define_property = undefined, .descriptors = undefined };
++        const bindings = &ctx.keyboard_bindings.?;
++        v8.v8__Global__New(isolate.handle, prototype, &bindings.prototype);
++        v8.v8__Global__New(isolate.handle, define, &bindings.define_property);
++        for (descriptors, &bindings.descriptors) |descriptor, *saved| v8.v8__Global__New(isolate.handle, descriptor, saved);
++    }
++
++    const bindings = &ctx.keyboard_bindings.?;
++    if (secure != bindings.hidden) return;
++    const prototype: *const v8.Object = @ptrCast(v8.v8__Global__Get(&bindings.prototype, isolate.handle).?);
++    for (names, &bindings.descriptors, 0..) |name, *descriptor, i| {
++        const target = if (i == 0) prototype else global;
++        const key = isolate.initStringHandle(name);
++        if (secure) {
++            const define: *const v8.Function = @ptrCast(v8.v8__Global__Get(&bindings.define_property, isolate.handle).?);
++            const args = [_]?*const v8.Value{ @ptrCast(target), key, v8.v8__Global__Get(descriptor, isolate.handle) };
++            _ = v8.v8__Function__Call(define, context, @ptrCast(global), args.len, &args) orelse return error.JsException;
++        } else {
++            var result: v8.MaybeBool = undefined;
++            v8.v8__Object__Delete(target, context, key, &result);
++            if (!result.has_value or !result.value) return error.JsException;
++        }
++    }
++    bindings.hidden = !secure;
++}
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index 5324ead..3d08902 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -37,6 +37,7 @@ const NetworkInformation = @import("NetworkInformation.zig");
+ const MediaDevices = @import("MediaDevices.zig");
+ const WebShare = @import("WebShare.zig");
+ const CredentialsContainer = @import("CredentialsContainer.zig");
++const Keyboard = @import("Keyboard.zig");
+ 
+ const Navigator = @This();
+ 
+@@ -60,6 +61,7 @@ _ua_data: NavigatorUAData = .{},
+ _service_worker: ?*ServiceWorkerContainer = null,
+ _media_devices: ?*MediaDevices = null,
+ _credentials: ?*CredentialsContainer = null,
++_keyboard: ?*Keyboard = null,
+ _gpu: ?*@import("WebGPU.zig").GPU = null,
+ _share_pending: bool = false,
+ _share_activation_ms: ?u64 = null,
+@@ -233,6 +235,11 @@ fn getCredentials(self: *Navigator, exec: *Execution) !*CredentialsContainer {
+     return self._credentials.?;
+ }
+ 
++fn getKeyboard(self: *Navigator, exec: *Execution) !*Keyboard {
++    if (self._keyboard == null) self._keyboard = try Keyboard.init(self, exec);
++    return self._keyboard.?;
++}
++
+ fn getGPU(self: *Navigator, exec: *Execution) !*@import("WebGPU.zig").GPU {
+     if (self._gpu == null) self._gpu = try @import("WebGPU.zig").GPU.init(exec);
+     return self._gpu.?;
+@@ -386,6 +393,7 @@ pub const JsApi = struct {
+     pub const connection = bridge.accessor(Navigator.getConnection, null, .{ .cache = .{ .private = "network_information" } });
+     pub const mediaDevices = bridge.accessor(Navigator.getMediaDevices, null, .{ .exposed = .window });
+     pub const credentials = bridge.accessor(Navigator.getCredentials, null, .{ .exposed = .window });
++    pub const keyboard = bridge.accessor(Navigator.getKeyboard, null, .{ .exposed = .window });
+     pub const gpu = bridge.accessor(Navigator.getGPU, null, .{});
+     pub const serviceWorker = bridge.accessor(Navigator.getServiceWorker, null, .{});
+     pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});

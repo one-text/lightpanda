@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 29 Oct 2026 21:12:25 -0300
+Subject: [PATCH] tls: enable native signed certificate timestamp requests
+
+Enable SCT requests through the pinned BoringSSL context API before curl creates each SSL connection. Keep extension serialization and SCT response handling native, without changing certificate verification, GREASE, cipher/signature policy or session caching. This closes only extension 18; Chrome CT enforcement and the other missing extensions remain out of scope.
+---
+ src/network/http.zig  | 1 +
+ src/sys/libcrypto.zig | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/src/network/http.zig b/src/network/http.zig
+index afc25ca..066bcc5 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -482,6 +482,7 @@ pub const Connection = struct {
+                 crypto.SSL_CTX_set_grease_enabled(ssl_ctx, 1);
+                 crypto.SSL_CTX_set_grease_sigalgs_enabled(ssl_ctx, 1);
+                 crypto.SSL_CTX_set_permute_extensions(ssl_ctx, 1);
++                crypto.SSL_CTX_enable_signed_cert_timestamps(ssl_ctx);
+ 
+                 // Chromium's cipher policy retains the backend's AES-aware ordering.
+                 if (crypto.SSL_CTX_set_strict_cipher_list(ssl_ctx, "ALL:!aPSK:!ECDSA+SHA1:!3DES") != 1) {
+diff --git a/src/sys/libcrypto.zig b/src/sys/libcrypto.zig
+index b6215b0..3395c00 100644
+--- a/src/sys/libcrypto.zig
++++ b/src/sys/libcrypto.zig
+@@ -184,6 +184,7 @@ pub extern fn SSL_CTX_set1_verify_cert_store(ctx: ?*SSL_CTX, store: ?*X509_STORE
+ pub extern fn SSL_CTX_set_grease_enabled(ctx: *SSL_CTX, enabled: c_int) void;
+ pub extern fn SSL_CTX_set_grease_sigalgs_enabled(ctx: *SSL_CTX, enabled: c_int) void;
+ pub extern fn SSL_CTX_set_permute_extensions(ctx: *SSL_CTX, enabled: c_int) void;
++pub extern fn SSL_CTX_enable_signed_cert_timestamps(ctx: *SSL_CTX) void;
+ pub extern fn SSL_CTX_set_strict_cipher_list(ctx: *SSL_CTX, str: [*:0]const u8) c_int;
+ pub extern fn SSL_CTX_set_verify_algorithm_prefs(ctx: *SSL_CTX, prefs: [*]const u16, num_prefs: usize) c_int;
+ 

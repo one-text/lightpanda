@@ -1,0 +1,608 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 13 Oct 2026 18:06:07 -0300
+Subject: [PATCH] webapi: spoof Neo screen work area with native accessors
+
+Complete Screen.availLeft/availTop/availWidth/availHeight using native,
+read-only prototype accessors. Use a 24 CSS-pixel menu bar and an
+auto-hidden Dock on a single primary display. Bound the top inset to
+emulated screen height and saturate available height for tiny screens.
+
+Pin a chosen base MacBook Neo display profile: 1204x753 CSS pixels at 2x
+(2408x1506 physical panel pixels), with a 1100x650 content viewport. These
+are explicit spoofed assumptions, not measured Apple default settings.
+Honor existing CDP metrics overrides and reset behavior.
+
+Keep device-width/device-height media features tied to effective screen
+metrics rather than the content viewport. Invalidate stylesheet caches
+before media-query callbacks on metrics changes. Replace the root-element
+1920px fallback with its owning frame's effective viewport width.
+
+Update existing default-dependent test expectations and give fixed-size
+screenshot/media-query tests explicit metrics; add no unit tests. Do not
+change Window outer geometry, UA/client hints, worker loading, or GPU APIs.
+
+References:
+https://www.apple.com/macbook-neo/specs/
+https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/blink/renderer/core/frame/screen.idl
+https://drafts.csswg.org/cssom-view/#the-screen-interface
+https://drafts.csswg.org/mediaqueries-4/#device-width
+---
+ src/browser/Frame.zig                         |  1 +
+ src/browser/Viewport.zig                      |  8 ++-
+ src/browser/css/MediaQuery.zig                | 58 ++++++++++---------
+ src/browser/tests/css/media_query_list.html   | 30 +++++-----
+ src/browser/tests/window/screen.html          |  5 +-
+ src/browser/tests/window/stubs.html           |  3 +-
+ src/browser/tests/window/visual_viewport.html |  5 +-
+ src/browser/tests/window/window.html          | 13 +++--
+ src/browser/webapi/Element.zig                |  3 +-
+ src/browser/webapi/Screen.zig                 | 19 +++++-
+ src/mcp/tools.zig                             |  3 +
+ src/server/Server.zig                         |  3 +-
+ src/server/cdp/domains/emulation.zig          | 11 ++--
+ src/server/cdp/domains/page.zig               |  7 ++-
+ 14 files changed, 104 insertions(+), 65 deletions(-)
+
+diff --git a/src/browser/Frame.zig b/src/browser/Frame.zig
+index e9ccd68..2cca158 100644
+--- a/src/browser/Frame.zig
++++ b/src/browser/Frame.zig
+@@ -561,6 +561,7 @@ fn detachDisconnectedPdf(self: *Frame) void {
+ }
+ 
+ pub fn viewportChanged(self: *Frame) void {
++    self._style_manager.sheetModified();
+     var i: usize = 0;
+     while (i < self._media_query_lists.items.len) : (i += 1) {
+         self._media_query_lists.items[i].viewportChanged();
+diff --git a/src/browser/Viewport.zig b/src/browser/Viewport.zig
+index b4f58f2..a825480 100644
+--- a/src/browser/Viewport.zig
++++ b/src/browser/Viewport.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -39,6 +40,9 @@ pub const Orientation = struct {
+ };
+ 
+ pub const default = Viewport{
+-    .width = 1920,
+-    .height = 1080,
++    .width = 1100,
++    .height = 650,
++    .scale = 2.0,
++    .screen_width = 1204,
++    .screen_height = 753,
+ };
+diff --git a/src/browser/css/MediaQuery.zig b/src/browser/css/MediaQuery.zig
+index 3481a44..a0a975d 100644
+--- a/src/browser/css/MediaQuery.zig
++++ b/src/browser/css/MediaQuery.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -276,10 +277,7 @@ fn evalFeature(text: []const u8, viewport: Viewport) bool {
+ 
+ const max_feature_name_len = 17;
+ 
+-/// Map the deprecated `device-*` features onto their viewport counterparts.
+-/// `device-width` is the width of the output device; we have no separate
+-/// screen geometry, and `window.screen.width` already reports the viewport
+-/// (see webapi/Screen.zig), so both stay consistent.
++/// Normalize deprecated `device-*` names; their dimensions come from the screen.
+ fn stripDevice(lname: []const u8) []const u8 {
+     if (std.mem.eql(u8, lname, "device-width")) return "width";
+     if (std.mem.eql(u8, lname, "min-device-width")) return "min-width";
+@@ -296,30 +294,34 @@ fn evalNameValue(name: []const u8, value: []const u8, viewport: Viewport) bool {
+     }
+ 
+     var buf: [max_feature_name_len]u8 = undefined;
+-    const lname = stripDevice(std.ascii.lowerString(&buf, name));
++    const lower_name = std.ascii.lowerString(&buf, name);
++    const lname = stripDevice(lower_name);
++    const device = lname.len != lower_name.len;
++    const width = if (device) viewport.screen_width orelse viewport.width else viewport.width;
++    const height = if (device) viewport.screen_height orelse viewport.height else viewport.height;
+     if (std.mem.eql(u8, lname, "min-width")) {
+         const px = parseLengthPx(value) orelse return false;
+-        return viewport.width >= px;
++        return width >= px;
+     }
+     if (std.mem.eql(u8, lname, "max-width")) {
+         const px = parseLengthPx(value) orelse return false;
+-        return viewport.width <= px;
++        return width <= px;
+     }
+     if (std.mem.eql(u8, lname, "width")) {
+         const px = parseLengthPx(value) orelse return false;
+-        return viewport.width == px;
++        return width == px;
+     }
+     if (std.mem.eql(u8, lname, "min-height")) {
+         const px = parseLengthPx(value) orelse return false;
+-        return viewport.height >= px;
++        return height >= px;
+     }
+     if (std.mem.eql(u8, lname, "max-height")) {
+         const px = parseLengthPx(value) orelse return false;
+-        return viewport.height <= px;
++        return height <= px;
+     }
+     if (std.mem.eql(u8, lname, "height")) {
+         const px = parseLengthPx(value) orelse return false;
+-        return viewport.height == px;
++        return height == px;
+     }
+     if (std.mem.eql(u8, lname, "orientation")) {
+         if (std.ascii.eqlIgnoreCase(value, "landscape")) return viewport.width >= viewport.height;
+@@ -334,10 +336,14 @@ fn evalBoolean(name: []const u8, viewport: Viewport) bool {
+         return false;
+     }
+     var buf: [max_feature_name_len]u8 = undefined;
+-    const lname = stripDevice(std.ascii.lowerString(&buf, name));
+-
+-    if (std.mem.eql(u8, lname, "width")) return viewport.width > 0;
+-    if (std.mem.eql(u8, lname, "height")) return viewport.height > 0;
++    const lower_name = std.ascii.lowerString(&buf, name);
++    const lname = stripDevice(lower_name);
++    const device = lname.len != lower_name.len;
++    const width = if (device) viewport.screen_width orelse viewport.width else viewport.width;
++    const height = if (device) viewport.screen_height orelse viewport.height else viewport.height;
++
++    if (std.mem.eql(u8, lname, "width")) return width > 0;
++    if (std.mem.eql(u8, lname, "height")) return height > 0;
+     if (std.mem.eql(u8, lname, "orientation")) return true;
+     return false;
+ }
+@@ -395,7 +401,7 @@ test "MediaQuery: unknown ident is false" {
+ }
+ 
+ test "MediaQuery: min-width on 1920x1080 viewport" {
+-    const v = Viewport.default;
++    const v = Viewport{ .width = 1920, .height = 1080 };
+     try testing.expect(matches("(min-width: 1px)", v));
+     try testing.expect(matches("(min-width: 600px)", v));
+     try testing.expect(matches("(min-width: 1920px)", v));
+@@ -404,7 +410,7 @@ test "MediaQuery: min-width on 1920x1080 viewport" {
+ }
+ 
+ test "MediaQuery: max-width" {
+-    const v = Viewport.default;
++    const v = Viewport{ .width = 1920, .height = 1080 };
+     try testing.expect(matches("(max-width: 1920px)", v));
+     try testing.expect(matches("(max-width: 2000px)", v));
+     try testing.expect(!matches("(max-width: 1919px)", v));
+@@ -412,14 +418,14 @@ test "MediaQuery: max-width" {
+ }
+ 
+ test "MediaQuery: width (exact)" {
+-    const v = Viewport.default;
++    const v = Viewport{ .width = 1920, .height = 1080 };
+     try testing.expect(matches("(width: 1920px)", v));
+     try testing.expect(!matches("(width: 1921px)", v));
+     try testing.expect(!matches("(width: 1919px)", v));
+ }
+ 
+ test "MediaQuery: min-height / max-height / height" {
+-    const v = Viewport.default;
++    const v = Viewport{ .width = 1920, .height = 1080 };
+     try testing.expect(matches("(min-height: 1080px)", v));
+     try testing.expect(!matches("(min-height: 1081px)", v));
+     try testing.expect(matches("(max-height: 1080px)", v));
+@@ -429,7 +435,7 @@ test "MediaQuery: min-height / max-height / height" {
+ }
+ 
+ test "MediaQuery: device-width / device-height" {
+-    const v = Viewport.default;
++    const v = Viewport{ .width = 1920, .height = 1080 };
+     try testing.expect(matches("(min-device-width: 1px)", v));
+     try testing.expect(matches("(min-device-width: 1920px)", v));
+     try testing.expect(!matches("(min-device-width: 1921px)", v));
+@@ -510,7 +516,7 @@ test "MediaQuery: `only` is no-op" {
+ }
+ 
+ test "MediaQuery: em units (1em=16px)" {
+-    const v = Viewport.default;
++    const v = Viewport{ .width = 1920, .height = 1080 };
+     try testing.expect(matches("(min-width: 30em)", v)); // 480px <= 1920px
+     try testing.expect(matches("(min-width: 120em)", v)); // 1920px == 1920
+     try testing.expect(!matches("(min-width: 121em)", v)); // 1936px > 1920
+@@ -556,8 +562,8 @@ test "MediaQuery: boolean form (feature presence)" {
+ 
+ test "MediaQuery: viewport-default values" {
+     const v = Viewport.default;
+-    try testing.expectEqual(@as(u32, 1920), v.width);
+-    try testing.expectEqual(@as(u32, 1080), v.height);
++    try testing.expectEqual(@as(u32, 1100), v.width);
++    try testing.expectEqual(@as(u32, 650), v.height);
+ }
+ 
+ test "MediaQuery: leading whitespace and case" {
+@@ -581,7 +587,7 @@ test "MediaQuery: not print is true on screen viewport" {
+ 
+ test "MediaQuery: common responsive breakpoint" {
+     // Pattern: hide one of mobile/desktop CTA duplicates above a breakpoint.
+-    const v = Viewport.default; // 1920×1080 — desktop side.
++    const v = Viewport.default; // Desktop side.
+     try testing.expect(matches("(min-width: 768px)", v));
+     try testing.expect(!matches("(max-width: 767px)", v));
+ }
+@@ -659,7 +665,7 @@ test "MediaQuery: additional comment placements" {
+ 
+ test "MediaQuery: u32 boundaries on length" {
+     const v = Viewport.default;
+-    // u32 max parses; the viewport (1920) doesn't reach it.
++    // u32 max parses; the viewport doesn't reach it.
+     try testing.expect(!matches("(min-width: 4294967295px)", v));
+     // Beyond u32 max overflows parseInt and fails closed.
+     try testing.expect(!matches("(min-width: 4294967296px)", v));
+@@ -691,7 +697,7 @@ test "MediaQuery: not all is always false" {
+ 
+ test "MediaQuery: not applies to the whole query" {
+     const v = Viewport.default;
+-    // For 1920×1080: (min-width:3000px)=false, (orientation:landscape)=true.
++    // For the default: (min-width:3000px)=false, (orientation:landscape)=true.
+     // Combined feature match is false; `not` flips it to true.
+     try testing.expect(matches("not (min-width: 3000px) and (orientation: landscape)", v));
+     // Both branches true → combined true → `not` flips to false.
+diff --git a/src/browser/tests/css/media_query_list.html b/src/browser/tests/css/media_query_list.html
+index 07ff6e9..8c9fec4 100644
+--- a/src/browser/tests/css/media_query_list.html
++++ b/src/browser/tests/css/media_query_list.html
+@@ -1,4 +1,5 @@
+ <!DOCTYPE html>
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
+ <head>
+   <script src="../testing.js"></script>
+ </head>
+@@ -7,8 +8,8 @@
+ </body>
+ 
+ <!--
+-  The viewport reported by window.innerWidth / innerHeight is currently
+-  hardcoded at 1920×1080. matchMedia evaluates against the same dimensions.
++  The default content viewport is 1100×650 and the screen is 1204×753.
++  matchMedia distinguishes viewport features from device-* screen features.
+ -->
+ 
+ <script id=matchMedia_basic>
+@@ -41,7 +42,7 @@
+ 
+ <script id=matchMedia_orientation>
+ {
+-  // 1920×1080 is landscape.
++  // The default content viewport is landscape.
+   testing.expectEqual(true, window.matchMedia('(orientation: landscape)').matches);
+   testing.expectEqual(false, window.matchMedia('(orientation: portrait)').matches);
+ }
+@@ -57,18 +58,17 @@
+ 
+ <script id=matchMedia_device_width_height>
+ {
+-  // The deprecated device-* features resolve against the same 1920×1080
+-  // viewport as window.screen.width / .height.
++  // The deprecated device-* features resolve against the 1204×753 screen.
+   testing.expectEqual(true,  window.matchMedia('(min-device-width: 1px)').matches);
+-  testing.expectEqual(true,  window.matchMedia('(min-device-width: 1920px)').matches);
+-  testing.expectEqual(false, window.matchMedia('(min-device-width: 1921px)').matches);
+-  testing.expectEqual(true,  window.matchMedia('(max-device-width: 1920px)').matches);
+-  testing.expectEqual(false, window.matchMedia('(max-device-width: 1919px)').matches);
+-  testing.expectEqual(true,  window.matchMedia('(device-width: 1920px)').matches);
++  testing.expectEqual(true,  window.matchMedia('(min-device-width: 1204px)').matches);
++  testing.expectEqual(false, window.matchMedia('(min-device-width: 1205px)').matches);
++  testing.expectEqual(true,  window.matchMedia('(max-device-width: 1204px)').matches);
++  testing.expectEqual(false, window.matchMedia('(max-device-width: 1203px)').matches);
++  testing.expectEqual(true,  window.matchMedia('(device-width: 1204px)').matches);
+ 
+-  testing.expectEqual(true,  window.matchMedia('(min-device-height: 1080px)').matches);
+-  testing.expectEqual(false, window.matchMedia('(min-device-height: 1081px)').matches);
+-  testing.expectEqual(true,  window.matchMedia('(device-height: 1080px)').matches);
++  testing.expectEqual(true,  window.matchMedia('(min-device-height: 753px)').matches);
++  testing.expectEqual(false, window.matchMedia('(min-device-height: 754px)').matches);
++  testing.expectEqual(true,  window.matchMedia('(device-height: 753px)').matches);
+ 
+   // .media round-trips the query as written.
+   const mql = window.matchMedia('(min-device-width: 1px)');
+@@ -122,9 +122,9 @@
+ 
+ <script id=matchMedia_em_units>
+ {
+-  // 1em = 16px. 30em = 480px ≤ 1920px → matches.
++  // 1em = 16px. 30em = 480px ≤ 1100px → matches.
+   testing.expectEqual(true,  window.matchMedia('(min-width: 30em)').matches);
+-  // 121em = 1936px > 1920px → does not match.
++  // 121em = 1936px > 1100px → does not match.
+   testing.expectEqual(false, window.matchMedia('(min-width: 121em)').matches);
+   // u32-overflowing em / rem fails closed instead of panicking.
+   testing.expectEqual(false, window.matchMedia('(min-width: 268435456em)').matches);
+diff --git a/src/browser/tests/window/screen.html b/src/browser/tests/window/screen.html
+index 37f8667..ef8ecdf 100644
+--- a/src/browser/tests/window/screen.html
++++ b/src/browser/tests/window/screen.html
+@@ -1,11 +1,12 @@
+ <!DOCTYPE html>
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
+ <script src="../testing.js"></script>
+ 
+ <script id=screen>
+   let screen = window.screen;
+   if (testing.IS_TEST_RUNNER) {
+-    testing.expectEqual(1920, screen.width);
+-    testing.expectEqual(1080, screen.height);
++    testing.expectEqual(1204, screen.width);
++    testing.expectEqual(753, screen.height);
+   }
+ 
+   let orientation = screen.orientation;
+diff --git a/src/browser/tests/window/stubs.html b/src/browser/tests/window/stubs.html
+index 74c8a94..a3cf0f5 100644
+--- a/src/browser/tests/window/stubs.html
++++ b/src/browser/tests/window/stubs.html
+@@ -1,4 +1,5 @@
+ <!DOCTYPE html>
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
+ <script src="../testing.js"></script>
+ 
+ <script id="alert">
+@@ -29,6 +30,6 @@
+ 
+ <script id="devicePixelRatio">
+   {
+-    testing.expectEqual(1, window.devicePixelRatio);
++    testing.expectEqual(2, window.devicePixelRatio);
+   }
+ </script>
+diff --git a/src/browser/tests/window/visual_viewport.html b/src/browser/tests/window/visual_viewport.html
+index bcde9ac..8cce97c 100644
+--- a/src/browser/tests/window/visual_viewport.html
++++ b/src/browser/tests/window/visual_viewport.html
+@@ -1,4 +1,5 @@
+ <!DOCTYPE html>
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
+ <script src="../testing.js"></script>
+ 
+ <script id=visual_viewport>
+@@ -8,7 +9,7 @@
+   testing.expectEqual(0, vp.offsetTop);
+   testing.expectEqual(0, vp.pageLeft);
+   testing.expectEqual(0, vp.pageTop);
+-  testing.expectEqual(1920, vp.width);
+-  testing.expectEqual(1080, vp.height);
++  testing.expectEqual(1100, vp.width);
++  testing.expectEqual(650, vp.height);
+   testing.expectEqual(1.0, vp.scale);
+ </script>
+diff --git a/src/browser/tests/window/window.html b/src/browser/tests/window/window.html
+index 8347c24..f6b366e 100644
+--- a/src/browser/tests/window/window.html
++++ b/src/browser/tests/window/window.html
+@@ -1,4 +1,5 @@
+ <!DOCTYPE html>
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
+ <script src="../testing.js"></script>
+ <body></body>
+ 
+@@ -8,8 +9,8 @@
+   testing.expectEqual(window, window.self);
+   testing.expectEqual(null, window.opener);
+ 
+-  testing.expectEqual(1080, innerHeight);
+-  testing.expectEqual(1920, innerWidth);
++  testing.expectEqual(650, innerHeight);
++  testing.expectEqual(1100, innerWidth);
+ </script>
+ 
+ <script id=is_secure_context>
+@@ -200,10 +201,10 @@
+ </script>
+ 
+ <script id=screen>
+-  testing.expectEqual(1920, screen.width);
+-  testing.expectEqual(1080, screen.height);
+-  testing.expectEqual(1920, screen.availWidth);
+-  testing.expectEqual(1040, screen.availHeight);
++  testing.expectEqual(1204, screen.width);
++  testing.expectEqual(753, screen.height);
++  testing.expectEqual(1204, screen.availWidth);
++  testing.expectEqual(729, screen.availHeight);
+   testing.expectEqual(24, screen.colorDepth);
+   testing.expectEqual(24, screen.pixelDepth);
+   testing.expectEqual(screen, window.screen);
+diff --git a/src/browser/webapi/Element.zig b/src/browser/webapi/Element.zig
+index 50bfd83..52da6a2 100644
+--- a/src/browser/webapi/Element.zig
++++ b/src/browser/webapi/Element.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -1520,7 +1521,7 @@ pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.S
+     // Root containers span the document, see Document.extent.
+     if (root) {
+         return .{ .value = switch (axis) {
+-            .width => 1920.0,
++            .width => @floatFromInt((self.ownerFrame(frame) orelse frame).page.getViewport().width),
+             .height => if (self.asNode().ownerDocument(frame)) |doc| doc.extent().height else 0.0,
+         } };
+     }
+diff --git a/src/browser/webapi/Screen.zig b/src/browser/webapi/Screen.zig
+index 6b93528..e4bb71e 100644
+--- a/src/browser/webapi/Screen.zig
++++ b/src/browser/webapi/Screen.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -31,6 +32,8 @@ pub fn registerTypes() []const type {
+ 
+ const Screen = @This();
+ 
++const menu_bar_height: u32 = 24;
++
+ pub const Proto = EventTarget;
+ 
+ _proto: *EventTarget,
+@@ -59,6 +62,18 @@ pub fn getHeight(_: *const Screen, frame: *Frame) u32 {
+     return viewport.screen_height orelse viewport.height;
+ }
+ 
++fn getAvailLeft(_: *const Screen) i32 {
++    return 0;
++}
++
++fn getAvailTop(self: *const Screen, frame: *Frame) i32 {
++    return @intCast(@min(menu_bar_height, self.getHeight(frame)));
++}
++
++fn getAvailHeight(self: *const Screen, frame: *Frame) u32 {
++    return self.getHeight(frame) -| menu_bar_height;
++}
++
+ pub const JsApi = struct {
+     pub const bridge = js.Bridge(Screen);
+ 
+@@ -70,8 +85,10 @@ pub const JsApi = struct {
+ 
+     pub const width = bridge.accessor(Screen.getWidth, null, .{});
+     pub const height = bridge.accessor(Screen.getHeight, null, .{});
++    pub const availLeft = bridge.accessor(Screen.getAvailLeft, null, .{});
++    pub const availTop = bridge.accessor(Screen.getAvailTop, null, .{});
+     pub const availWidth = bridge.accessor(Screen.getWidth, null, .{});
+-    pub const availHeight = bridge.property(1040, .{ .template = false });
++    pub const availHeight = bridge.accessor(Screen.getAvailHeight, null, .{});
+     pub const colorDepth = bridge.property(24, .{ .template = false });
+     pub const pixelDepth = bridge.property(24, .{ .template = false });
+     pub const orientation = bridge.accessor(Screen.getOrientation, null, .{});
+diff --git a/src/mcp/tools.zig b/src/mcp/tools.zig
+index b6d9b91..dcc5ecb 100644
+--- a/src/mcp/tools.zig
++++ b/src/mcp/tools.zig
+@@ -1,3 +1,5 @@
++// Brenno Flávio <contato@brennoflavio.com.br>
++
+ const std = @import("std");
+ 
+ const lp = @import("lightpanda");
+@@ -1757,6 +1759,7 @@ test "MCP - screenshot: inline image, file, unsafe path" {
+     var out: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+     const server = try testLoadPage("http://localhost:9582/src/browser/tests/mcp_actions.html", &out.writer);
+     defer server.deinit();
++    server.active_session.session.browser.setViewportOverride(.{ .width = 1920, .height = 1080 });
+ 
+     const inline_call =
+         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"screenshot"}}
+diff --git a/src/server/Server.zig b/src/server/Server.zig
+index 559807c..2c52e3a 100644
+--- a/src/server/Server.zig
++++ b/src/server/Server.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -2705,7 +2706,7 @@ test "server: HTTP window rect" {
+     var c = try createTestClient();
+     defer c.deinit();
+ 
+-    try testing.expectEqual("{\"value\":{\"x\":0,\"y\":0,\"width\":1920,\"height\":1080}}", responseBody(try sessionCommand(&c, "GET", &session_id, "/window/rect", "")));
++    try testing.expectEqual("{\"value\":{\"x\":0,\"y\":0,\"width\":1100,\"height\":650}}", responseBody(try sessionCommand(&c, "GET", &session_id, "/window/rect", "")));
+ 
+     const url = "http://127.0.0.1:9582/src/browser/tests/webdriver/elements.html";
+     try testing.expectEqual("{\"value\":null}", responseBody(try sessionCommand(&c, "POST", &session_id, "/url", "{\"url\":\"" ++ url ++ "\"}")));
+diff --git a/src/server/cdp/domains/emulation.zig b/src/server/cdp/domains/emulation.zig
+index 65fda60..44d03e9 100644
+--- a/src/server/cdp/domains/emulation.zig
++++ b/src/server/cdp/domains/emulation.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -326,7 +327,7 @@ test "cdp.Emulation: setDeviceMetricsOverride screenWidth/screenHeight reach win
+     try testing.expect(v.toBool());
+ 
+     try ctx.processMessage(.{ .id = 3, .method = "Emulation.clearDeviceMetricsOverride" });
+-    v = try ls.local.exec("screen.width === innerWidth && screen.height === innerHeight && devicePixelRatio === 1", null);
++    v = try ls.local.exec("screen.width === 1204 && screen.height === 753 && innerWidth === 1100 && innerHeight === 650 && devicePixelRatio === 2", null);
+     try testing.expect(v.toBool());
+ }
+ 
+@@ -500,8 +501,8 @@ test "cdp.Emulation: setDeviceMetricsOverride and clear" {
+     const page = bc.mainPage().?;
+ 
+     // Defaults to the compile-time viewport before any override.
+-    try testing.expectEqual(1920, page.getViewport().width);
+-    try testing.expectEqual(1080, page.getViewport().height);
++    try testing.expectEqual(1100, page.getViewport().width);
++    try testing.expectEqual(650, page.getViewport().height);
+ 
+     try ctx.processMessage(.{
+         .id = 8,
+@@ -524,8 +525,8 @@ test "cdp.Emulation: setDeviceMetricsOverride and clear" {
+     });
+ 
+     try ctx.expectSentResult(null, .{ .id = 9 });
+-    try testing.expectEqual(1920, page.getViewport().width);
+-    try testing.expectEqual(1080, page.getViewport().height);
++    try testing.expectEqual(1100, page.getViewport().width);
++    try testing.expectEqual(650, page.getViewport().height);
+ }
+ 
+ test "cdp.Emulation: setGeolocationOverride and clear" {
+diff --git a/src/server/cdp/domains/page.zig b/src/server/cdp/domains/page.zig
+index 835a1f1..90ac400 100644
+--- a/src/server/cdp/domains/page.zig
++++ b/src/server/cdp/domains/page.zig
+@@ -3,6 +3,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -1838,7 +1839,7 @@ test "cdp.frame: captureScreenshot" {
+     _ = try ctx.loadBrowserContext(.{ .id = "BID-9", .url = "hi.html", .target_id = "FID-000000000X".* });
+ 
+     // Keep the payload small: the test transport buffers 32KB frames.
+-    try ctx.processMessage(.{ .id = 10, .method = "Emulation.setDeviceMetricsOverride", .params = .{ .width = 400, .height = 300 } });
++    try ctx.processMessage(.{ .id = 10, .method = "Emulation.setDeviceMetricsOverride", .params = .{ .width = 400, .height = 300, .deviceScaleFactor = 1 } });
+ 
+     {
+         // Viewport-sized: the PNG header carries the size.
+@@ -2014,8 +2015,8 @@ test "cdp.frame: getLayoutMetrics" {
+ 
+     _ = try ctx.loadBrowserContext(.{ .id = "BID-9", .url = "hi.html", .target_id = "FID-000000000X".* });
+ 
+-    const width = 1920;
+-    const height = 1080;
++    const width = 1100;
++    const height = 650;
+ 
+     try ctx.processMessage(.{ .id = 12, .method = "Page.getLayoutMetrics" });
+     try ctx.expectSentResult(.{

@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Sun, 1 Nov 2026 21:22:02 -0300
+Subject: [PATCH] http: align navigation header order with Chrome
+
+Emit known headers on non-internal navigation requests in the order
+observed from installed Chrome 154 by fingerprint/. Preserve resolved
+header values and overrides, the relative order of unknown headers,
+and the existing fetch/internal-request emission path. Rebuild only the
+wire header list on every redirect/auth attempt, without mutating the
+request's source-layered header state.
+
+Insert the default navigation Accept-Encoding into that ordered list,
+suppressing curl's earlier generated copy while keeping native automatic
+decoding enabled. Obtain the supported encoding list from pinned curl's
+own allocator-backed helper and release it with curl_free. Do not change
+compression offers or advertise unsupported zstd.
+
+The fingerprint recorder confirms exact cold-navigation ordinary-header
+name order over HTTP/2. Shared headers also follow Chrome's HTTP/1.1
+order; Chrome's pre-existing Connection: keep-alive presence difference
+is outside this patch. Fetch ordering, compression values and persona
+values remain separate work. Temporary diagnostics cover overrides,
+empty values, repeated requests, redirects, authentication retries and
+gzip/deflate/Brotli decoding over HTTP/1.1 and HTTP/2. No new unit tests.
+
+References: fingerprint/README.md; pinned curl 8.22.0 lib/http.c and
+lib/content_encoding.c.
+---
+ src/network/HttpClient.zig | 40 ++++++++++++++++++++++++++++++++++++--
+ src/network/http.zig       |  6 ++++++
+ src/sys/libcurl.zig        |  4 ++++
+ 3 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index 44ee7ee..ae05ea6 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -3690,8 +3690,44 @@ pub const Transfer = struct {
+         // accumulate duplicates.
+         conn.clearHeaders();
+         const arena = self.arena.allocator();
+-        for (self.req_headers.items) |hdr| {
+-            try conn.addHeader(arena, hdr.name, hdr.value);
++        if (!req.internal and req.request_mode == .navigate) {
++            const order = [_][]const u8{
++                "sec-ch-ua",
++                "sec-ch-ua-mobile",
++                "sec-ch-ua-platform",
++                "upgrade-insecure-requests",
++                "user-agent",
++                "accept",
++                "sec-fetch-site",
++                "sec-fetch-mode",
++                "sec-fetch-user",
++                "sec-fetch-dest",
++                "accept-encoding",
++                "accept-language",
++                "priority",
++            };
++            for (order) |name| {
++                // A custom header suppresses curl's earlier automatic emission,
++                // while CURLOPT_ACCEPT_ENCODING still enables native decoding.
++                if (std.ascii.eqlIgnoreCase(name, "accept-encoding") and self.findRequestHeader(name) == null) {
++                    try conn.addDefaultAcceptEncoding(arena);
++                }
++                for (self.req_headers.items) |hdr| {
++                    if (std.ascii.eqlIgnoreCase(hdr.name, name)) {
++                        try conn.addHeader(arena, hdr.name, hdr.value);
++                    }
++                }
++            }
++            headers: for (self.req_headers.items) |hdr| {
++                for (order) |name| {
++                    if (std.ascii.eqlIgnoreCase(hdr.name, name)) continue :headers;
++                }
++                try conn.addHeader(arena, hdr.name, hdr.value);
++            }
++        } else {
++            for (self.req_headers.items) |hdr| {
++                try conn.addHeader(arena, hdr.name, hdr.value);
++            }
+         }
+         if (req.body != null and self.findRequestHeader("content-type") == null) {
+             // Prevent libcurl from always setting application/x-www-form-urlencoded
+diff --git a/src/network/http.zig b/src/network/http.zig
+index 3581e4f..6a6d121 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -385,6 +385,12 @@ pub const Connection = struct {
+         self._header_list = updated;
+     }
+ 
++    pub fn addDefaultAcceptEncoding(self: *Connection, allocator: std.mem.Allocator) !void {
++        const encodings = libcurl.Curl_get_content_encodings() orelse return error.OutOfMemory;
++        defer libcurl.curl_free(encodings);
++        try self.addHeader(allocator, "Accept-Encoding", std.mem.span(encodings));
++    }
++
+     pub fn commitHeaders(self: *const Connection) !void {
+         try libcurl.curl_easy_setopt(self._easy, .http_header, self._header_list);
+     }
+diff --git a/src/sys/libcurl.zig b/src/sys/libcurl.zig
+index 928ac33..b9536cb 100644
+--- a/src/sys/libcurl.zig
++++ b/src/sys/libcurl.zig
+@@ -595,6 +595,10 @@ pub fn curl_version() [*c]const u8 {
+     return c.curl_version();
+ }
+ 
++// Pinned curl's own supported-decoder list, also used by CURLOPT_ACCEPT_ENCODING.
++pub extern fn Curl_get_content_encodings() ?[*:0]u8;
++pub const curl_free = c.curl_free;
++
+ pub fn curl_easy_init() ?*Curl {
+     return c.curl_easy_init();
+ }

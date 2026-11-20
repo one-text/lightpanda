@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lightpanda patch builder <patch-builder@localhost>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs: add no-op patch-stack example
+
+Exercise the downstream patch workflow without changing browser code,
+build configuration, or runtime behavior. Remove this example once real
+patches replace it.
+---
+ DOWNSTREAM.md | 7 +++++++
+ 1 file changed, 7 insertions(+)
+ create mode 100644 DOWNSTREAM.md
+
+diff --git a/DOWNSTREAM.md b/DOWNSTREAM.md
+new file mode 100644
+index 0000000..919a707
+--- /dev/null
++++ b/DOWNSTREAM.md
+@@ -0,0 +1,7 @@
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
++
++# Downstream patch-stack example
++
++This documentation-only file demonstrates the lightpanda-stealth patch stack.
++It does not change browser code, build configuration, or runtime behavior.
++The original upstream submodule stays untouched.

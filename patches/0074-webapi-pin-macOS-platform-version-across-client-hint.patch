@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 5 Nov 2026 00:15:17 -0300
+Subject: [PATCH] webapi: pin macOS platform version across client hints
+
+Pin macOS Tahoe 26.3.2 for MacBook Neo/A18 Pro (https://support.apple.com/en-us/100100). Share JS and quoted HTTP values through Config.HttpHeaders; preserve requested-hint filtering, HTTP opt-in and overrides, native APIs and the reduced legacy UA.
+
+Validation: build passed; 1658/1658 upstream tests passed; benchmark improved 119/130 to 120/130 with four matching scopes and no regressions. Temporary API/HTTP diagnostics passed. Reviewer found no issues.
+---
+ src/Config.zig                         | 2 ++
+ src/browser/webapi/NavigatorUAData.zig | 2 +-
+ src/network/HttpClient.zig             | 2 +-
+ 3 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/Config.zig b/src/Config.zig
+index 50fb365..09b5f48 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -1001,6 +1001,8 @@ pub const HttpHeaders = struct {
+     pub const device_memory_header: [:0]const u8 = std.fmt.comptimePrint("{d}", .{device_memory_gb});
+     pub const ua_platform = "macOS";
+     pub const sec_ch_ua_platform: [:0]const u8 = "\"" ++ ua_platform ++ "\"";
++    pub const ua_platform_version = "26.3.2";
++    pub const sec_ch_ua_platform_version: [:0]const u8 = "\"" ++ ua_platform_version ++ "\"";
+     pub const ua_architecture = "arm";
+     pub const ua_bitness = "64";
+     pub const sec_ch_ua_arch: [:0]const u8 = "\"" ++ ua_architecture ++ "\"";
+diff --git a/src/browser/webapi/NavigatorUAData.zig b/src/browser/webapi/NavigatorUAData.zig
+index 2dacc3a..524dfd9 100644
+--- a/src/browser/webapi/NavigatorUAData.zig
++++ b/src/browser/webapi/NavigatorUAData.zig
+@@ -74,7 +74,7 @@ fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, ex
+         } else if (std.mem.eql(u8, hint, "model")) {
+             _ = try result.set("model", "", .{});
+         } else if (std.mem.eql(u8, hint, "platformVersion")) {
+-            _ = try result.set("platformVersion", "", .{});
++            _ = try result.set("platformVersion", Config.HttpHeaders.ua_platform_version, .{});
+         } else if (std.mem.eql(u8, hint, "uaFullVersion")) {
+             _ = try result.set("uaFullVersion", Config.HttpHeaders.chrome_full_version, .{});
+         } else if (std.mem.eql(u8, hint, "fullVersionList")) {
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index bb1a82a..c1d9836 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -1356,7 +1356,7 @@ fn setClientHintHeaders(transfer: *Transfer) !void {
+     if (hints.origins.get(origin)) |requested| {
+         if (requested.full_version_list) try transfer.setHeader("sec-ch-ua-full-version-list", lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .{});
+         if (requested.model) try transfer.setHeader("sec-ch-ua-model", "\"\"", .{});
+-        if (requested.platform_version) try transfer.setHeader("sec-ch-ua-platform-version", "\"\"", .{});
++        if (requested.platform_version) try transfer.setHeader("sec-ch-ua-platform-version", lp.Config.HttpHeaders.sec_ch_ua_platform_version, .{});
+         if (requested.dpr) {
+             const scale = owner.scope.session().browser.getViewport().scale;
+             // Chrome serializes DPR with six significant digits.

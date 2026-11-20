@@ -1,0 +1,338 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 13 Oct 2026 21:01:51 -0300
+Subject: [PATCH] webapi: spoof Chrome 155 Client Hint brands natively
+
+Pin the branded Chrome identity to 155.0.8059.40, published for macOS
+on October 6, 2026 and matching the embedded V8 15.5 release family.
+Keep the MacBook Neo/A18 Pro/8GB/256GB hardware persona unchanged.
+This patch deliberately does not change the default UA, platform or
+architecture hints, CDP identity, or Client Hint transport opt-in rules.
+
+Use Chromium's seed-155 brand order and GREASE values: Google Chrome,
+Chromium, Not(A:Brand; major versions 155/155/24 and corresponding full
+versions 155.0.8059.40/155.0.8059.40/24.0.0.0. Derive HTTP and JS lists
+from the same definition. Separate low-entropy major versions from
+fullVersionList and select uaFullVersion independently of GREASE order.
+
+Preserve native accessors and operations. Capture the native Object.freeze
+per context before page scripts run to implement the brands FrozenArray
+without trusting mutable page globals. Leave JSON and promise arrays
+mutable. Honor requested high-entropy hints, use the formFactors spelling,
+and remove the empty-object binding shortcut so wrong receivers reject.
+
+Adjust only existing navigator/fetch/XHR expectations; retain fixed Sec-*
+header protection checks and unrelated User-Agent expectations. Temporary
+ignored diagnostics verify native descriptors/receiver checks, freezing and
+intrinsic tampering, exact hint subsets, HTTP parity, worker reuse and
+recreated frame/page contexts. Existing 1658 upstream tests pass.
+
+References:
+https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_086471744.html
+https://chromium.googlesource.com/chromium/src/+/refs/heads/main/components/embedder_support/user_agent_utils.cc
+https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/blink/renderer/core/frame/navigator_ua_data.idl
+https://wicg.github.io/ua-client-hints/
+---
+ src/Config.zig                             |  8 ++-
+ src/browser/js/Context.zig                 |  5 ++
+ src/browser/js/Env.zig                     | 10 ++++
+ src/browser/tests/navigator/navigator.html | 18 +++----
+ src/browser/tests/net/fetch.html           |  4 +-
+ src/browser/tests/net/xhr.html             |  4 +-
+ src/browser/webapi/NavigatorUAData.zig     | 63 ++++++++++++----------
+ 7 files changed, 71 insertions(+), 41 deletions(-)
+
+diff --git a/src/Config.zig b/src/Config.zig
+index 0bb03ab..9c2ce36 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -994,8 +995,13 @@ pub const HttpHeaders = struct {
+     /// Source of truth for client-hints brand data. Both the Sec-Ch-Ua
+     /// HTTP header and navigator.userAgentData.brands derive from this
+     /// list, so the two sides cannot drift.
++    pub const chrome_major_version = "155";
++    pub const chrome_full_version = "155.0.8059.40";
++
+     pub const brands = [_]Brand{
+-        .{ .brand = "Lightpanda", .version = "1", .full_version = lp.build_config.version },
++        .{ .brand = "Google Chrome", .version = chrome_major_version, .full_version = chrome_full_version },
++        .{ .brand = "Chromium", .version = chrome_major_version, .full_version = chrome_full_version },
++        .{ .brand = "Not(A:Brand", .version = "24", .full_version = "24.0.0.0" },
+     };
+ 
+     pub const sec_ch_ua: [:0]const u8 = blk: {
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index 6609b44..c508233 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -59,6 +60,9 @@ microtask_queue: *v8.MicrotaskQueue,
+ // from this, and we can free it when the context is done.
+ handle: v8.Global,
+ 
++// Captured before page scripts can replace Object.freeze.
++object_freeze: v8.Global,
++
+ cpu_profiler: ?*v8.CpuProfiler = null,
+ 
+ heap_profiler: ?*v8.HeapProfiler = null,
+@@ -225,6 +229,7 @@ pub fn deinit(self: *Context) void {
+     // pointer null, v8 drops the job instead.
+     v8.v8__Context__DetachGlobal(entered.handle);
+ 
++    v8.v8__Global__Reset(&self.object_freeze);
+     v8.v8__Global__Reset(&self.handle);
+     env.isolate.notifyContextDisposed();
+     // There can be other tasks associated with this context that we need to
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index a929e47..3afb6f1 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -374,6 +375,14 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+     const origin = try page.getOrCreateOrigin(null);
+     errdefer page.releaseOrigin(origin);
+ 
++    const object_key = isolate.initStringHandle("Object");
++    const freeze_key = isolate.initStringHandle("freeze");
++    const object_constructor = v8.v8__Object__Get(global_obj, v8_context, object_key).?;
++    const freeze = v8.v8__Object__Get(@ptrCast(object_constructor), v8_context, freeze_key).?;
++    var object_freeze: v8.Global = undefined;
++    v8.v8__Global__New(isolate.handle, freeze, &object_freeze);
++    errdefer v8.v8__Global__Reset(&object_freeze);
++
+     const context = try context_arena.create(Context);
+     context.* = .{
+         .env = self,
+@@ -384,6 +393,7 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+         .isolate = isolate,
+         .arena = context_arena,
+         .handle = context_global,
++        .object_freeze = object_freeze,
+         .templates = self.templates,
+         .call_arena = params.call_arena,
+         .local_arena = params.local_arena,
+diff --git a/src/browser/tests/navigator/navigator.html b/src/browser/tests/navigator/navigator.html
+index 0e83f95..6f81195 100644
+--- a/src/browser/tests/navigator/navigator.html
++++ b/src/browser/tests/navigator/navigator.html
+@@ -126,9 +126,9 @@
+   const validUAPlatforms = ['macOS', 'Windows', 'Linux', 'FreeBSD', 'Unknown'];
+   testing.expectEqual(true, validUAPlatforms.includes(navigator.userAgentData.platform));
+ 
+-  testing.expectEqual(1, navigator.userAgentData.brands.length);
+-  testing.expectEqual('Lightpanda', navigator.userAgentData.brands[0].brand);
+-  testing.expectEqual("1.1.0-", navigator.userAgentData.brands[0].version.substring(0,6));
++  testing.expectEqual(3, navigator.userAgentData.brands.length);
++  testing.expectEqual('Google Chrome', navigator.userAgentData.brands[0].brand);
++  testing.expectEqual('155', navigator.userAgentData.brands[0].version);
+ 
+   // Same instance returned on repeated access
+   testing.expectEqual(true, navigator.userAgentData === navigator.userAgentData);
+@@ -137,13 +137,13 @@
+   testing.expectEqual(false, json.mobile);
+   testing.expectEqual(navigator.userAgentData.platform, json.platform);
+   testing.expectEqual(true, Array.isArray(json.brands));
+-  testing.expectEqual('Lightpanda', json.brands[0].brand);
++  testing.expectEqual('Google Chrome', json.brands[0].brand);
+ </script>
+ 
+ <script id=userAgentData_highEntropy type=module>
+   {
+     const state = await testing.async();
+-    const p = navigator.userAgentData.getHighEntropyValues(['architecture', 'platformVersion', 'fullVersionList']);
++    const p = navigator.userAgentData.getHighEntropyValues(['architecture', 'platformVersion', 'fullVersionList', 'uaFullVersion', 'wow64', 'formFactors']);
+     testing.expectTrue(p instanceof Promise);
+     const v = await p;
+     state.resolve();
+@@ -153,11 +153,11 @@
+       testing.expectEqual(navigator.userAgentData.platform, v.platform);
+       testing.expectEqual(true, Array.isArray(v.brands));
+       testing.expectEqual(true, Array.isArray(v.fullVersionList));
+-      testing.expectEqual('Lightpanda', v.fullVersionList[0].brand);
+-      testing.expectEqual('1.1.0-', v.uaFullVersion.substring(0,6));
++      testing.expectEqual('Google Chrome', v.fullVersionList[0].brand);
++      testing.expectEqual('155.0.8059.40', v.uaFullVersion);
+       testing.expectEqual(false, v.wow64);
+-      testing.expectEqual(true, Array.isArray(v.formFactor));
+-      testing.expectEqual('Desktop', v.formFactor[0]);
++      testing.expectEqual(true, Array.isArray(v.formFactors));
++      testing.expectEqual('Desktop', v.formFactors[0]);
+     });
+   }
+ </script>
+diff --git a/src/browser/tests/net/fetch.html b/src/browser/tests/net/fetch.html
+index 61bfda7..826f130 100644
+--- a/src/browser/tests/net/fetch.html
++++ b/src/browser/tests/net/fetch.html
+@@ -1,4 +1,5 @@
+ <!DOCTYPE html>
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
+ <script src="../testing.js"></script>
+ 
+ <script id=fetch_basic type=module>
+@@ -480,8 +481,7 @@
+       testing.expectEqual(undefined, got['cookie']);
+       testing.expectEqual(true, got['user-agent'].includes('Lightpanda'));
+       testing.expectEqual(false, got['user-agent'].includes('Mozilla'));
+-      testing.expectEqual(true, got['sec-ch-ua'].includes('Lightpanda'));
+-      testing.expectEqual(false, got['sec-ch-ua'].includes('Chromium'));
++      testing.expectEqual('"Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"', got['sec-ch-ua']);
+     });
+   }
+ </script>
+diff --git a/src/browser/tests/net/xhr.html b/src/browser/tests/net/xhr.html
+index ab223e0..6def224 100644
+--- a/src/browser/tests/net/xhr.html
++++ b/src/browser/tests/net/xhr.html
+@@ -1,4 +1,5 @@
+ <!DOCTYPE html>
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
+ <script src="../testing.js"></script>
+ 
+ <script id=xhr type=module>
+@@ -632,8 +633,7 @@
+       testing.expectEqual('a, b', got['x-multi']);
+       testing.expectEqual(true, got['user-agent'].includes('Lightpanda'));
+       testing.expectEqual(false, got['user-agent'].includes('Mozilla'));
+-      testing.expectEqual(true, got['sec-ch-ua'].includes('Lightpanda'));
+-      testing.expectEqual(false, got['sec-ch-ua'].includes('Chromium'));
++      testing.expectEqual('"Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"', got['sec-ch-ua']);
+       testing.expectEqual(false, (got['cookie'] ?? '').includes('injected'));
+       testing.expectEqual(undefined, got['proxy-test']);
+       testing.expectEqual(undefined, got['sec-test']);
+diff --git a/src/browser/webapi/NavigatorUAData.zig b/src/browser/webapi/NavigatorUAData.zig
+index 37fce6a..23d6535 100644
+--- a/src/browser/webapi/NavigatorUAData.zig
++++ b/src/browser/webapi/NavigatorUAData.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -16,6 +17,7 @@
+ // You should have received a copy of the GNU Affero General Public License
+ // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ 
++const std = @import("std");
+ const builtin = @import("builtin");
+ 
+ const Config = @import("../../Config.zig");
+@@ -31,8 +33,11 @@ const Brand = struct {
+     version: []const u8,
+ };
+ 
+-fn getBrands(_: *const NavigatorUAData) []const Brand {
+-    return brandList();
++fn getBrands(_: *const NavigatorUAData, exec: *const Execution) !js.Value {
++    const local = exec.js.local.?;
++    const brands = try local.zigValueToJs(brandList(false), .{});
++    const freeze = js.Function{ .local = local, .handle = @ptrCast(js.v8.v8__Global__Get(&exec.js.object_freeze, local.isolate.handle).?) };
++    return freeze.call(js.Value, .{brands});
+ }
+ 
+ fn getMobile(_: *const NavigatorUAData) bool {
+@@ -50,41 +55,46 @@ pub fn toJSON(_: *const NavigatorUAData) struct {
+ } {
+     return .{
+         .mobile = false,
+-        .brands = brandList(),
++        .brands = brandList(false),
+         .platform = uaPlatform(),
+     };
+ }
+ 
+ fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, exec: *const Execution) !js.Promise {
+-    // This should always return `brands` + `mobile` + `platform` and then whatever
+-    // "hints" field is requested (assuming the browser has permission), but it's
+-    // also valid to just return everything.
+-
+-    _ = hints;
+-
+-    const brands = brandList();
+-
+-    return exec.js.local.?.resolvePromise(.{
+-        .brands = brandList(),
+-        .mobile = false,
+-        .platform = uaPlatform(),
+-        .architecture = uaArchitecture(),
+-        .bitness = uaBitness(),
+-        .model = "",
+-        .platformVersion = "",
+-        .uaFullVersion = if (brands.len > 0) brands[0].version else "1.0.0.0",
+-        .fullVersionList = brands,
+-        .wow64 = false,
+-        .formFactor = [_][]const u8{"Desktop"},
+-    });
++    const local = exec.js.local.?;
++    const result = local.newObject();
++    _ = try result.set("brands", brandList(false), .{});
++    _ = try result.set("mobile", false, .{});
++    _ = try result.set("platform", uaPlatform(), .{});
++
++    for (hints) |hint| {
++        if (std.mem.eql(u8, hint, "architecture")) {
++            _ = try result.set("architecture", uaArchitecture(), .{});
++        } else if (std.mem.eql(u8, hint, "bitness")) {
++            _ = try result.set("bitness", uaBitness(), .{});
++        } else if (std.mem.eql(u8, hint, "model")) {
++            _ = try result.set("model", "", .{});
++        } else if (std.mem.eql(u8, hint, "platformVersion")) {
++            _ = try result.set("platformVersion", "", .{});
++        } else if (std.mem.eql(u8, hint, "uaFullVersion")) {
++            _ = try result.set("uaFullVersion", Config.HttpHeaders.chrome_full_version, .{});
++        } else if (std.mem.eql(u8, hint, "fullVersionList")) {
++            _ = try result.set("fullVersionList", brandList(true), .{});
++        } else if (std.mem.eql(u8, hint, "wow64")) {
++            _ = try result.set("wow64", false, .{});
++        } else if (std.mem.eql(u8, hint, "formFactors")) {
++            _ = try result.set("formFactors", [_][]const u8{"Desktop"}, .{});
++        }
++    }
++    return local.resolvePromise(result);
+ }
+ 
+-fn brandList() []const Brand {
++fn brandList(comptime full: bool) []const Brand {
+     const out = comptime blk: {
+         const src = &Config.HttpHeaders.brands;
+         var arr: [src.len]Brand = undefined;
+         for (src, 0..) |b, i| {
+-            arr[i] = .{ .brand = b.brand, .version = b.full_version };
++            arr[i] = .{ .brand = b.brand, .version = if (full) b.full_version else b.version };
+         }
+         const final = arr;
+         break :blk final;
+@@ -124,7 +134,6 @@ pub const JsApi = struct {
+         pub const name = "NavigatorUAData";
+         pub const prototype_chain = bridge.prototypeChain();
+         pub var class_id: bridge.ClassId = undefined;
+-        pub const empty_with_no_proto = true;
+     };
+ 
+     pub const brands = bridge.accessor(NavigatorUAData.getBrands, null, .{});

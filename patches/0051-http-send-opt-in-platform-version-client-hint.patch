@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Sat, 31 Oct 2026 10:59:22 -0300
+Subject: [PATCH] http: send opt-in platform-version client hint
+
+Honor platform-version-only Accept-CH with the quoted-empty JS value. Preserve origin/session eligibility, generated-header recomputation and explicit-header precedence. Keep macOS unpinned and JS/TLS unchanged; add no tests.
+---
+ src/network/HttpClient.zig | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index 885a65c..b8a101d 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -1173,6 +1173,7 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
+ const RequestedHints = struct {
+     full_version_list: bool = false,
+     model: bool = false,
++    platform_version: bool = false,
+     device_memory: bool = false,
+     architecture: bool = false,
+     bitness: bool = false,
+@@ -1189,7 +1190,7 @@ pub const ClientHints = struct {
+     }
+ 
+     fn update(self: *ClientHints, allocator: Allocator, origin: []const u8, requested: RequestedHints) !void {
+-        if (!requested.full_version_list and !requested.model and !requested.device_memory and !requested.architecture and !requested.bitness) {
++        if (!requested.full_version_list and !requested.model and !requested.platform_version and !requested.device_memory and !requested.architecture and !requested.bitness) {
+             if (self.origins.fetchRemove(origin)) |removed| allocator.free(removed.key);
+         } else if (self.origins.getPtr(origin)) |existing| {
+             existing.* = requested;
+@@ -1282,6 +1283,8 @@ const ClientHintList = struct {
+                 requested.full_version_list = true;
+             } else if (std.ascii.eqlIgnoreCase(hint, "sec-ch-ua-model")) {
+                 requested.model = true;
++            } else if (std.ascii.eqlIgnoreCase(hint, "sec-ch-ua-platform-version")) {
++                requested.platform_version = true;
+             } else if (std.ascii.eqlIgnoreCase(hint, "device-memory")) {
+                 requested.device_memory = true;
+             } else if (std.ascii.eqlIgnoreCase(hint, "sec-ch-ua-arch")) {
+@@ -1319,6 +1322,7 @@ fn setClientHintHeaders(transfer: *Transfer) !void {
+         const hdr = transfer.req_headers.items[i];
+         if (hdr.source == .user_agent and (std.ascii.eqlIgnoreCase(hdr.name, "sec-ch-ua-full-version-list") or
+             std.ascii.eqlIgnoreCase(hdr.name, "sec-ch-ua-model") or
++            std.ascii.eqlIgnoreCase(hdr.name, "sec-ch-ua-platform-version") or
+             std.ascii.eqlIgnoreCase(hdr.name, "device-memory") or
+             std.ascii.eqlIgnoreCase(hdr.name, "sec-ch-ua-arch") or
+             std.ascii.eqlIgnoreCase(hdr.name, "sec-ch-ua-bitness")))
+@@ -1348,6 +1352,7 @@ fn setClientHintHeaders(transfer: *Transfer) !void {
+     if (hints.origins.get(origin)) |requested| {
+         if (requested.full_version_list) try transfer.setHeader("Sec-CH-UA-Full-Version-List", lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .{});
+         if (requested.model) try transfer.setHeader("Sec-CH-UA-Model", "\"\"", .{});
++        if (requested.platform_version) try transfer.setHeader("Sec-CH-UA-Platform-Version", "\"\"", .{});
+         if (requested.device_memory) try transfer.setHeader("Device-Memory", lp.Config.HttpHeaders.device_memory_header, .{});
+         if (requested.architecture) try transfer.setHeader("Sec-CH-UA-Arch", lp.Config.HttpHeaders.sec_ch_ua_arch, .{});
+         if (requested.bitness) try transfer.setHeader("Sec-CH-UA-Bitness", lp.Config.HttpHeaders.sec_ch_ua_bitness, .{});

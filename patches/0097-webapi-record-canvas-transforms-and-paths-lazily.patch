@@ -1,0 +1,984 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 19 Nov 2026 02:25:51 -0300
+Subject: [PATCH] webapi: record canvas transforms and paths lazily
+
+Extend the bounded display-list model from0030, not the browser into a
+rendering engine. Both regular and offscreen2D contexts now share affine
+transform composition, reset/get/setTransform, dictionary alias validation,
+state save/restore, transformed rectangles/clears and synthetic glyph output.
+Numeric dictionary members preserve null-to-zero coercion. putImageData and
+getImageData remain independent of the current transform as required.
+
+Record the current path in device coordinates at construction time. Reuse
+SVG's existing bounded curve flattener for quadratic/cubic segments; record
+moves, lines, closures, rectangles and circular arcs. Snapshot path geometry
+when fill/stroke is called so subsequent path edits cannot change history.
+Support nonzero/evenodd fill rules, geometric hit tests, lineWidth/lineCap
+validation and saved state, plus non-mutating strokeRect. Stroke width uses
+the paint-time transform; synthetic path coverage is evaluated only during
+readback/serialization, through the same replay path as PNG output.
+
+Retain axis-aligned transformed replacement pruning so animation clears
+recycle prior commands and owned path snapshots. Reject non-finite inverse
+samples, normalize arc sweeps without overflowing finite angle differences,
+include square caps in conservative bounds, distinguish fill coverage from
+boundary-inclusive hit tests, and handle zero-length round-capped segments.
+
+This is deliberately synthetic pixel output: no GPU, Skia, external rendering
+library, eager framebuffer, real font rasterization, exact antialiasing or
+Chrome/Mac fingerprint hash is introduced. Path2D, clip, full stroke joins,
+dash coverage, gradients/pattern painting and unrelated existing no-op APIs
+remain outside this change. This does not claim complete Canvas2D rendering
+conformance or a remedy for the separate Sephora catalog denial.
+
+A temporary owned main-world fixture covers54 cases for each context type:
+108/108 checks pass in the patched Debug build, Camoufox158 and Chrome154;
+the saved normal0096 binary passes22/108. Checks cover matrix overloads,
+coercion, save/reset, simple transformed pixels, path snapshot/fill/hit-test
+semantics and review-derived numerical/coverage regressions. Matrix checks
+allow1e-6 reference rounding. Stroke checks test semantic coverage rather
+than antialiasing; reference engines differ on zero-length stroke pixels.
+All1658 existing upstream tests pass; none were added or modified.
+
+Reference: https://html.spec.whatwg.org/multipage/canvas.html#2dcontext
+---
+ .../canvas/CanvasRenderingContext2D.zig       |  83 ++++---
+ .../OffscreenCanvasRenderingContext2D.zig     |  83 ++++---
+ src/browser/webapi/canvas/Path.zig            | 138 +++++++++++
+ src/browser/webapi/canvas/Recording.zig       | 106 ++++++++-
+ src/browser/webapi/canvas/context2d.zig       | 215 +++++++++++++++++-
+ src/browser/webapi/canvas/geometry.zig        |  54 +++++
+ src/browser/webapi/svg/PathData.zig           |   4 +-
+ 7 files changed, 575 insertions(+), 108 deletions(-)
+ create mode 100644 src/browser/webapi/canvas/Path.zig
+ create mode 100644 src/browser/webapi/canvas/geometry.zig
+
+diff --git a/src/browser/webapi/canvas/CanvasRenderingContext2D.zig b/src/browser/webapi/canvas/CanvasRenderingContext2D.zig
+index e3f5967..ae95315 100644
+--- a/src/browser/webapi/canvas/CanvasRenderingContext2D.zig
++++ b/src/browser/webapi/canvas/CanvasRenderingContext2D.zig
+@@ -39,6 +39,7 @@ const CanvasRenderingContext2D = @This();
+ _canvas: *Canvas,
+ _state: context2d.State = .{},
+ _recording: context2d.Recording = .{},
++_path: @import("Path.zig") = .{},
+ _saved: std.ArrayList(context2d.State) = .empty,
+ 
+ const painting = context2d.Painting(CanvasRenderingContext2D);
+@@ -119,12 +120,8 @@ fn getLineDash(self: *const CanvasRenderingContext2D) []const f64 {
+ 
+ fn roundRect(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: ?js.Value) void {}
+ pub fn ellipse(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64, _: ?bool) void {}
+-fn isPointInPath(_: *const CanvasRenderingContext2D, _: js.Value, _: ?js.Value, _: ?js.Value, _: ?js.Value) bool {
+-    return false;
+-}
+-fn isPointInStroke(_: *const CanvasRenderingContext2D, _: js.Value, _: ?js.Value, _: ?js.Value) bool {
+-    return false;
+-}
++pub const isPointInPath = painting.isPointInPath;
++pub const isPointInStroke = painting.isPointInStroke;
+ 
+ fn createLinearGradient(_: *const CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, exec: *const Execution) !*CanvasGradient {
+     return CanvasGradient.init(exec);
+@@ -149,26 +146,27 @@ fn createPattern(_: *const CanvasRenderingContext2D, _: js.Value, repetition_: ?
+ 
+ pub const save = painting.save;
+ pub const restore = painting.restore;
+-pub fn scale(_: *CanvasRenderingContext2D, _: f64, _: f64) void {}
+-pub fn rotate(_: *CanvasRenderingContext2D, _: f64) void {}
+-pub fn translate(_: *CanvasRenderingContext2D, _: f64, _: f64) void {}
+-pub fn transform(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+-fn setTransform(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+-fn resetTransform(_: *CanvasRenderingContext2D) void {}
++pub const scale = painting.scale;
++pub const rotate = painting.rotate;
++pub const translate = painting.translate;
++pub const transform = painting.transform;
++pub const setTransform = painting.setTransform;
++pub const resetTransform = painting.resetTransform;
++pub const getTransform = painting.getTransform;
+ const clearRect = painting.clearRect;
+ const fillRect = painting.fillRect;
+-fn strokeRect(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
+-fn beginPath(_: *CanvasRenderingContext2D) void {}
+-fn closePath(_: *CanvasRenderingContext2D) void {}
+-fn moveTo(_: *CanvasRenderingContext2D, _: f64, _: f64) void {}
+-fn lineTo(_: *CanvasRenderingContext2D, _: f64, _: f64) void {}
+-fn quadraticCurveTo(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
+-fn bezierCurveTo(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+-pub fn arc(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: ?bool) void {}
++pub const strokeRect = painting.strokeRect;
++pub const beginPath = painting.beginPath;
++pub const closePath = painting.closePath;
++pub const moveTo = painting.moveTo;
++pub const lineTo = painting.lineTo;
++pub const quadraticCurveTo = painting.quadraticCurveTo;
++pub const bezierCurveTo = painting.bezierCurveTo;
++pub const arc = painting.arc;
+ fn arcTo(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+-pub fn rect(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
+-pub fn fill(_: *CanvasRenderingContext2D) void {}
+-pub fn stroke(_: *CanvasRenderingContext2D) void {}
++pub const rect = painting.rect;
++pub const fill = painting.fill;
++pub const stroke = painting.stroke;
+ pub fn clip(_: *CanvasRenderingContext2D) void {}
+ const fillText = painting.fillText;
+ fn strokeText(_: *CanvasRenderingContext2D, _: []const u8, _: f64, _: f64, _: ?f64) void {}
+@@ -211,8 +209,8 @@ pub const JsApi = struct {
+     pub const globalAlpha = bridge.accessor(painting.getGlobalAlpha, painting.setGlobalAlpha, .{});
+     pub const globalCompositeOperation = bridge.property("source-over", .{ .template = false, .readonly = false });
+     pub const strokeStyle = bridge.accessor(CanvasRenderingContext2D.getStrokeStyle, CanvasRenderingContext2D.setStrokeStyle, .{});
+-    pub const lineWidth = bridge.property(1.0, .{ .template = false, .readonly = false });
+-    pub const lineCap = bridge.property("butt", .{ .template = false, .readonly = false });
++    pub const lineWidth = bridge.accessor(painting.getLineWidth, painting.setLineWidth, .{});
++    pub const lineCap = bridge.accessor(painting.getLineCap, painting.setLineCap, .{});
+     pub const lineJoin = bridge.property("miter", .{ .template = false, .readonly = false });
+     pub const miterLimit = bridge.property(10.0, .{ .template = false, .readonly = false });
+     pub const textAlign = bridge.accessor(painting.getTextAlign, painting.setTextAlign, .{});
+@@ -226,26 +224,27 @@ pub const JsApi = struct {
+     pub const getImageData = bridge.function(CanvasRenderingContext2D.getImageData, .{});
+     pub const save = bridge.function(CanvasRenderingContext2D.save, .{});
+     pub const restore = bridge.function(CanvasRenderingContext2D.restore, .{});
+-    pub const scale = bridge.function(CanvasRenderingContext2D.scale, .{ .noop = true });
+-    pub const rotate = bridge.function(CanvasRenderingContext2D.rotate, .{ .noop = true });
+-    pub const translate = bridge.function(CanvasRenderingContext2D.translate, .{ .noop = true });
+-    pub const transform = bridge.function(CanvasRenderingContext2D.transform, .{ .noop = true });
+-    pub const setTransform = bridge.function(CanvasRenderingContext2D.setTransform, .{ .noop = true });
+-    pub const resetTransform = bridge.function(CanvasRenderingContext2D.resetTransform, .{ .noop = true });
++    pub const scale = bridge.function(CanvasRenderingContext2D.scale, .{});
++    pub const rotate = bridge.function(CanvasRenderingContext2D.rotate, .{});
++    pub const translate = bridge.function(CanvasRenderingContext2D.translate, .{});
++    pub const transform = bridge.function(CanvasRenderingContext2D.transform, .{});
++    pub const setTransform = bridge.function(CanvasRenderingContext2D.setTransform, .{});
++    pub const resetTransform = bridge.function(CanvasRenderingContext2D.resetTransform, .{});
++    pub const getTransform = bridge.function(CanvasRenderingContext2D.getTransform, .{});
+     pub const clearRect = bridge.function(CanvasRenderingContext2D.clearRect, .{});
+     pub const fillRect = bridge.function(CanvasRenderingContext2D.fillRect, .{});
+-    pub const strokeRect = bridge.function(CanvasRenderingContext2D.strokeRect, .{ .noop = true });
+-    pub const beginPath = bridge.function(CanvasRenderingContext2D.beginPath, .{ .noop = true });
+-    pub const closePath = bridge.function(CanvasRenderingContext2D.closePath, .{ .noop = true });
+-    pub const moveTo = bridge.function(CanvasRenderingContext2D.moveTo, .{ .noop = true });
+-    pub const lineTo = bridge.function(CanvasRenderingContext2D.lineTo, .{ .noop = true });
+-    pub const quadraticCurveTo = bridge.function(CanvasRenderingContext2D.quadraticCurveTo, .{ .noop = true });
+-    pub const bezierCurveTo = bridge.function(CanvasRenderingContext2D.bezierCurveTo, .{ .noop = true });
+-    pub const arc = bridge.function(CanvasRenderingContext2D.arc, .{ .noop = true });
++    pub const strokeRect = bridge.function(CanvasRenderingContext2D.strokeRect, .{});
++    pub const beginPath = bridge.function(CanvasRenderingContext2D.beginPath, .{});
++    pub const closePath = bridge.function(CanvasRenderingContext2D.closePath, .{});
++    pub const moveTo = bridge.function(CanvasRenderingContext2D.moveTo, .{});
++    pub const lineTo = bridge.function(CanvasRenderingContext2D.lineTo, .{});
++    pub const quadraticCurveTo = bridge.function(CanvasRenderingContext2D.quadraticCurveTo, .{});
++    pub const bezierCurveTo = bridge.function(CanvasRenderingContext2D.bezierCurveTo, .{});
++    pub const arc = bridge.function(CanvasRenderingContext2D.arc, .{});
+     pub const arcTo = bridge.function(CanvasRenderingContext2D.arcTo, .{ .noop = true });
+-    pub const rect = bridge.function(CanvasRenderingContext2D.rect, .{ .noop = true });
+-    pub const fill = bridge.function(CanvasRenderingContext2D.fill, .{ .noop = true });
+-    pub const stroke = bridge.function(CanvasRenderingContext2D.stroke, .{ .noop = true });
++    pub const rect = bridge.function(CanvasRenderingContext2D.rect, .{});
++    pub const fill = bridge.function(CanvasRenderingContext2D.fill, .{});
++    pub const stroke = bridge.function(CanvasRenderingContext2D.stroke, .{});
+     pub const clip = bridge.function(CanvasRenderingContext2D.clip, .{ .noop = true });
+     pub const fillText = bridge.function(CanvasRenderingContext2D.fillText, .{});
+     pub const strokeText = bridge.function(CanvasRenderingContext2D.strokeText, .{ .noop = true });
+diff --git a/src/browser/webapi/canvas/OffscreenCanvasRenderingContext2D.zig b/src/browser/webapi/canvas/OffscreenCanvasRenderingContext2D.zig
+index c95cea4..8b35b83 100644
+--- a/src/browser/webapi/canvas/OffscreenCanvasRenderingContext2D.zig
++++ b/src/browser/webapi/canvas/OffscreenCanvasRenderingContext2D.zig
+@@ -38,6 +38,7 @@ const OffscreenCanvasRenderingContext2D = @This();
+ _canvas: *OffscreenCanvas,
+ _state: context2d.State = .{},
+ _recording: context2d.Recording = .{},
++_path: @import("Path.zig") = .{},
+ _saved: std.ArrayList(context2d.State) = .empty,
+ 
+ const painting = context2d.Painting(OffscreenCanvasRenderingContext2D);
+@@ -114,12 +115,8 @@ fn getLineDash(self: *const OffscreenCanvasRenderingContext2D) []const f64 {
+ 
+ fn roundRect(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: ?js.Value) void {}
+ pub fn ellipse(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64, _: ?bool) void {}
+-fn isPointInPath(_: *const OffscreenCanvasRenderingContext2D, _: js.Value, _: ?js.Value, _: ?js.Value, _: ?js.Value) bool {
+-    return false;
+-}
+-fn isPointInStroke(_: *const OffscreenCanvasRenderingContext2D, _: js.Value, _: ?js.Value, _: ?js.Value) bool {
+-    return false;
+-}
++pub const isPointInPath = painting.isPointInPath;
++pub const isPointInStroke = painting.isPointInStroke;
+ 
+ fn createLinearGradient(_: *const OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, exec: *const Execution) !*CanvasGradient {
+     return CanvasGradient.init(exec);
+@@ -144,26 +141,27 @@ fn createPattern(_: *const OffscreenCanvasRenderingContext2D, _: js.Value, repet
+ 
+ pub const save = painting.save;
+ pub const restore = painting.restore;
+-pub fn scale(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64) void {}
+-pub fn rotate(_: *OffscreenCanvasRenderingContext2D, _: f64) void {}
+-pub fn translate(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64) void {}
+-pub fn transform(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+-fn setTransform(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+-fn resetTransform(_: *OffscreenCanvasRenderingContext2D) void {}
++pub const scale = painting.scale;
++pub const rotate = painting.rotate;
++pub const translate = painting.translate;
++pub const transform = painting.transform;
++pub const setTransform = painting.setTransform;
++pub const resetTransform = painting.resetTransform;
++pub const getTransform = painting.getTransform;
+ const clearRect = painting.clearRect;
+ const fillRect = painting.fillRect;
+-fn strokeRect(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
+-fn beginPath(_: *OffscreenCanvasRenderingContext2D) void {}
+-fn closePath(_: *OffscreenCanvasRenderingContext2D) void {}
+-fn moveTo(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64) void {}
+-fn lineTo(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64) void {}
+-fn quadraticCurveTo(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
+-fn bezierCurveTo(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+-pub fn arc(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: ?bool) void {}
++pub const strokeRect = painting.strokeRect;
++pub const beginPath = painting.beginPath;
++pub const closePath = painting.closePath;
++pub const moveTo = painting.moveTo;
++pub const lineTo = painting.lineTo;
++pub const quadraticCurveTo = painting.quadraticCurveTo;
++pub const bezierCurveTo = painting.bezierCurveTo;
++pub const arc = painting.arc;
+ fn arcTo(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+-pub fn rect(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
+-pub fn fill(_: *OffscreenCanvasRenderingContext2D) void {}
+-pub fn stroke(_: *OffscreenCanvasRenderingContext2D) void {}
++pub const rect = painting.rect;
++pub const fill = painting.fill;
++pub const stroke = painting.stroke;
+ pub fn clip(_: *OffscreenCanvasRenderingContext2D) void {}
+ const fillText = painting.fillText;
+ fn strokeText(_: *OffscreenCanvasRenderingContext2D, _: []const u8, _: f64, _: f64, _: ?f64) void {}
+@@ -206,8 +204,8 @@ pub const JsApi = struct {
+     pub const globalAlpha = bridge.accessor(painting.getGlobalAlpha, painting.setGlobalAlpha, .{});
+     pub const globalCompositeOperation = bridge.property("source-over", .{ .template = false, .readonly = false });
+     pub const strokeStyle = bridge.accessor(OffscreenCanvasRenderingContext2D.getStrokeStyle, OffscreenCanvasRenderingContext2D.setStrokeStyle, .{});
+-    pub const lineWidth = bridge.property(1.0, .{ .template = false, .readonly = false });
+-    pub const lineCap = bridge.property("butt", .{ .template = false, .readonly = false });
++    pub const lineWidth = bridge.accessor(painting.getLineWidth, painting.setLineWidth, .{});
++    pub const lineCap = bridge.accessor(painting.getLineCap, painting.setLineCap, .{});
+     pub const lineJoin = bridge.property("miter", .{ .template = false, .readonly = false });
+     pub const miterLimit = bridge.property(10.0, .{ .template = false, .readonly = false });
+     pub const textAlign = bridge.accessor(painting.getTextAlign, painting.setTextAlign, .{});
+@@ -220,26 +218,27 @@ pub const JsApi = struct {
+     pub const getImageData = bridge.function(OffscreenCanvasRenderingContext2D.getImageData, .{});
+     pub const save = bridge.function(OffscreenCanvasRenderingContext2D.save, .{});
+     pub const restore = bridge.function(OffscreenCanvasRenderingContext2D.restore, .{});
+-    pub const scale = bridge.function(OffscreenCanvasRenderingContext2D.scale, .{ .noop = true });
+-    pub const rotate = bridge.function(OffscreenCanvasRenderingContext2D.rotate, .{ .noop = true });
+-    pub const translate = bridge.function(OffscreenCanvasRenderingContext2D.translate, .{ .noop = true });
+-    pub const transform = bridge.function(OffscreenCanvasRenderingContext2D.transform, .{ .noop = true });
+-    pub const setTransform = bridge.function(OffscreenCanvasRenderingContext2D.setTransform, .{ .noop = true });
+-    pub const resetTransform = bridge.function(OffscreenCanvasRenderingContext2D.resetTransform, .{ .noop = true });
++    pub const scale = bridge.function(OffscreenCanvasRenderingContext2D.scale, .{});
++    pub const rotate = bridge.function(OffscreenCanvasRenderingContext2D.rotate, .{});
++    pub const translate = bridge.function(OffscreenCanvasRenderingContext2D.translate, .{});
++    pub const transform = bridge.function(OffscreenCanvasRenderingContext2D.transform, .{});
++    pub const setTransform = bridge.function(OffscreenCanvasRenderingContext2D.setTransform, .{});
++    pub const resetTransform = bridge.function(OffscreenCanvasRenderingContext2D.resetTransform, .{});
++    pub const getTransform = bridge.function(OffscreenCanvasRenderingContext2D.getTransform, .{});
+     pub const clearRect = bridge.function(OffscreenCanvasRenderingContext2D.clearRect, .{});
+     pub const fillRect = bridge.function(OffscreenCanvasRenderingContext2D.fillRect, .{});
+-    pub const strokeRect = bridge.function(OffscreenCanvasRenderingContext2D.strokeRect, .{ .noop = true });
+-    pub const beginPath = bridge.function(OffscreenCanvasRenderingContext2D.beginPath, .{ .noop = true });
+-    pub const closePath = bridge.function(OffscreenCanvasRenderingContext2D.closePath, .{ .noop = true });
+-    pub const moveTo = bridge.function(OffscreenCanvasRenderingContext2D.moveTo, .{ .noop = true });
+-    pub const lineTo = bridge.function(OffscreenCanvasRenderingContext2D.lineTo, .{ .noop = true });
+-    pub const quadraticCurveTo = bridge.function(OffscreenCanvasRenderingContext2D.quadraticCurveTo, .{ .noop = true });
+-    pub const bezierCurveTo = bridge.function(OffscreenCanvasRenderingContext2D.bezierCurveTo, .{ .noop = true });
+-    pub const arc = bridge.function(OffscreenCanvasRenderingContext2D.arc, .{ .noop = true });
++    pub const strokeRect = bridge.function(OffscreenCanvasRenderingContext2D.strokeRect, .{});
++    pub const beginPath = bridge.function(OffscreenCanvasRenderingContext2D.beginPath, .{});
++    pub const closePath = bridge.function(OffscreenCanvasRenderingContext2D.closePath, .{});
++    pub const moveTo = bridge.function(OffscreenCanvasRenderingContext2D.moveTo, .{});
++    pub const lineTo = bridge.function(OffscreenCanvasRenderingContext2D.lineTo, .{});
++    pub const quadraticCurveTo = bridge.function(OffscreenCanvasRenderingContext2D.quadraticCurveTo, .{});
++    pub const bezierCurveTo = bridge.function(OffscreenCanvasRenderingContext2D.bezierCurveTo, .{});
++    pub const arc = bridge.function(OffscreenCanvasRenderingContext2D.arc, .{});
+     pub const arcTo = bridge.function(OffscreenCanvasRenderingContext2D.arcTo, .{ .noop = true });
+-    pub const rect = bridge.function(OffscreenCanvasRenderingContext2D.rect, .{ .noop = true });
+-    pub const fill = bridge.function(OffscreenCanvasRenderingContext2D.fill, .{ .noop = true });
+-    pub const stroke = bridge.function(OffscreenCanvasRenderingContext2D.stroke, .{ .noop = true });
++    pub const rect = bridge.function(OffscreenCanvasRenderingContext2D.rect, .{});
++    pub const fill = bridge.function(OffscreenCanvasRenderingContext2D.fill, .{});
++    pub const stroke = bridge.function(OffscreenCanvasRenderingContext2D.stroke, .{});
+     pub const clip = bridge.function(OffscreenCanvasRenderingContext2D.clip, .{ .noop = true });
+     pub const fillText = bridge.function(OffscreenCanvasRenderingContext2D.fillText, .{});
+     pub const strokeText = bridge.function(OffscreenCanvasRenderingContext2D.strokeText, .{ .noop = true });
+diff --git a/src/browser/webapi/canvas/Path.zig b/src/browser/webapi/canvas/Path.zig
+new file mode 100644
+index 0000000..5ec8466
+--- /dev/null
++++ b/src/browser/webapi/canvas/Path.zig
+@@ -0,0 +1,138 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++//! Geometry for the current path; no pixels are allocated while drawing.
++const std = @import("std");
++const svg = @import("../svg/PathData.zig");
++const geometry = @import("geometry.zig");
++const Allocator = std.mem.Allocator;
++pub const Point = geometry.Point;
++pub const Rule = enum { nonzero, evenodd };
++pub const Cap = enum { butt, round, square };
++pub const Vertex = struct { point: Point, move: bool = false };
++const Path = @This();
++
++vertices: std.ArrayList(Vertex) = .empty,
++current: ?Point = null,
++start: ?Point = null,
++
++pub fn reset(self: *Path) void {
++    self.vertices.clearRetainingCapacity();
++    self.current = null;
++    self.start = null;
++}
++
++pub fn move(self: *Path, point: Point, allocator: Allocator) !void {
++    if (!finite(point)) return;
++    // Repeated moveTo replaces an empty subpath rather than growing history.
++    if (self.vertices.items.len > 0 and self.vertices.items[self.vertices.items.len - 1].move) {
++        self.vertices.items[self.vertices.items.len - 1].point = point;
++    } else try self.vertices.append(allocator, .{ .point = point, .move = true });
++    self.current = point;
++    self.start = point;
++}
++
++pub fn line(self: *Path, point: Point, allocator: Allocator) !void {
++    if (!finite(point)) return;
++    if (self.current == null) return self.move(point, allocator);
++    try self.vertices.append(allocator, .{ .point = point });
++    self.current = point;
++}
++
++pub fn close(self: *Path, allocator: Allocator) !void {
++    const first = self.start orelse return;
++    if (self.vertices.items[self.vertices.items.len - 1].move) return;
++    try self.line(first, allocator);
++    try self.move(first, allocator);
++}
++
++pub fn curve(self: *Path, segment: svg.Segment, allocator: Allocator, scratch: Allocator) !void {
++    var points: std.ArrayList(Point) = .empty;
++    defer points.deinit(scratch);
++    try svg.flatten(segment, &points, scratch);
++    for (points.items[1..]) |point| try self.line(point, allocator);
++}
++
++fn finite(point: Point) bool {
++    return std.math.isFinite(point.x) and std.math.isFinite(point.y);
++}
++
++fn cross(a: Point, b: Point, p: Point) f64 {
++    return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
++}
++
++fn crossing(a: Point, b: Point, p: Point) i32 {
++    if (a.y <= p.y and b.y > p.y and cross(a, b, p) > 0) return 1;
++    if (a.y > p.y and b.y <= p.y and cross(a, b, p) < 0) return -1;
++    return 0;
++}
++
++fn onSegment(a: Point, b: Point, p: Point) bool {
++    return (a.x != b.x or a.y != b.y) and cross(a, b, p) == 0 and p.x >= @min(a.x, b.x) and p.x <= @max(a.x, b.x) and p.y >= @min(a.y, b.y) and p.y <= @max(a.y, b.y);
++}
++
++pub fn contains(vertices: []const Vertex, point: Point, rule: Rule, include_boundary: bool) bool {
++    if (!finite(point)) return false;
++    var winding: i64 = 0;
++    var start: ?Point = null;
++    var previous: Point = undefined;
++    for (vertices) |vertex| {
++        if (vertex.move) {
++            if (start) |first| {
++                if (include_boundary and onSegment(previous, first, point)) return true;
++                winding += crossing(previous, first, point);
++            }
++            start = vertex.point;
++        } else {
++            if (include_boundary and onSegment(previous, vertex.point, point)) return true;
++            winding += crossing(previous, vertex.point, point);
++        }
++        previous = vertex.point;
++    }
++    if (start) |first| {
++        if (include_boundary and onSegment(previous, first, point)) return true;
++        winding += crossing(previous, first, point);
++    }
++    return if (rule == .evenodd) @mod(winding, 2) != 0 else winding != 0;
++}
++
++pub fn inStroke(vertices: []const Vertex, point: Point, radius: f64, cap: Cap) bool {
++    if (!finite(point) or !(radius > 0)) return false;
++    var previous: Point = undefined;
++    for (vertices) |vertex| {
++        defer previous = vertex.point;
++        if (vertex.move) continue;
++        const dx = vertex.point.x - previous.x;
++        const dy = vertex.point.y - previous.y;
++        const length_squared = dx * dx + dy * dy;
++        if (length_squared == 0) {
++            const x = point.x - previous.x;
++            const y = point.y - previous.y;
++            if (cap == .round and x * x + y * y <= radius * radius) return true;
++            continue;
++        }
++        const t = ((point.x - previous.x) * dx + (point.y - previous.y) * dy) / length_squared;
++        if (cap == .butt and (t < 0 or t > 1)) continue;
++        const extension = radius / @sqrt(length_squared);
++        if (cap == .square and (t < -extension or t > 1 + extension)) continue;
++        const projected = if (cap == .round) std.math.clamp(t, 0, 1) else t;
++        const x = point.x - previous.x - projected * dx;
++        const y = point.y - previous.y - projected * dy;
++        if (x * x + y * y <= radius * radius) return true;
++    }
++    return false;
++}
+diff --git a/src/browser/webapi/canvas/Recording.zig b/src/browser/webapi/canvas/Recording.zig
+index d58403d..8b276a4 100644
+--- a/src/browser/webapi/canvas/Recording.zig
++++ b/src/browser/webapi/canvas/Recording.zig
+@@ -23,26 +23,37 @@ const Execution = @import("../../js/js.zig").Execution;
+ const ImageData = @import("../ImageData.zig");
+ const Allocator = std.mem.Allocator;
+ const Recording = @This();
++const geometry = @import("geometry.zig");
++const Path = @import("Path.zig");
++pub const Stroke = struct { matrix: geometry.Matrix, radius: f64, cap: Path.Cap };
++const PathPaint = struct { vertices: []const Path.Vertex, color: RGBA, rule: Path.Rule, stroke: ?Stroke, inverse: geometry.Matrix };
+ 
+ allocator: ?Allocator = null,
+ commands: std.ArrayList(Command) = .empty,
+ 
+ pub const Bounds = struct { left: u32, top: u32, right: u32, bottom: u32 };
+-pub const Glyph = struct { x: f64, y: f64, width: f64, height: f64, codepoint: u21, color: RGBA };
++pub const Glyph = struct { x: f64, y: f64, width: f64, height: f64, codepoint: u21, color: RGBA, matrix: geometry.Matrix = .{} };
++const Rectangle = struct { inverse: geometry.Matrix, left: f64, top: f64, right: f64, bottom: f64, color: ?RGBA };
+ const Command = struct {
+     bounds: Bounds,
+-    paint: union(enum) { fill: RGBA, clear, glyph: Glyph, pixels: []const u8 },
++    paint: union(enum) { fill: RGBA, clear, glyph: Glyph, rectangle: Rectangle, path: PathPaint, pixels: []const u8 },
+ };
+ 
+ pub fn hasBitmap(width: u32, height: u32) bool {
+     return width > 0 and height > 0 and @as(u64, width) * height <= 16384 * 16384;
+ }
+ 
++fn release(command: Command, allocator: Allocator) void {
++    switch (command.paint) {
++        .pixels => |pixels| allocator.free(pixels),
++        .path => |shape| allocator.free(shape.vertices),
++        else => {},
++    }
++}
++
+ pub fn reset(self: *Recording) void {
+     const allocator = self.allocator orelse return;
+-    for (self.commands.items) |command| {
+-        if (command.paint == .pixels) allocator.free(command.paint.pixels);
+-    }
++    for (self.commands.items) |command| release(command, allocator);
+     // Reuse display-list storage across animation frames, without retaining pixels.
+     self.commands.clearRetainingCapacity();
+ }
+@@ -55,7 +66,7 @@ fn discardCovered(self: *Recording, area: Bounds) void {
+     for (self.commands.items) |command| {
+         const b = command.bounds;
+         if (area.left <= b.left and area.top <= b.top and area.right >= b.right and area.bottom >= b.bottom) {
+-            if (command.paint == .pixels) allocator.free(command.paint.pixels);
++            release(command, allocator);
+         } else {
+             self.commands.items[kept] = command;
+             kept += 1;
+@@ -90,12 +101,58 @@ pub fn rectangle(self: *Recording, area: Bounds, color: ?RGBA, width: u32, heigh
+     try self.append(.{ .bounds = area, .paint = if (color) |c| .{ .fill = c } else .clear }, exec);
+ }
+ 
++pub fn transformedRectangle(self: *Recording, x: f64, y: f64, w: f64, h: f64, matrix: geometry.Matrix, color: ?RGBA, width: u32, height: u32, exec: *Execution) !void {
++    if (matrix.b == 0 and matrix.c == 0) {
++        return self.rectangle(bounds(matrix.a * x + matrix.e, matrix.d * y + matrix.f, matrix.a * w, matrix.d * h, width, height) orelse return, color, width, height, exec);
++    }
++    if (color) |c| if (c.a == 0) return;
++    const inverse = geometry.inverse(matrix) orelse return;
++    const extent = geometry.rectangle(matrix, x, y, w, h) orelse return;
++    const area = bounds(extent.min_x, extent.min_y, extent.width(), extent.height(), width, height) orelse return;
++    try self.append(.{ .bounds = area, .paint = .{ .rectangle = .{
++        .inverse = inverse,
++        .left = @min(x, x + w),
++        .top = @min(y, y + h),
++        .right = @max(x, x + w),
++        .bottom = @max(y, y + h),
++        .color = color,
++    } } }, exec);
++}
++
+ pub fn glyph(self: *Recording, shape: Glyph, width: u32, height: u32, exec: *Execution) !void {
+     if (shape.color.a == 0 or shape.width <= 0 or shape.height <= 0) return;
+-    const area = bounds(shape.x, shape.y, shape.width, shape.height, width, height) orelse return;
++    _ = geometry.inverse(shape.matrix) orelse return;
++    const extent = geometry.rectangle(shape.matrix, shape.x, shape.y, shape.width, shape.height) orelse return;
++    const area = bounds(extent.min_x, extent.min_y, extent.width(), extent.height(), width, height) orelse return;
+     try self.append(.{ .bounds = area, .paint = .{ .glyph = shape } }, exec);
+ }
+ 
++pub fn path(self: *Recording, vertices: []const Path.Vertex, color: RGBA, rule: Path.Rule, stroke: ?Stroke, width: u32, height: u32, exec: *Execution) !void {
++    if (color.a == 0 or vertices.len == 0) return;
++    var extent: geometry.Bounds = .{};
++    for (vertices) |vertex| extent.include(vertex.point);
++    var inverse: geometry.Matrix = .{};
++    if (stroke) |s| {
++        inverse = geometry.inverse(s.matrix) orelse return;
++        const cap_scale: f64 = if (s.cap == .square) @sqrt(@as(f64, 2)) else 1;
++        const dx = s.radius * cap_scale * (@abs(s.matrix.a) + @abs(s.matrix.c));
++        const dy = s.radius * cap_scale * (@abs(s.matrix.b) + @abs(s.matrix.d));
++        extent.min_x -= dx;
++        extent.max_x += dx;
++        extent.min_y -= dy;
++        extent.max_y += dy;
++    }
++    const margin: f64 = if (stroke != null) 0.5 else 0;
++    const area = bounds(extent.min_x - margin, extent.min_y - margin, extent.width() + margin * 2, extent.height() + margin * 2, width, height) orelse return;
++    const allocator = self.allocator orelse exec._factory.storageAllocator();
++    const snapshot = try allocator.dupe(Path.Vertex, vertices);
++    errdefer allocator.free(snapshot);
++    if (stroke != null) for (snapshot) |*vertex| {
++        vertex.point = inverse.apply(vertex.point);
++    };
++    try self.append(.{ .bounds = area, .paint = .{ .path = .{ .vertices = snapshot, .color = color, .rule = rule, .stroke = stroke, .inverse = inverse } } }, exec);
++}
++
+ /// Copy only the visible dirty rectangle now; subsequent ImageData writes
+ /// must not change a recorded putImageData operation.
+ pub fn put(self: *Recording, image: *ImageData, dx: f64, dy: f64, dirty_x: ?f64, dirty_y: ?f64, dirty_w: ?f64, dirty_h: ?f64, width: u32, height: u32, exec: *Execution) !void {
+@@ -160,14 +217,39 @@ pub fn readSpan(self: *const Recording, sx: i64, sy: i64, destination: []u8, wid
+                 var i: usize = 0;
+                 while (i < span.len) : (i += 4) blend(span[i..][0..4], c);
+             },
++            .path => |p| {
++                var x = left;
++                while (x < right) : (x += 1) {
++                    const point = geometry.Point{ .x = @as(f64, @floatFromInt(x)) + 0.5, .y = @as(f64, @floatFromInt(sy)) + 0.5 };
++                    const covered = if (p.stroke) |s| Path.inStroke(p.vertices, p.inverse.apply(point), s.radius, s.cap) else Path.contains(p.vertices, point, p.rule, false);
++                    if (covered) {
++                        const i: usize = @intCast((x - left) * 4);
++                        blend(span[i..][0..4], p.color);
++                    }
++                }
++            },
++            .rectangle => |r| {
++                var x = left;
++                while (x < right) : (x += 1) {
++                    const point = r.inverse.apply(.{ .x = @as(f64, @floatFromInt(x)) + 0.5, .y = @as(f64, @floatFromInt(sy)) + 0.5 });
++                    if (!std.math.isFinite(point.x) or !std.math.isFinite(point.y)) continue;
++                    if (point.x < r.left or point.x >= r.right or point.y < r.top or point.y >= r.bottom) continue;
++                    const i: usize = @intCast((x - left) * 4);
++                    if (r.color) |c| blend(span[i..][0..4], c) else @memset(span[i..][0..4], 0);
++                }
++            },
+             .glyph => |g| {
+-                const row: u32 = @intFromFloat(@floor((@as(f64, @floatFromInt(sy)) + 0.5 - g.y) * 7 / g.height));
+-                if (row >= 7) continue;
+-                const mask = (@as(u32, g.codepoint) *% @as(u32, 0x45d9f3b)) ^ (row *% @as(u32, 0x9e3779b9));
++                const inverse = geometry.inverse(g.matrix) orelse continue;
+                 var x = left;
+                 while (x < right) : (x += 1) {
+-                    const column: u32 = @intFromFloat(@floor((@as(f64, @floatFromInt(x)) + 0.5 - g.x) * 5 / g.width));
+-                    if (column < 5 and (mask >> @as(u5, @intCast(column))) & 1 != 0) {
++                    const point = inverse.apply(.{ .x = @as(f64, @floatFromInt(x)) + 0.5, .y = @as(f64, @floatFromInt(sy)) + 0.5 });
++                    if (!std.math.isFinite(point.x) or !std.math.isFinite(point.y)) continue;
++                    if (point.x < g.x or point.x >= g.x + g.width or point.y < g.y or point.y >= g.y + g.height) continue;
++                    const row: u32 = @intFromFloat(@floor((point.y - g.y) * 7 / g.height));
++                    const column: u32 = @intFromFloat(@floor((point.x - g.x) * 5 / g.width));
++                    if (row >= 7 or column >= 5) continue;
++                    const mask = (@as(u32, g.codepoint) *% @as(u32, 0x45d9f3b)) ^ (row *% @as(u32, 0x9e3779b9));
++                    if ((mask >> @as(u5, @intCast(column))) & 1 != 0) {
+                         const i: usize = @intCast((x - left) * 4);
+                         blend(span[i..][0..4], g.color);
+                     }
+diff --git a/src/browser/webapi/canvas/context2d.zig b/src/browser/webapi/canvas/context2d.zig
+index a4e34e2..7c46bab 100644
+--- a/src/browser/webapi/canvas/context2d.zig
++++ b/src/browser/webapi/canvas/context2d.zig
+@@ -29,6 +29,11 @@ const CanvasGradient = @import("CanvasGradient.zig");
+ const CanvasPattern = @import("CanvasPattern.zig");
+ 
+ const Execution = js.Execution;
++const geometry = @import("geometry.zig");
++const Path = @import("Path.zig");
++const DOMMatrix = @import("../DOMMatrix.zig");
++const MatrixInit = @import("../svg/Transform.zig").DOMMatrix2DInit;
++const MatrixReadOnly = @import("../DOMMatrixReadOnly.zig");
+ pub const Recording = @import("Recording.zig");
+ 
+ const default_font = "10px sans-serif";
+@@ -70,6 +75,9 @@ const TextAlign = enum { start, end, left, right, center };
+ const TextBaseline = enum { top, hanging, middle, alphabetic, ideographic, bottom };
+ 
+ pub const State = struct {
++    transform: geometry.Matrix = .{},
++    line_width: f64 = 1,
++    line_cap: Path.Cap = .butt,
+     global_alpha: f64 = 1,
+     text_align: TextAlign = .start,
+     text_baseline: TextBaseline = .alphabetic,
+@@ -165,11 +173,12 @@ pub const State = struct {
+ };
+ 
+ /// The regular and offscreen contexts share one deliberately bounded painter.
+-/// Transforms, paths, gradients and actual font rasterization remain unsupported.
++/// Output is synthesized lazily; this is not a browser rendering engine.
+ pub fn Painting(comptime Context: type) type {
+     return struct {
+         pub fn reset(self: *Context) void {
+             self._recording.reset();
++            self._path.reset();
+             self._state = .{};
+             self._saved.clearRetainingCapacity();
+         }
+@@ -182,6 +191,194 @@ pub fn Painting(comptime Context: type) type {
+             self._state = self._saved.pop() orelse return;
+         }
+ 
++        pub fn scale(self: *Context, x: f64, y: f64) void {
++            concatenate(self, .{ .a = x, .d = y });
++        }
++
++        pub fn rotate(self: *Context, angle: f64) void {
++            concatenate(self, .{ .a = @cos(angle), .b = @sin(angle), .c = -@sin(angle), .d = @cos(angle) });
++        }
++
++        pub fn translate(self: *Context, x: f64, y: f64) void {
++            concatenate(self, .{ .e = x, .f = y });
++        }
++
++        pub fn transform(self: *Context, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) void {
++            concatenate(self, .{ .a = a, .b = b, .c = c, .d = d, .e = e, .f = f });
++        }
++
++        fn concatenate(self: *Context, matrix: geometry.Matrix) void {
++            if (geometry.finite(matrix)) self._state.transform = self._state.transform.multiply(matrix);
++        }
++
++        pub fn resetTransform(self: *Context) void {
++            self._state.transform = .{};
++        }
++
++        pub fn setTransform(self: *Context, args: []const js.Value) !void {
++            var matrix: geometry.Matrix = .{};
++            if (args.len >= 6) {
++                inline for (std.meta.fields(geometry.Matrix), 0..) |field, i| {
++                    @field(matrix, field.name) = try args[i].toF64();
++                }
++            } else if (args.len > 1) {
++                return error.TypeError;
++            } else if (args.len == 1 and !args[0].isNullOrUndefined()) {
++                if (!args[0].isObject()) return error.TypeError;
++                const object = args[0].toObject();
++                var dictionary: MatrixReadOnly.DOMMatrixInit = .{};
++                inline for (std.meta.fields(MatrixInit)) |field| {
++                    const value = try object.get(field.name);
++                    if (!value.isUndefined()) @field(dictionary, field.name) = try value.toF64();
++                }
++                const parsed = try MatrixReadOnly.fixupDict(dictionary);
++                matrix = .{ .a = parsed.m[0], .b = parsed.m[1], .c = parsed.m[4], .d = parsed.m[5], .e = parsed.m[12], .f = parsed.m[13] };
++            }
++            if (geometry.finite(matrix)) self._state.transform = matrix;
++        }
++
++        pub fn getTransform(self: *const Context, exec: *Execution) !*DOMMatrix {
++            const m = self._state.transform;
++            return DOMMatrix.create(.{ m.a, m.b, 0, 0, m.c, m.d, 0, 0, 0, 0, 1, 0, m.e, m.f, 0, 1 }, true, exec.page);
++        }
++
++        pub fn beginPath(self: *Context) void {
++            self._path.reset();
++        }
++
++        pub fn closePath(self: *Context, exec: *Execution) !void {
++            try self._path.close(exec._factory.storageAllocator());
++        }
++
++        pub fn moveTo(self: *Context, x: f64, y: f64, exec: *Execution) !void {
++            if (!valid(.{ x, y })) return;
++            try self._path.move(self._state.transform.apply(.{ .x = x, .y = y }), exec._factory.storageAllocator());
++        }
++
++        pub fn lineTo(self: *Context, x: f64, y: f64, exec: *Execution) !void {
++            if (!valid(.{ x, y })) return;
++            try self._path.line(self._state.transform.apply(.{ .x = x, .y = y }), exec._factory.storageAllocator());
++        }
++
++        pub fn quadraticCurveTo(self: *Context, cx: f64, cy: f64, x: f64, y: f64, exec: *Execution) !void {
++            if (!valid(.{ cx, cy, x, y })) return;
++            const matrix = self._state.transform;
++            const control = matrix.apply(.{ .x = cx, .y = cy });
++            if (self._path.current == null) try self._path.move(control, exec._factory.storageAllocator());
++            const start = self._path.current orelse return;
++            try self._path.curve(.{ .quadratic = .{ .start = start, .control = control, .end = matrix.apply(.{ .x = x, .y = y }) } }, exec._factory.storageAllocator(), exec.local_arena);
++        }
++
++        pub fn bezierCurveTo(self: *Context, cx1: f64, cy1: f64, cx2: f64, cy2: f64, x: f64, y: f64, exec: *Execution) !void {
++            if (!valid(.{ cx1, cy1, cx2, cy2, x, y })) return;
++            const matrix = self._state.transform;
++            const control = matrix.apply(.{ .x = cx1, .y = cy1 });
++            if (self._path.current == null) try self._path.move(control, exec._factory.storageAllocator());
++            const start = self._path.current orelse return;
++            try self._path.curve(.{ .cubic = .{ .start = start, .control1 = control, .control2 = matrix.apply(.{ .x = cx2, .y = cy2 }), .end = matrix.apply(.{ .x = x, .y = y }) } }, exec._factory.storageAllocator(), exec.local_arena);
++        }
++
++        pub fn arc(self: *Context, x: f64, y: f64, radius: f64, start: f64, end: f64, anticlockwise: ?bool, exec: *Execution) !void {
++            if (!valid(.{ x, y, radius, start, end })) return;
++            if (radius < 0) return error.IndexSizeError;
++            const tau = 2 * std.math.pi;
++            const ccw = anticlockwise orelse false;
++            var delta = end - start;
++            if (!ccw and delta >= tau) delta = tau else if (ccw and -delta >= tau) delta = -tau else {
++                if (!std.math.isFinite(delta)) delta = @mod(end, tau) - @mod(start, tau);
++                delta = @mod(delta, tau);
++                if (ccw and delta != 0) delta -= tau;
++            }
++            const angle = @mod(start, tau);
++            try lineTo(self, x + radius * @cos(angle), y + radius * @sin(angle), exec);
++            if (radius == 0 or delta == 0) return;
++            const steps: usize = @intFromFloat(@ceil(@abs(delta) / (std.math.pi / 2.0)));
++            const step = delta / @as(f64, @floatFromInt(steps));
++            const k = 4.0 / 3.0 * @tan(step / 4);
++            for (0..steps) |i| {
++                const a = angle + @as(f64, @floatFromInt(i)) * step;
++                const b = a + step;
++                try bezierCurveTo(self, x + radius * (@cos(a) - k * @sin(a)), y + radius * (@sin(a) + k * @cos(a)), x + radius * (@cos(b) + k * @sin(b)), y + radius * (@sin(b) - k * @cos(b)), x + radius * @cos(b), y + radius * @sin(b), exec);
++            }
++        }
++
++        pub fn rect(self: *Context, x: f64, y: f64, w: f64, h: f64, exec: *Execution) !void {
++            if (!valid(.{ x, y, w, h, x + w, y + h })) return;
++            try moveTo(self, x, y, exec);
++            try lineTo(self, x + w, y, exec);
++            try lineTo(self, x + w, y + h, exec);
++            try lineTo(self, x, y + h, exec);
++            try closePath(self, exec);
++        }
++
++        fn valid(values: anytype) bool {
++            inline for (values) |value| if (!std.math.isFinite(value)) return false;
++            return true;
++        }
++
++        fn fillRule(rule: ?[]const u8) !Path.Rule {
++            return std.meta.stringToEnum(Path.Rule, rule orelse "nonzero") orelse error.TypeError;
++        }
++
++        pub fn fill(self: *Context, rule: ?[]const u8, exec: *Execution) !void {
++            const parsed = try fillRule(rule);
++            const c = fillColor(self) orelse return;
++            try self._recording.path(self._path.vertices.items, c, parsed, null, self._canvas.getWidth(), self._canvas.getHeight(), exec);
++        }
++
++        pub fn stroke(self: *Context, exec: *Execution) !void {
++            var c = switch (self._state.stroke_style) {
++                .color => |c| c,
++                else => return,
++            };
++            c.a = @intFromFloat(@round(@as(f64, @floatFromInt(c.a)) * self._state.global_alpha));
++            try self._recording.path(self._path.vertices.items, c, .nonzero, .{ .matrix = self._state.transform, .radius = self._state.line_width / 2, .cap = self._state.line_cap }, self._canvas.getWidth(), self._canvas.getHeight(), exec);
++        }
++
++        pub fn strokeRect(self: *Context, x: f64, y: f64, w: f64, h: f64, exec: *Execution) !void {
++            const previous = self._path;
++            self._path = .{};
++            defer {
++                self._path.vertices.deinit(exec._factory.storageAllocator());
++                self._path = previous;
++            }
++            try rect(self, x, y, w, h, exec);
++            try stroke(self, exec);
++        }
++
++        pub fn isPointInPath(self: *const Context, x: f64, y: f64, rule: ?[]const u8) !bool {
++            return Path.contains(self._path.vertices.items, .{ .x = x, .y = y }, try fillRule(rule), true);
++        }
++
++        pub fn isPointInStroke(self: *const Context, x: f64, y: f64) bool {
++            const inverse = geometry.inverse(self._state.transform) orelse return false;
++            var previous: geometry.Point = undefined;
++            for (self._path.vertices.items) |vertex| {
++                const point = inverse.apply(vertex.point);
++                defer previous = point;
++                if (vertex.move) continue;
++                const edge = [_]Path.Vertex{ .{ .point = previous, .move = true }, .{ .point = point } };
++                if (Path.inStroke(&edge, inverse.apply(.{ .x = x, .y = y }), self._state.line_width / 2, self._state.line_cap)) return true;
++            }
++            return false;
++        }
++
++        pub fn getLineWidth(self: *const Context) f64 {
++            return self._state.line_width;
++        }
++
++        pub fn setLineWidth(self: *Context, value: f64) void {
++            if (value > 0 and std.math.isFinite(value)) self._state.line_width = value;
++        }
++
++        pub fn getLineCap(self: *const Context) []const u8 {
++            return @tagName(self._state.line_cap);
++        }
++
++        pub fn setLineCap(self: *Context, value: []const u8) void {
++            self._state.line_cap = std.meta.stringToEnum(Path.Cap, value) orelse return;
++        }
++
+         pub fn getGlobalAlpha(self: *const Context) f64 {
+             return self._state.global_alpha;
+         }
+@@ -218,16 +415,14 @@ pub fn Painting(comptime Context: type) type {
+         pub fn clearRect(self: *Context, x: f64, y: f64, w: f64, h: f64, exec: *Execution) !void {
+             const width = self._canvas.getWidth();
+             const height = self._canvas.getHeight();
+-            const area = Recording.bounds(x, y, w, h, width, height) orelse return;
+-            try self._recording.rectangle(area, null, width, height, exec);
++            try self._recording.transformedRectangle(x, y, w, h, self._state.transform, null, width, height, exec);
+         }
+ 
+         pub fn fillRect(self: *Context, x: f64, y: f64, w: f64, h: f64, exec: *Execution) !void {
+             const c = fillColor(self) orelse return;
+             const width = self._canvas.getWidth();
+             const height = self._canvas.getHeight();
+-            const area = Recording.bounds(x, y, w, h, width, height) orelse return;
+-            try self._recording.rectangle(area, c, width, height, exec);
++            try self._recording.transformedRectangle(x, y, w, h, self._state.transform, c, width, height, exec);
+         }
+ 
+         pub fn fillText(self: *Context, text: []const u8, x: f64, y: f64, max_width: ?js.Value, exec: *Execution) !void {
+@@ -239,15 +434,15 @@ pub fn Painting(comptime Context: type) type {
+             const size = state.font_size;
+             const natural_width = measureWidth(text, size, state.font_face);
+             if (!(natural_width > 0) or !std.math.isFinite(natural_width)) return;
+-            var scale: f64 = 1;
++            var text_scale: f64 = 1;
+             if (limit) |value| {
+                 if (!(value > 0) or !std.math.isFinite(value)) return;
+-                scale = @min(1, value / natural_width);
++                text_scale = @min(1, value / natural_width);
+             }
+             const width = self._canvas.getWidth();
+             const height = self._canvas.getHeight();
+             if (!Recording.hasBitmap(width, height)) return;
+-            var pen = x - natural_width * scale * switch (state.text_align) {
++            var pen = x - natural_width * text_scale * switch (state.text_align) {
+                 .center => @as(f64, 0.5),
+                 .end, .right => @as(f64, 1),
+                 else => @as(f64, 0),
+@@ -263,9 +458,9 @@ pub fn Painting(comptime Context: type) type {
+             while (it.i < text.len) {
+                 const start = it.i;
+                 const cp = it.nextCodepoint() orelse break;
+-                const advance = measureWidth(text[start..it.i], size, state.font_face) * scale;
++                const advance = measureWidth(text[start..it.i], size, state.font_face) * text_scale;
+                 if (cp > ' ' and advance > 0) {
+-                    try self._recording.glyph(.{ .x = pen, .y = top, .width = advance * 0.85, .height = size, .codepoint = cp, .color = c }, width, height, exec);
++                    try self._recording.glyph(.{ .x = pen, .y = top, .width = advance * 0.85, .height = size, .codepoint = cp, .color = c, .matrix = state.transform }, width, height, exec);
+                 }
+                 pen += advance;
+             }
+diff --git a/src/browser/webapi/canvas/geometry.zig b/src/browser/webapi/canvas/geometry.zig
+new file mode 100644
+index 0000000..b3933fe
+--- /dev/null
++++ b/src/browser/webapi/canvas/geometry.zig
+@@ -0,0 +1,54 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const svg = @import("../svg/PathData.zig");
++pub const Matrix = svg.Matrix;
++pub const Point = svg.Point;
++pub const Bounds = svg.Bounds;
++
++pub fn finite(matrix: Matrix) bool {
++    inline for (std.meta.fields(Matrix)) |field| {
++        if (!std.math.isFinite(@field(matrix, field.name))) return false;
++    }
++    return true;
++}
++
++pub fn inverse(matrix: Matrix) ?Matrix {
++    const determinant = matrix.a * matrix.d - matrix.b * matrix.c;
++    if (determinant == 0 or !std.math.isFinite(determinant)) return null;
++    const result = Matrix{
++        .a = matrix.d / determinant,
++        .b = -matrix.b / determinant,
++        .c = -matrix.c / determinant,
++        .d = matrix.a / determinant,
++        .e = (matrix.c * matrix.f - matrix.d * matrix.e) / determinant,
++        .f = (matrix.b * matrix.e - matrix.a * matrix.f) / determinant,
++    };
++    return if (finite(result)) result else null;
++}
++
++pub fn rectangle(matrix: Matrix, x: f64, y: f64, w: f64, h: f64) ?Bounds {
++    inline for (.{ x, y, w, h }) |value| if (!std.math.isFinite(value)) return null;
++    var result: Bounds = .{};
++    for ([_]Point{ .{ .x = x, .y = y }, .{ .x = x + w, .y = y }, .{ .x = x + w, .y = y + h }, .{ .x = x, .y = y + h } }) |point| {
++        const transformed = matrix.apply(point);
++        if (!std.math.isFinite(transformed.x) or !std.math.isFinite(transformed.y)) return null;
++        result.include(transformed);
++    }
++    return result;
++}
+diff --git a/src/browser/webapi/svg/PathData.zig b/src/browser/webapi/svg/PathData.zig
+index 20abea8..3a6ab85 100644
+--- a/src/browser/webapi/svg/PathData.zig
++++ b/src/browser/webapi/svg/PathData.zig
+@@ -107,7 +107,7 @@ const Arc = struct {
+     delta: f64,
+ };
+ 
+-const Segment = union(enum) {
++pub const Segment = union(enum) {
+     line: Line,
+     quadratic: Quadratic,
+     cubic: Cubic,
+@@ -703,7 +703,7 @@ const flatten_tolerance = 0.001;
+ const flatten_relative_tolerance = 1e-6;
+ const flatten_depth = 18;
+ 
+-fn flatten(segment: Segment, points: *std.ArrayList(Point), allocator: Allocator) !void {
++pub fn flatten(segment: Segment, points: *std.ArrayList(Point), allocator: Allocator) !void {
+     try points.append(allocator, segment.start());
+     switch (segment) {
+         .line => |line| try points.append(allocator, line.end),

@@ -1,0 +1,461 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 19 Oct 2026 11:29:58 -0300
+Subject: [PATCH] webapi: mock Neo WebGL identity and query limits natively
+
+Expose a lightweight WebGL 1 query context from HTMLCanvasElement and
+OffscreenCanvas, including worker globals. Keep native receiver checks,
+method descriptors, context identity, canvas ownership and context-type
+exclusion. Report live drawing-buffer dimensions without rendering work.
+
+Use a synthetic Apple A18 Pro / ANGLE Metal identity for the base MacBook
+Neo persona. Return numeric query limits and a fresh Int32Array viewport
+limit through the existing typed-array bridge. These hardcoded limits are
+chosen mock values, not measurements from a physical A18 Pro device.
+
+Cache WEBGL_debug_renderer_info per context, gate its unmasked queries on
+extension enablement, and return null plus clear-on-read INVALID_ENUM for
+unsupported parameter queries. Advertise only the implemented debug
+extension rather than the old stub's list of unimplemented extensions.
+Expose query constants on the interface and its prototype.
+
+Deliberately remain query-only: no rendering, shaders, buffers, textures,
+WebGL2 or context-loss extension. Graphics consumers requiring resource
+methods are not supported. Preserve the existing 2D paths and use their
+empty synthetic PNG fallback for WebGL canvas exports.
+
+Keep the benchmark unchanged: its modern-GPU allowlist recognizes Apple
+M-series but not A18 Pro, so the GPU-limit assertion still cannot pass
+with the required persona. Add no unit tests; validate with existing
+upstream tests and ignored temporary page/iframe/worker CDP diagnostics.
+
+References:
+https://www.apple.com/macbook-neo/specs/
+https://registry.khronos.org/webgl/specs/latest/1.0/
+https://registry.khronos.org/webgl/extensions/WEBGL_debug_renderer_info/
+---
+ src/browser/js/bridge.zig                     |   1 +
+ src/browser/webapi/canvas/OffscreenCanvas.zig |  25 +-
+ .../webapi/canvas/WebGLRenderingContext.zig   | 258 +++++++-----------
+ src/browser/webapi/element/html/Canvas.zig    |  12 +-
+ 4 files changed, 130 insertions(+), 166 deletions(-)
+
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 784866b..7fd6105 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1402,6 +1402,7 @@ const worker_common_apis = [_]type{
+     @import("../webapi/event/TaskPriorityChangeEvent.zig"),
+     @import("../webapi/URL.zig"),
+     @import("../webapi/URLPattern.zig"),
++    @import("../webapi/canvas/WebGLRenderingContext.zig"),
+     @import("../webapi/canvas/OffscreenCanvas.zig"),
+     @import("../webapi/canvas/OffscreenCanvasRenderingContext2D.zig"),
+     @import("../webapi/canvas/TextMetrics.zig"),
+diff --git a/src/browser/webapi/canvas/OffscreenCanvas.zig b/src/browser/webapi/canvas/OffscreenCanvas.zig
+index 19c44dd..fc129be 100644
+--- a/src/browser/webapi/canvas/OffscreenCanvas.zig
++++ b/src/browser/webapi/canvas/OffscreenCanvas.zig
+@@ -24,6 +24,7 @@ const Blob = @import("../Blob.zig");
+ const Recording = @import("Recording.zig");
+ const empty_recording: Recording = .{};
+ const OffscreenCanvasRenderingContext2D = @import("OffscreenCanvasRenderingContext2D.zig");
++const WebGLRenderingContext = @import("WebGLRenderingContext.zig");
+ 
+ const Execution = js.Execution;
+ 
+@@ -40,6 +41,7 @@ _cached: ?DrawingContext = null,
+ /// we're using tagged union.
+ const DrawingContext = union(enum) {
+     @"2d": *OffscreenCanvasRenderingContext2D,
++    webgl: *WebGLRenderingContext,
+ };
+ 
+ pub fn constructor(width: u32, height: u32, exec: *Execution) !*OffscreenCanvas {
+@@ -55,7 +57,7 @@ pub fn getWidth(self: *const OffscreenCanvas) u32 {
+ 
+ fn setWidth(self: *OffscreenCanvas, value: u32) void {
+     self._width = value;
+-    if (self._cached) |cached| cached.@"2d".reset();
++    self.resetBitmap();
+ }
+ 
+ pub fn getHeight(self: *const OffscreenCanvas) u32 {
+@@ -64,13 +66,21 @@ pub fn getHeight(self: *const OffscreenCanvas) u32 {
+ 
+ fn setHeight(self: *OffscreenCanvas, value: u32) void {
+     self._height = value;
+-    if (self._cached) |cached| cached.@"2d".reset();
++    self.resetBitmap();
++}
++
++fn resetBitmap(self: *OffscreenCanvas) void {
++    if (self._cached) |cached| switch (cached) {
++        .@"2d" => |ctx| ctx.reset(),
++        .webgl => {},
++    };
+ }
+ 
+ fn getContext(self: *OffscreenCanvas, context_type: []const u8, exec: *Execution) !?DrawingContext {
+     if (self._cached) |cached| {
+         return switch (cached) {
+             .@"2d" => if (std.mem.eql(u8, context_type, "2d")) cached else null,
++            .webgl => if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) cached else null,
+         };
+     }
+ 
+@@ -80,6 +90,12 @@ fn getContext(self: *OffscreenCanvas, context_type: []const u8, exec: *Execution
+         return self._cached;
+     }
+ 
++    if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) {
++        const ctx = try exec._factory.create(WebGLRenderingContext{ ._canvas = .{ .offscreen = self } });
++        self._cached = .{ .webgl = ctx };
++        return self._cached;
++    }
++
+     return null;
+ }
+ 
+@@ -89,7 +105,10 @@ fn convertToBlob(self: *const OffscreenCanvas, exec: *Execution) !js.Promise {
+     if (!Recording.hasBitmap(self._width, self._height)) {
+         return error.IndexSizeError;
+     }
+-    const recording = if (self._cached) |cached| &cached.@"2d"._recording else &empty_recording;
++    const recording = if (self._cached) |cached| switch (cached) {
++        .@"2d" => |ctx| &ctx._recording,
++        .webgl => &empty_recording,
++    } else &empty_recording;
+     const blob = try Blob.initFromBytes(try recording.png(self._width, self._height, exec), "image/png", exec);
+     return exec.js.local.?.resolvePromise(blob);
+ }
+diff --git a/src/browser/webapi/canvas/WebGLRenderingContext.zig b/src/browser/webapi/canvas/WebGLRenderingContext.zig
+index f75c0e0..0aa59d3 100644
+--- a/src/browser/webapi/canvas/WebGLRenderingContext.zig
++++ b/src/browser/webapi/canvas/WebGLRenderingContext.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -17,189 +18,140 @@
+ // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ 
+ const std = @import("std");
+-
+ const js = @import("../../js/js.zig");
+-const Frame = @import("../../Frame.zig");
+-
+-pub fn registerTypes() []const type {
+-    return &.{
+-        WebGLRenderingContext,
+-        // Extension types should be runtime generated. We might want
+-        // to revisit this.
+-        Extension.Type.WEBGL_debug_renderer_info,
+-        Extension.Type.WEBGL_lose_context,
+-    };
+-}
++const Canvas = @import("../element/html/Canvas.zig");
++const OffscreenCanvas = @import("OffscreenCanvas.zig");
+ 
+ const WebGLRenderingContext = @This();
+ 
+-/// On Chrome and Safari, a call to `getSupportedExtensions` returns total of 39.
+-/// The reference for it lists lesser number of extensions:
+-/// https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/Using_Extensions#extension_list
+-const Extension = union(enum) {
+-    ANGLE_instanced_arrays: void,
+-    EXT_blend_minmax: void,
+-    EXT_clip_control: void,
+-    EXT_color_buffer_half_float: void,
+-    EXT_depth_clamp: void,
+-    EXT_disjoint_timer_query: void,
+-    EXT_float_blend: void,
+-    EXT_frag_depth: void,
+-    EXT_polygon_offset_clamp: void,
+-    EXT_shader_texture_lod: void,
+-    EXT_texture_compression_bptc: void,
+-    EXT_texture_compression_rgtc: void,
+-    EXT_texture_filter_anisotropic: void,
+-    EXT_texture_mirror_clamp_to_edge: void,
+-    EXT_sRGB: void,
+-    KHR_parallel_shader_compile: void,
+-    OES_element_index_uint: void,
+-    OES_fbo_render_mipmap: void,
+-    OES_standard_derivatives: void,
+-    OES_texture_float: void,
+-    OES_texture_float_linear: void,
+-    OES_texture_half_float: void,
+-    OES_texture_half_float_linear: void,
+-    OES_vertex_array_object: void,
+-    WEBGL_blend_func_extended: void,
+-    WEBGL_color_buffer_float: void,
+-    WEBGL_compressed_texture_astc: void,
+-    WEBGL_compressed_texture_etc: void,
+-    WEBGL_compressed_texture_etc1: void,
+-    WEBGL_compressed_texture_pvrtc: void,
+-    WEBGL_compressed_texture_s3tc: void,
+-    WEBGL_compressed_texture_s3tc_srgb: void,
+-    WEBGL_debug_renderer_info: *Type.WEBGL_debug_renderer_info,
+-    WEBGL_debug_shaders: void,
+-    WEBGL_depth_texture: void,
+-    WEBGL_draw_buffers: void,
+-    WEBGL_lose_context: *Type.WEBGL_lose_context,
+-    WEBGL_multi_draw: void,
+-    WEBGL_polygon_mode: void,
+-
+-    /// Reified enum type from the fields of this union.
+-    const Kind = blk: {
+-        const info = @typeInfo(Extension).@"union";
+-        const fields = info.fields;
+-        const Tag = std.math.IntFittingRange(0, if (fields.len == 0) 0 else fields.len - 1);
+-        var names: [fields.len][:0]const u8 = undefined;
+-        for (fields, 0..) |field, i| {
+-            names[i] = field.name;
+-        }
+-
+-        break :blk @Enum(Tag, .exhaustive, &names, &std.simd.iota(Tag, fields.len));
+-    };
+-
+-    /// Returns the `Extension.Kind` by its name.
+-    fn find(name: []const u8) ?Kind {
+-        // Just to make you really sad, this function has to be case-insensitive.
+-        // So here we copy what's being done in `std.meta.stringToEnum` but replace
+-        // the comparison function.
+-        const kvs = comptime build_kvs: {
+-            const T = Extension.Kind;
+-            const EnumKV = struct { []const u8, T };
+-            var kvs_array: [@typeInfo(T).@"enum".fields.len]EnumKV = undefined;
+-            for (@typeInfo(T).@"enum".fields, 0..) |enumField, i| {
+-                kvs_array[i] = .{ enumField.name, @field(T, enumField.name) };
+-            }
+-            break :build_kvs kvs_array[0..];
+-        };
+-        const Map = std.StaticStringMapWithEql(Extension.Kind, std.static_string_map.eqlAsciiIgnoreCase);
+-        const map = Map.initComptime(kvs);
+-        return map.get(name);
+-    }
+-
+-    /// Extension types.
+-    pub const Type = struct {
+-        pub const WEBGL_debug_renderer_info = struct {
+-            _: u8 = 0,
+-            const UNMASKED_VENDOR_WEBGL: u64 = 0x9245;
+-            const UNMASKED_RENDERER_WEBGL: u64 = 0x9246;
++pub fn registerTypes() []const type {
++    return &.{ WebGLRenderingContext, DebugRendererInfo };
++}
+ 
+-            pub const JsApi = struct {
+-                pub const bridge = js.Bridge(WEBGL_debug_renderer_info);
++pub const Owner = union(enum) {
++    html: *Canvas,
++    offscreen: *OffscreenCanvas,
++};
+ 
+-                pub const Meta = struct {
+-                    pub const name = "WEBGL_debug_renderer_info";
++_canvas: Owner,
++_debug_info: ?*DebugRendererInfo = null,
++_error: u32 = 0,
+ 
+-                    pub const prototype_chain = bridge.prototypeChain();
+-                    pub var class_id: bridge.ClassId = undefined;
+-                };
++fn getCanvas(self: *const WebGLRenderingContext) Owner {
++    return self._canvas;
++}
+ 
+-                pub const UNMASKED_VENDOR_WEBGL = bridge.property(WEBGL_debug_renderer_info.UNMASKED_VENDOR_WEBGL, .{ .template = false, .readonly = true });
+-                pub const UNMASKED_RENDERER_WEBGL = bridge.property(WEBGL_debug_renderer_info.UNMASKED_RENDERER_WEBGL, .{ .template = false, .readonly = true });
+-            };
+-        };
++fn getDrawingBufferWidth(self: *const WebGLRenderingContext) u32 {
++    return switch (self._canvas) {
++        inline else => |canvas| canvas.getWidth(),
++    };
++}
+ 
+-        pub const WEBGL_lose_context = struct {
+-            _: u8 = 0,
+-            fn loseContext(_: *const WEBGL_lose_context) void {}
+-            fn restoreContext(_: *const WEBGL_lose_context) void {}
++fn getDrawingBufferHeight(self: *const WebGLRenderingContext) u32 {
++    return switch (self._canvas) {
++        inline else => |canvas| canvas.getHeight(),
++    };
++}
+ 
+-            pub const JsApi = struct {
+-                pub const bridge = js.Bridge(WEBGL_lose_context);
++const Parameter = union(enum) {
++    string: []const u8,
++    number: u32,
++    int32: js.TypedArray(i32),
++};
+ 
+-                pub const Meta = struct {
+-                    pub const name = "WEBGL_lose_context";
++// Synthetic WebGL 1 query profile for the base Neo's Apple A18 Pro.
++// No graphics resources, shader execution or rendering are implemented.
++fn getParameter(self: *WebGLRenderingContext, pname: u32) ?Parameter {
++    return switch (pname) {
++        0x1F00 => .{ .string = "WebKit" },
++        0x1F01 => .{ .string = "WebKit WebGL" },
++        0x1F02 => .{ .string = "WebGL 1.0 (OpenGL ES 2.0 Chromium)" },
++        0x8B8C => .{ .string = "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)" },
++        0x9245, 0x9246 => if (self._debug_info != null)
++            .{ .string = if (pname == 0x9245) "Google Inc. (Apple)" else "ANGLE (Apple, ANGLE Metal Renderer: Apple A18 Pro, Unspecified Version)" }
++        else
++            self.invalidEnum(),
++        0x0D33, 0x851C, 0x84E8 => .{ .number = 16384 },
++        0x0D3A => .{ .int32 = .{ .values = &.{ 16384, 16384 } } },
++        0x8872, 0x8B4C => .{ .number = 16 },
++        0x8B4D => .{ .number = 32 },
++        0x8869 => .{ .number = 16 },
++        else => self.invalidEnum(),
++    };
++}
+ 
+-                    pub const prototype_chain = bridge.prototypeChain();
+-                    pub var class_id: bridge.ClassId = undefined;
+-                };
++fn invalidEnum(self: *WebGLRenderingContext) ?Parameter {
++    if (self._error == 0) self._error = 0x0500;
++    return null;
++}
+ 
+-                pub const loseContext = bridge.function(WEBGL_lose_context.loseContext, .{ .noop = true });
+-                pub const restoreContext = bridge.function(WEBGL_lose_context.restoreContext, .{ .noop = true });
+-            };
+-        };
+-    };
+-};
++fn getError(self: *WebGLRenderingContext) u32 {
++    const err = self._error;
++    self._error = 0;
++    return err;
++}
+ 
+-/// This actually takes "GLenum" which, in fact, is a fancy way to say number.
+-/// Return value also depends on what's being passed as `pname`; we don't really
+-/// support any though.
+-fn getParameter(_: *const WebGLRenderingContext, pname: u32) []const u8 {
+-    _ = pname;
+-    return "";
++fn isContextLost(_: *const WebGLRenderingContext) bool {
++    return false;
+ }
+ 
+-/// Enables a WebGL extension.
+-fn getExtension(_: *const WebGLRenderingContext, name: []const u8, frame: *Frame) !?Extension {
+-    const tag = Extension.find(name) orelse return null;
+-
+-    return switch (tag) {
+-        .WEBGL_debug_renderer_info => {
+-            const info = try frame._factory.create(Extension.Type.WEBGL_debug_renderer_info{});
+-            return .{ .WEBGL_debug_renderer_info = info };
+-        },
+-        .WEBGL_lose_context => {
+-            const ctx = try frame._factory.create(Extension.Type.WEBGL_lose_context{});
+-            return .{ .WEBGL_lose_context = ctx };
+-        },
+-        inline else => |comptime_enum| @unionInit(Extension, @tagName(comptime_enum), {}),
+-    };
++fn getExtension(self: *WebGLRenderingContext, name: []const u8, exec: *js.Execution) !?*DebugRendererInfo {
++    if (!std.ascii.eqlIgnoreCase(name, "WEBGL_debug_renderer_info")) return null;
++    if (self._debug_info == null) {
++        self._debug_info = try exec._factory.create(DebugRendererInfo{});
++    }
++    return self._debug_info;
+ }
+ 
+-/// Returns a list of all the supported WebGL extensions.
+ fn getSupportedExtensions(_: *const WebGLRenderingContext) []const []const u8 {
+-    return std.meta.fieldNames(Extension.Kind);
++    return &.{"WEBGL_debug_renderer_info"};
+ }
+ 
++const DebugRendererInfo = struct {
++    _: u8 = 0,
++
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(DebugRendererInfo);
++        pub const Meta = struct {
++            pub const name = "WEBGL_debug_renderer_info";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++
++        pub const UNMASKED_VENDOR_WEBGL = bridge.property(@as(u32, 0x9245), .{ .template = false, .readonly = true });
++        pub const UNMASKED_RENDERER_WEBGL = bridge.property(@as(u32, 0x9246), .{ .template = false, .readonly = true });
++    };
++};
++
+ pub const JsApi = struct {
+     pub const bridge = js.Bridge(WebGLRenderingContext);
+-
+     pub const Meta = struct {
+         pub const name = "WebGLRenderingContext";
+-
+         pub const prototype_chain = bridge.prototypeChain();
+         pub var class_id: bridge.ClassId = undefined;
+     };
+ 
++    pub const canvas = bridge.accessor(WebGLRenderingContext.getCanvas, null, .{});
++    pub const drawingBufferWidth = bridge.accessor(WebGLRenderingContext.getDrawingBufferWidth, null, .{});
++    pub const drawingBufferHeight = bridge.accessor(WebGLRenderingContext.getDrawingBufferHeight, null, .{});
+     pub const getParameter = bridge.function(WebGLRenderingContext.getParameter, .{});
+     pub const getExtension = bridge.function(WebGLRenderingContext.getExtension, .{});
+     pub const getSupportedExtensions = bridge.function(WebGLRenderingContext.getSupportedExtensions, .{});
++    pub const getError = bridge.function(WebGLRenderingContext.getError, .{});
++    pub const isContextLost = bridge.function(WebGLRenderingContext.isContextLost, .{});
++
++    pub const NO_ERROR = bridge.property(@as(u32, 0), .{ .template = true });
++    pub const INVALID_ENUM = bridge.property(@as(u32, 0x0500), .{ .template = true });
++    pub const VENDOR = bridge.property(@as(u32, 0x1F00), .{ .template = true });
++    pub const RENDERER = bridge.property(@as(u32, 0x1F01), .{ .template = true });
++    pub const VERSION = bridge.property(@as(u32, 0x1F02), .{ .template = true });
++    pub const SHADING_LANGUAGE_VERSION = bridge.property(@as(u32, 0x8B8C), .{ .template = true });
++    pub const MAX_TEXTURE_SIZE = bridge.property(@as(u32, 0x0D33), .{ .template = true });
++    pub const MAX_CUBE_MAP_TEXTURE_SIZE = bridge.property(@as(u32, 0x851C), .{ .template = true });
++    pub const MAX_RENDERBUFFER_SIZE = bridge.property(@as(u32, 0x84E8), .{ .template = true });
++    pub const MAX_VIEWPORT_DIMS = bridge.property(@as(u32, 0x0D3A), .{ .template = true });
++    pub const MAX_TEXTURE_IMAGE_UNITS = bridge.property(@as(u32, 0x8872), .{ .template = true });
++    pub const MAX_VERTEX_TEXTURE_IMAGE_UNITS = bridge.property(@as(u32, 0x8B4C), .{ .template = true });
++    pub const MAX_COMBINED_TEXTURE_IMAGE_UNITS = bridge.property(@as(u32, 0x8B4D), .{ .template = true });
++    pub const MAX_VERTEX_ATTRIBS = bridge.property(@as(u32, 0x8869), .{ .template = true });
+ };
+-
+-// getContext('web-gl') currently returns null, so this cannot be tested
+-// const testing = @import("../../../testing.zig");
+-// test "WebApi: WebGLRenderingContext" {
+-//     try testing.htmlRunner("canvas/webgl_rendering_context.html", .{});
+-// }
+diff --git a/src/browser/webapi/element/html/Canvas.zig b/src/browser/webapi/element/html/Canvas.zig
+index b396928..e5602a4 100644
+--- a/src/browser/webapi/element/html/Canvas.zig
++++ b/src/browser/webapi/element/html/Canvas.zig
+@@ -93,17 +93,9 @@ fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?DrawingC
+             break :blk .{ .@"2d" = ctx };
+         }
+ 
+-        // We only stub a tiny slice of the WebGL API (getParameter,
+-        // getExtension, getSupportedExtensions). Real WebGL consumers like
+-        // Three.js immediately call createTexture/createBuffer/etc. and
+-        // throw `TypeError: e.createTexture is not a function`. Pretending
+-        // WebGL works until the first non-stubbed call is the worst of both
+-        // worlds: pages that have an error boundary above the WebGL widget
+-        // catch the throw, reset, re-render, and loop forever.
+-        // Spec-correct signal for "no WebGL" is null, so apps that check
+-        // (Three.js does) can degrade gracefully.
+         if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) {
+-            return null;
++            const ctx = try frame._factory.create(WebGLRenderingContext{ ._canvas = .{ .html = self } });
++            break :blk .{ .webgl = ctx };
+         }
+         return null;
+     };

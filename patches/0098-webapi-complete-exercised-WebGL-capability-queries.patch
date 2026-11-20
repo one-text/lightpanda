@@ -1,0 +1,388 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 19 Nov 2026 13:41:48 -0300
+Subject: [PATCH] webapi: complete exercised WebGL capability queries
+
+Extend the existing query-only Apple A18 Pro / macOS ANGLE profile. Both
+HTML and Offscreen contexts now return standard constants and valid scalar
+or fresh Float32Array results for the capability queries observed in the
+Sephora protection scripts. Include signed texel offsets, uniform/block
+limits, varying limits and transform-feedback components. Keep WebGL2-only
+queries invalid in WebGL1 and preserve sticky, clear-on-read errors.
+
+Use source-derived ANGLE Metal macOS limits at revision
+ a35430f259e8e277253c99cfcb5a0bf9226cdfe5:
+- DisplayMtl.mm: macOS varying/output limits, point/line ranges, uniform
+  formulas, Apple-family UBO alignment and texel-offset/LOD values.
+- mtl_common.h: 16 KiB default uniforms and UBO size, 16 blocks per stage,
+  32 combined bindings; combined components = 4096 + 16384*16/4.
+- Constants.h: 128 transform-feedback interleaved components.
+These are source-backed profile values, not measurements from an A18 Pro
+Mac or verification against the exact target Chrome revision.
+
+Expose getContextAttributes with fresh own data properties, requested
+creation flags and DOMString/enum conversion. Convert WebGL options before
+cache checks as Chrome does, while keeping the cached context's original
+attributes. Reject Symbol power preferences and avoid inherited-setter
+interference when constructing the returned dictionary. Leave 2D settings
+handling outside this patch.
+
+Add the WebGL2-only getInternalformatParameter query for core renderbuffer
+formats, with fresh Int32Array results and invalid-enum handling. The human
+explicitly approved a conservative synthetic device-dependent policy:
+4 maximum/default antialiased samples; non-integer formats report [4,2],
+integer formats []; 8-bit color, optional 24-bit depth and 8-bit stencil.
+Legacy RGB/RGBA aliases use the corresponding non-integer sample policy.
+ANGLE Metal selects its actual sample counts through MTLDevice; these
+choices are not claimed as measured hardware support. Framebuffer bit and
+sample queries agree with the stored alpha/depth/stencil/antialias flags.
+
+No renderer, shader/resource implementation, SDK rewriting or fingerprint
+hash substitution is added. Existing renderer identity, extension list and
+shader-precision profile remain unchanged; this is not complete WebGL.
+
+Temporary owned controls: 296/296 API checks pass on patched Debug,
+Camoufox158 and Chrome154 across HTML/Offscreen and WebGL1/2; saved0097
+passes100/296. Patched native also passes54/54 policy-specific assertions.
+Reference device-dependent values are not compared to the mock policy;
+reference cached-option conversion, integer samples and RGB/RGBA alias
+behavior differ and are recorded separately. Existing Canvas2D108/108 and
+upstream1658/1658 tests pass; no upstream tests were added or modified.
+Live acceptance is evaluated separately and is not established by these
+owned checks.
+
+References:
+https://github.com/google/angle/tree/a35430f259e8e277253c99cfcb5a0bf9226cdfe5/src/libANGLE/renderer/metal
+https://github.com/google/angle/blob/a35430f259e8e277253c99cfcb5a0bf9226cdfe5/src/libANGLE/Constants.h
+https://registry.khronos.org/webgl/specs/latest/1.0/
+https://registry.khronos.org/webgl/specs/latest/2.0/
+https://registry.khronos.org/OpenGL-Refpages/es3.0/html/glGetInternalformativ.xhtml
+---
+ src/browser/webapi/canvas/OffscreenCanvas.zig |  10 +-
+ .../webapi/canvas/WebGLRenderingContext.zig   | 209 +++++++++++++++++-
+ src/browser/webapi/element/html/Canvas.zig    |  10 +-
+ 3 files changed, 222 insertions(+), 7 deletions(-)
+
+diff --git a/src/browser/webapi/canvas/OffscreenCanvas.zig b/src/browser/webapi/canvas/OffscreenCanvas.zig
+index 794ceba..58d921a 100644
+--- a/src/browser/webapi/canvas/OffscreenCanvas.zig
++++ b/src/browser/webapi/canvas/OffscreenCanvas.zig
+@@ -77,7 +77,11 @@ fn resetBitmap(self: *OffscreenCanvas) void {
+     };
+ }
+ 
+-fn getContext(self: *OffscreenCanvas, context_type: []const u8, exec: *Execution) !?DrawingContext {
++fn getContext(self: *OffscreenCanvas, context_type: []const u8, options: ?js.Value, exec: *Execution) !?DrawingContext {
++    const attributes = if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl") or std.mem.eql(u8, context_type, "webgl2"))
++        try WebGL.Attributes.parse(options)
++    else
++        WebGL.Attributes{};
+     if (self._cached) |cached| {
+         return switch (cached) {
+             .@"2d" => if (std.mem.eql(u8, context_type, "2d")) cached else null,
+@@ -93,13 +97,13 @@ fn getContext(self: *OffscreenCanvas, context_type: []const u8, exec: *Execution
+     }
+ 
+     if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) {
+-        const ctx = try exec._factory.create(WebGL.WebGLRenderingContext{ ._canvas = .{ .offscreen = self } });
++        const ctx = try exec._factory.create(WebGL.WebGLRenderingContext{ ._canvas = .{ .offscreen = self }, ._attributes = attributes });
+         self._cached = .{ .webgl = ctx };
+         return self._cached;
+     }
+ 
+     if (std.mem.eql(u8, context_type, "webgl2")) {
+-        const ctx = try exec._factory.create(WebGL.WebGL2RenderingContext{ ._canvas = .{ .offscreen = self } });
++        const ctx = try exec._factory.create(WebGL.WebGL2RenderingContext{ ._canvas = .{ .offscreen = self }, ._attributes = attributes });
+         self._cached = .{ .webgl2 = ctx };
+         return self._cached;
+     }
+diff --git a/src/browser/webapi/canvas/WebGLRenderingContext.zig b/src/browser/webapi/canvas/WebGLRenderingContext.zig
+index 47a9ed0..5a71b22 100644
+--- a/src/browser/webapi/canvas/WebGLRenderingContext.zig
++++ b/src/browser/webapi/canvas/WebGLRenderingContext.zig
+@@ -38,10 +38,57 @@ const Owner = union(enum) {
+ 
+ const Parameter = union(enum) {
+     string: []const u8,
+-    number: u32,
++    number: f64,
+     int32: js.TypedArray(i32),
++    float32: js.TypedArray(f32),
+ };
+ 
++pub const Attributes = struct {
++    alpha: bool = true,
++    antialias: bool = true,
++    depth: bool = true,
++    desynchronized: bool = false,
++    failIfMajorPerformanceCaveat: bool = false,
++    powerPreference: []const u8 = "default",
++    premultipliedAlpha: bool = true,
++    preserveDrawingBuffer: bool = false,
++    stencil: bool = false,
++    xrCompatible: bool = false,
++
++    pub fn parse(input: ?js.Value) !Attributes {
++        var attributes: Attributes = .{};
++        const value = input orelse return attributes;
++        if (!value.isObject()) return attributes;
++        const object = value.toObject();
++        inline for (std.meta.fields(Attributes)) |field| {
++            const member = try object.get(field.name);
++            if (!member.isUndefined()) {
++                if (comptime field.type == bool) {
++                    @field(attributes, field.name) = member.toBool();
++                } else {
++                    if (member.isSymbol()) return error.TypeError;
++                    const preference = try member.toStringSlice();
++                    if (std.mem.eql(u8, preference, "default")) {
++                        attributes.powerPreference = "default";
++                    } else if (std.mem.eql(u8, preference, "low-power")) {
++                        attributes.powerPreference = "low-power";
++                    } else if (std.mem.eql(u8, preference, "high-performance")) {
++                        attributes.powerPreference = "high-performance";
++                    } else return error.TypeError;
++                }
++            }
++        }
++        return attributes;
++    }
++};
++
++fn isWebGL2Parameter(pname: u32) bool {
++    return switch (pname) {
++        0x8B4B, 0x9122, 0x9125, 0x8B4A, 0x8B49, 0x8A2B, 0x8A2D, 0x8A2E, 0x8A2F, 0x8A30, 0x8A31, 0x8A33, 0x8A34, 0x8C8A, 0x8904, 0x8905, 0x84FD, 0x8D57 => true,
++        else => false,
++    };
++}
++
+ // Separate native interfaces with shared query behavior, not JS inheritance.
+ // This A18 Pro profile has no graphics resources, shaders or rendering backend.
+ fn Context(comptime version: u2) type {
+@@ -49,6 +96,7 @@ fn Context(comptime version: u2) type {
+         const Self = @This();
+ 
+         _canvas: Owner,
++        _attributes: Attributes = .{},
+         _debug_info: ?*DebugRendererInfo = null,
+         _error: u32 = 0,
+ 
+@@ -68,7 +116,21 @@ fn Context(comptime version: u2) type {
+             };
+         }
+ 
++        fn getContextAttributes(self: *const Self, exec: *js.Execution) !js.Object {
++            const local = exec.js.local.?;
++            const result = local.newObject();
++            inline for (std.meta.fields(Attributes)) |field| {
++                const value = try local.zigValueToJs(@field(self._attributes, field.name), .{});
++                if (!(result.defineOwnProperty(field.name, value, 0) orelse return error.JsException)) return error.TypeError;
++            }
++            return result;
++        }
++
+         fn getParameter(self: *Self, pname: u32) ?Parameter {
++            if (version == 1 and isWebGL2Parameter(pname)) {
++                self.invalidEnum();
++                return null;
++            }
+             return switch (pname) {
+                 0x1F00 => .{ .string = "WebKit" },
+                 0x1F01 => .{ .string = "WebKit WebGL" },
+@@ -85,6 +147,83 @@ fn Context(comptime version: u2) type {
+                 0x8872, 0x8B4C => .{ .number = 16 },
+                 0x8B4D => .{ .number = 32 },
+                 0x8869 => .{ .number = 16 },
++                0x846E => .{ .float32 = .{ .values = &.{ 1, 1 } } },
++                0x846D => .{ .float32 = .{ .values = &.{ 1, 511 } } },
++                // ANGLE Metal macOS caps; source-derived, not A18 Pro measurements.
++                0x8B4B, 0x9122, 0x9125 => .{ .number = 120 },
++                0x8DFC => .{ .number = 30 },
++                0x8DFB, 0x8DFD => .{ .number = 1024 },
++                0x8B49, 0x8B4A => .{ .number = 4096 },
++                0x8A2B, 0x8A2D => .{ .number = 16 },
++                0x8A2E, 0x8A2F => .{ .number = 32 },
++                0x8A30 => .{ .number = 16384 },
++                0x8A31, 0x8A33 => .{ .number = 4096 + 16384 * 16 / 4 },
++                0x8A34 => .{ .number = 16 },
++                0x8C8A => .{ .number = 128 },
++                0x8904 => .{ .number = -8 },
++                0x8905 => .{ .number = 7 },
++                0x84FD => .{ .number = 15 },
++                // Conservative synthetic framebuffer/sample policy, not GPU discovery.
++                0x0D52, 0x0D53, 0x0D54 => .{ .number = 8 },
++                0x0D55 => .{ .number = if (self._attributes.alpha) 8 else 0 },
++                0x0D56 => .{ .number = if (self._attributes.depth) 24 else 0 },
++                0x0D57 => .{ .number = if (self._attributes.stencil) 8 else 0 },
++                0x80A8 => .{ .number = if (self._attributes.antialias) 1 else 0 },
++                0x80A9 => .{ .number = if (self._attributes.antialias) 4 else 0 },
++                0x8D57 => .{ .number = 4 },
++                else => blk: {
++                    self.invalidEnum();
++                    break :blk null;
++                },
++            };
++        }
++
++        fn getInternalformatParameter(self: *Self, target: u32, internalformat: u32, pname: u32) ?js.TypedArray(i32) {
++            if (target != 0x8D41 or pname != 0x80A9) {
++                self.invalidEnum();
++                return null;
++            }
++            return switch (internalformat) {
++                // Core non-integer formats, including legacy RGB/RGBA aliases.
++                0x1907,
++                0x1908,
++                0x8229,
++                0x822B,
++                0x8051,
++                0x8058,
++                0x8D62,
++                0x8056,
++                0x8057,
++                0x8059,
++                0x8C43,
++                0x81A5,
++                0x81A6,
++                0x8CAC,
++                0x88F0,
++                0x8CAD,
++                0x8D48,
++                => .{ .values = &.{ 4, 2 } },
++                // Integer renderbuffers do not support multisampling.
++                0x8231,
++                0x8232,
++                0x8233,
++                0x8234,
++                0x8235,
++                0x8236,
++                0x8237,
++                0x8238,
++                0x8239,
++                0x823A,
++                0x823B,
++                0x823C,
++                0x8D8E,
++                0x8D7C,
++                0x8D88,
++                0x8D76,
++                0x8D82,
++                0x8D70,
++                0x906F,
++                => .{ .values = &.{} },
+                 else => blk: {
+                     self.invalidEnum();
+                     break :blk null;
+@@ -149,6 +288,8 @@ fn Context(comptime version: u2) type {
+             pub const drawingBufferWidth = bridge.accessor(Self.getDrawingBufferWidth, null, .{});
+             pub const drawingBufferHeight = bridge.accessor(Self.getDrawingBufferHeight, null, .{});
+             pub const getParameter = bridge.function(Self.getParameter, .{});
++            pub const getContextAttributes = bridge.function(Self.getContextAttributes, .{});
++            pub const getInternalformatParameter = if (version == 2) bridge.function(Self.getInternalformatParameter, .{}) else {};
+             pub const getShaderPrecisionFormat = bridge.function(Self.getShaderPrecisionFormat, .{});
+             pub const getExtension = bridge.function(Self.getExtension, .{});
+             pub const getSupportedExtensions = bridge.function(Self.getSupportedExtensions, .{});
+@@ -177,6 +318,72 @@ fn Context(comptime version: u2) type {
+             pub const MAX_VERTEX_TEXTURE_IMAGE_UNITS = bridge.property(@as(u32, 0x8B4C), .{ .template = true });
+             pub const MAX_COMBINED_TEXTURE_IMAGE_UNITS = bridge.property(@as(u32, 0x8B4D), .{ .template = true });
+             pub const MAX_VERTEX_ATTRIBS = bridge.property(@as(u32, 0x8869), .{ .template = true });
++            pub const ALIASED_LINE_WIDTH_RANGE = bridge.property(@as(u32, 0x846E), .{ .template = true });
++            pub const ALIASED_POINT_SIZE_RANGE = bridge.property(@as(u32, 0x846D), .{ .template = true });
++            pub const MAX_VARYING_VECTORS = bridge.property(@as(u32, 0x8DFC), .{ .template = true });
++            pub const MAX_VERTEX_UNIFORM_VECTORS = bridge.property(@as(u32, 0x8DFB), .{ .template = true });
++            pub const MAX_FRAGMENT_UNIFORM_VECTORS = bridge.property(@as(u32, 0x8DFD), .{ .template = true });
++            pub const RED_BITS = bridge.property(@as(u32, 0xD52), .{ .template = true });
++            pub const GREEN_BITS = bridge.property(@as(u32, 0xD53), .{ .template = true });
++            pub const BLUE_BITS = bridge.property(@as(u32, 0xD54), .{ .template = true });
++            pub const ALPHA_BITS = bridge.property(@as(u32, 0xD55), .{ .template = true });
++            pub const DEPTH_BITS = bridge.property(@as(u32, 0xD56), .{ .template = true });
++            pub const STENCIL_BITS = bridge.property(@as(u32, 0xD57), .{ .template = true });
++            pub const SAMPLE_BUFFERS = bridge.property(@as(u32, 0x80A8), .{ .template = true });
++            pub const SAMPLES = bridge.property(@as(u32, 0x80A9), .{ .template = true });
++            pub const RENDERBUFFER = bridge.property(@as(u32, 0x8D41), .{ .template = true });
++            pub const RGBA4 = bridge.property(@as(u32, 0x8056), .{ .template = true });
++            pub const RGB5_A1 = bridge.property(@as(u32, 0x8057), .{ .template = true });
++            pub const RGB565 = bridge.property(@as(u32, 0x8D62), .{ .template = true });
++            pub const DEPTH_COMPONENT16 = bridge.property(@as(u32, 0x81A5), .{ .template = true });
++            pub const STENCIL_INDEX8 = bridge.property(@as(u32, 0x8D48), .{ .template = true });
++            pub const MAX_VARYING_COMPONENTS = if (version == 2) bridge.property(@as(u32, 0x8B4B), .{ .template = true }) else {};
++            pub const MAX_VERTEX_OUTPUT_COMPONENTS = if (version == 2) bridge.property(@as(u32, 0x9122), .{ .template = true }) else {};
++            pub const MAX_FRAGMENT_INPUT_COMPONENTS = if (version == 2) bridge.property(@as(u32, 0x9125), .{ .template = true }) else {};
++            pub const MAX_VERTEX_UNIFORM_COMPONENTS = if (version == 2) bridge.property(@as(u32, 0x8B4A), .{ .template = true }) else {};
++            pub const MAX_FRAGMENT_UNIFORM_COMPONENTS = if (version == 2) bridge.property(@as(u32, 0x8B49), .{ .template = true }) else {};
++            pub const MAX_VERTEX_UNIFORM_BLOCKS = if (version == 2) bridge.property(@as(u32, 0x8A2B), .{ .template = true }) else {};
++            pub const MAX_FRAGMENT_UNIFORM_BLOCKS = if (version == 2) bridge.property(@as(u32, 0x8A2D), .{ .template = true }) else {};
++            pub const MAX_COMBINED_UNIFORM_BLOCKS = if (version == 2) bridge.property(@as(u32, 0x8A2E), .{ .template = true }) else {};
++            pub const MAX_UNIFORM_BUFFER_BINDINGS = if (version == 2) bridge.property(@as(u32, 0x8A2F), .{ .template = true }) else {};
++            pub const MAX_UNIFORM_BLOCK_SIZE = if (version == 2) bridge.property(@as(u32, 0x8A30), .{ .template = true }) else {};
++            pub const MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS = if (version == 2) bridge.property(@as(u32, 0x8A31), .{ .template = true }) else {};
++            pub const MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS = if (version == 2) bridge.property(@as(u32, 0x8A33), .{ .template = true }) else {};
++            pub const UNIFORM_BUFFER_OFFSET_ALIGNMENT = if (version == 2) bridge.property(@as(u32, 0x8A34), .{ .template = true }) else {};
++            pub const MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS = if (version == 2) bridge.property(@as(u32, 0x8C8A), .{ .template = true }) else {};
++            pub const MIN_PROGRAM_TEXEL_OFFSET = if (version == 2) bridge.property(@as(u32, 0x8904), .{ .template = true }) else {};
++            pub const MAX_PROGRAM_TEXEL_OFFSET = if (version == 2) bridge.property(@as(u32, 0x8905), .{ .template = true }) else {};
++            pub const MAX_TEXTURE_LOD_BIAS = if (version == 2) bridge.property(@as(u32, 0x84FD), .{ .template = true }) else {};
++            pub const MAX_SAMPLES = if (version == 2) bridge.property(@as(u32, 0x8D57), .{ .template = true }) else {};
++            pub const R8 = if (version == 2) bridge.property(@as(u32, 0x8229), .{ .template = true }) else {};
++            pub const RG8 = if (version == 2) bridge.property(@as(u32, 0x822B), .{ .template = true }) else {};
++            pub const RGB8 = if (version == 2) bridge.property(@as(u32, 0x8051), .{ .template = true }) else {};
++            pub const RGBA8 = bridge.property(@as(u32, 0x8058), .{ .template = true });
++            pub const RGB10_A2 = if (version == 2) bridge.property(@as(u32, 0x8059), .{ .template = true }) else {};
++            pub const SRGB8_ALPHA8 = if (version == 2) bridge.property(@as(u32, 0x8C43), .{ .template = true }) else {};
++            pub const DEPTH_COMPONENT24 = if (version == 2) bridge.property(@as(u32, 0x81A6), .{ .template = true }) else {};
++            pub const DEPTH_COMPONENT32F = if (version == 2) bridge.property(@as(u32, 0x8CAC), .{ .template = true }) else {};
++            pub const DEPTH24_STENCIL8 = if (version == 2) bridge.property(@as(u32, 0x88F0), .{ .template = true }) else {};
++            pub const DEPTH32F_STENCIL8 = if (version == 2) bridge.property(@as(u32, 0x8CAD), .{ .template = true }) else {};
++            pub const R8I = if (version == 2) bridge.property(@as(u32, 0x8231), .{ .template = true }) else {};
++            pub const R8UI = if (version == 2) bridge.property(@as(u32, 0x8232), .{ .template = true }) else {};
++            pub const R16I = if (version == 2) bridge.property(@as(u32, 0x8233), .{ .template = true }) else {};
++            pub const R16UI = if (version == 2) bridge.property(@as(u32, 0x8234), .{ .template = true }) else {};
++            pub const R32I = if (version == 2) bridge.property(@as(u32, 0x8235), .{ .template = true }) else {};
++            pub const R32UI = if (version == 2) bridge.property(@as(u32, 0x8236), .{ .template = true }) else {};
++            pub const RG8I = if (version == 2) bridge.property(@as(u32, 0x8237), .{ .template = true }) else {};
++            pub const RG8UI = if (version == 2) bridge.property(@as(u32, 0x8238), .{ .template = true }) else {};
++            pub const RG16I = if (version == 2) bridge.property(@as(u32, 0x8239), .{ .template = true }) else {};
++            pub const RG16UI = if (version == 2) bridge.property(@as(u32, 0x823A), .{ .template = true }) else {};
++            pub const RG32I = if (version == 2) bridge.property(@as(u32, 0x823B), .{ .template = true }) else {};
++            pub const RG32UI = if (version == 2) bridge.property(@as(u32, 0x823C), .{ .template = true }) else {};
++            pub const RGBA8I = if (version == 2) bridge.property(@as(u32, 0x8D8E), .{ .template = true }) else {};
++            pub const RGBA8UI = if (version == 2) bridge.property(@as(u32, 0x8D7C), .{ .template = true }) else {};
++            pub const RGBA16I = if (version == 2) bridge.property(@as(u32, 0x8D88), .{ .template = true }) else {};
++            pub const RGBA16UI = if (version == 2) bridge.property(@as(u32, 0x8D76), .{ .template = true }) else {};
++            pub const RGBA32I = if (version == 2) bridge.property(@as(u32, 0x8D82), .{ .template = true }) else {};
++            pub const RGBA32UI = if (version == 2) bridge.property(@as(u32, 0x8D70), .{ .template = true }) else {};
++            pub const RGB10_A2UI = if (version == 2) bridge.property(@as(u32, 0x906F), .{ .template = true }) else {};
+         };
+     };
+ }
+diff --git a/src/browser/webapi/element/html/Canvas.zig b/src/browser/webapi/element/html/Canvas.zig
+index 47db86e..0af76fa 100644
+--- a/src/browser/webapi/element/html/Canvas.zig
++++ b/src/browser/webapi/element/html/Canvas.zig
+@@ -79,7 +79,11 @@ const DrawingContext = union(enum) {
+     webgl2: *WebGL.WebGL2RenderingContext,
+ };
+ 
+-fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?DrawingContext {
++fn getContext(self: *Canvas, context_type: []const u8, options: ?js.Value, frame: *Frame) !?DrawingContext {
++    const attributes = if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl") or std.mem.eql(u8, context_type, "webgl2"))
++        try WebGL.Attributes.parse(options)
++    else
++        WebGL.Attributes{};
+     if (self._cached) |cached| {
+         const matches = switch (cached) {
+             .@"2d" => std.mem.eql(u8, context_type, "2d"),
+@@ -96,11 +100,11 @@ fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?DrawingC
+         }
+ 
+         if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) {
+-            const ctx = try frame._factory.create(WebGL.WebGLRenderingContext{ ._canvas = .{ .html = self } });
++            const ctx = try frame._factory.create(WebGL.WebGLRenderingContext{ ._canvas = .{ .html = self }, ._attributes = attributes });
+             break :blk .{ .webgl = ctx };
+         }
+         if (std.mem.eql(u8, context_type, "webgl2")) {
+-            const ctx = try frame._factory.create(WebGL.WebGL2RenderingContext{ ._canvas = .{ .html = self } });
++            const ctx = try frame._factory.create(WebGL.WebGL2RenderingContext{ ._canvas = .{ .html = self }, ._attributes = attributes });
+             break :blk .{ .webgl2 = ctx };
+         }
+         return null;

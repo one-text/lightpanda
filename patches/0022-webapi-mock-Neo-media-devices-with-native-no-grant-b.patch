@@ -1,0 +1,1045 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 14 Oct 2026 21:52:20 -0300
+Subject: [PATCH] webapi: mock Neo media devices with native no-grant bindings
+
+Expose Window-only, secure-context MediaDevices, MediaDeviceInfo and
+InputDeviceInfo using native Zig/V8 bindings. Model the MacBook Neo's
+logical microphone, camera and speaker endpoints without consulting host
+hardware. Return fresh anonymized device objects; hide labels, IDs and
+input capabilities before any capture grant.
+
+Match the ordinary Chrome prototype surface: enumerateDevices,
+getSupportedConstraints, getUserMedia, getDisplayMedia,
+setCaptureHandleConfig and ondevicechange. Capture requests are validated
+and refused, never resolved to nonexistent streams. Interpret the media
+permissions-policy directives for enumeration and screen-capture
+delegation; do not introduce a general policy API or successful capture.
+
+Preserve Navigator singleton identity, device branding and inheritance,
+secure exposure across origin changes, native receiver checks, dictionary
+conversion order, IteratorClose and EventTarget listener behavior.
+Populate sequence results with own data properties. Use weak finalizers
+for disposable device chains, page-backed escaping DOMExceptions and
+Promise settlement without a mid-script microtask checkpoint.
+
+Scope: static no-capture-grant persona, not permission UI, host enumeration,
+hot-plug events, actual streams or a configurable hardware backend.
+Explicit capture grants through CDP are not modeled by this API.
+Reference API shape uses pinned Chromium 155.0.8053.0 Blink IDL/source,
+with Chrome 154 Linux observations for engine-level descriptors; an
+actual Mac Chrome reference was not available. Hardware follows AGENTS.md.
+
+References:
+https://w3c.github.io/mediacapture-main/
+https://w3c.github.io/mediacapture-screen-share/
+https://w3c.github.io/mediacapture-handle/identity/
+https://github.com/chromium/chromium/tree/155.0.8053.0/third_party/blink/renderer/modules/mediastream
+https://www.apple.com/macbook-neo/specs/
+
+Validation before export: existing upstream suite 1658/1658; temporary
+native API diagnostics 91/91; matching diagnostic-only GC snapshot 92/92,
+including collectible enumeration devices and retained metadata/errors.
+No new persistent unit tests or benchmark assertions.
+---
+ src/browser/js/Context.zig               |  11 +
+ src/browser/js/Env.zig                   |  58 +++++
+ src/browser/js/bridge.zig                |   3 +
+ src/browser/webapi/EventTarget.zig       |  18 ++
+ src/browser/webapi/InputDeviceInfo.zig   |  44 ++++
+ src/browser/webapi/MediaDeviceInfo.zig   |  98 +++++++
+ src/browser/webapi/MediaDevices.zig      | 313 +++++++++++++++++++++++
+ src/browser/webapi/Navigator.zig         |  10 +
+ src/browser/webapi/media_constraints.zig | 254 ++++++++++++++++++
+ 9 files changed, 809 insertions(+)
+ create mode 100644 src/browser/webapi/InputDeviceInfo.zig
+ create mode 100644 src/browser/webapi/MediaDeviceInfo.zig
+ create mode 100644 src/browser/webapi/MediaDevices.zig
+ create mode 100644 src/browser/webapi/media_constraints.zig
+
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index e18d9dc..15ec165 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -66,6 +66,11 @@ object_freeze: v8.Global,
+ // Native entries saved only while [SecureContext] battery APIs are hidden.
+ battery_bindings: ?struct { method: v8.Global, interface: v8.Global } = null,
+ web_share_bindings: ?[2]v8.Global = null,
++media_device_bindings: ?struct {
++    descriptor: v8.Global,
++    define_property: v8.Global,
++    interfaces: [3]v8.Global,
++} = null,
+ 
+ cpu_profiler: ?*v8.CpuProfiler = null,
+ 
+@@ -240,6 +245,11 @@ pub fn deinit(self: *Context) void {
+     if (self.web_share_bindings) |*bindings| {
+         for (bindings) |*binding| v8.v8__Global__Reset(binding);
+     }
++    if (self.media_device_bindings) |*bindings| {
++        v8.v8__Global__Reset(&bindings.descriptor);
++        v8.v8__Global__Reset(&bindings.define_property);
++        for (&bindings.interfaces) |*binding| v8.v8__Global__Reset(binding);
++    }
+     v8.v8__Global__Reset(&self.object_freeze);
+     v8.v8__Global__Reset(&self.handle);
+     env.isolate.notifyContextDisposed();
+@@ -274,6 +284,7 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
+             const secure = self.execution.isSecureContext();
+             env.setBatteryExposure(self, ls.local.handle, global_obj, secure);
+             env.setWebShareExposure(self, ls.local.handle, global_obj, secure);
++            try env.setMediaDevicesExposure(self, ls.local.handle, global_obj, secure);
+             // With the feature disabled, Env.createContext already hid this API.
+             if (!secure and self.page.session.experimental_features.serviceworker) {
+                 env.hideServiceWorker(true, ls.local.handle, global_obj);
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 50d476f..22a5ae0 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -522,6 +522,56 @@ pub fn setWebShareExposure(self: *const Env, ctx: *Context, v8_context: *const v
+     }
+ }
+ 
++pub fn setMediaDevicesExposure(self: *const Env, ctx: *Context, v8_context: *const v8.Context, global_obj: *const v8.Object, secure: bool) !void {
++    if (secure == (ctx.media_device_bindings == null)) return;
++    const isolate = self.isolate.handle;
++    const names = &self.disabled_api_names;
++    const constructor = v8.v8__Object__Get(global_obj, v8_context, @ptrCast(names.get(isolate, "navigator"))) orelse return error.JsException;
++    const prototype: *const v8.Object = @ptrCast(v8.v8__Object__Get(@ptrCast(constructor), v8_context, @ptrCast(names.get(isolate, "prototype"))) orelse return error.JsException);
++    const key = names.get(isolate, "media_devices");
++    const keys = [_]*const v8.String{
++        names.get(isolate, "media_devices_interface"),
++        names.get(isolate, "media_device_info"),
++        names.get(isolate, "input_device_info"),
++    };
++    var result: v8.MaybeBool = undefined;
++    if (secure) {
++        const bindings = &ctx.media_device_bindings.?;
++        const args = [_]?*const v8.Value{
++            @ptrCast(prototype), @ptrCast(key), v8.v8__Global__Get(&bindings.descriptor, isolate),
++        };
++        const define: *const v8.Function = @ptrCast(v8.v8__Global__Get(&bindings.define_property, isolate));
++        _ = v8.v8__Function__Call(define, v8_context, @ptrCast(global_obj), args.len, &args) orelse return error.JsException;
++        for (keys, &bindings.interfaces) |interface_key, *binding| {
++            v8.v8__Object__DefineOwnProperty(global_obj, v8_context, @ptrCast(interface_key), v8.v8__Global__Get(binding, isolate), v8.DontEnum, &result);
++            if (!result.has_value or !result.value) return error.JsException;
++        }
++        v8.v8__Global__Reset(&bindings.descriptor);
++        v8.v8__Global__Reset(&bindings.define_property);
++        for (&bindings.interfaces) |*binding| v8.v8__Global__Reset(binding);
++        ctx.media_device_bindings = null;
++    } else {
++        const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(prototype, v8_context, @ptrCast(key)) orelse return error.JsException;
++        const object = v8.v8__Object__Get(global_obj, v8_context, self.isolate.initStringHandle("Object")) orelse return error.JsException;
++        const define = v8.v8__Object__Get(@ptrCast(object), v8_context, self.isolate.initStringHandle("defineProperty")) orelse return error.JsException;
++        var interfaces: [3]*const v8.Value = undefined;
++        for (keys, &interfaces) |interface_key, *interface| {
++            interface.* = v8.v8__Object__Get(global_obj, v8_context, @ptrCast(interface_key)) orelse return error.JsException;
++        }
++        ctx.media_device_bindings = .{ .descriptor = undefined, .define_property = undefined, .interfaces = undefined };
++        const bindings = &ctx.media_device_bindings.?;
++        v8.v8__Global__New(isolate, descriptor, &bindings.descriptor);
++        v8.v8__Global__New(isolate, define, &bindings.define_property);
++        for (interfaces, &bindings.interfaces) |interface, *binding| v8.v8__Global__New(isolate, interface, binding);
++        v8.v8__Object__Delete(prototype, v8_context, @ptrCast(key), &result);
++        if (!result.has_value or !result.value) return error.JsException;
++        for (keys) |interface_key| {
++            v8.v8__Object__Delete(global_obj, v8_context, @ptrCast(interface_key), &result);
++            if (!result.has_value or !result.value) return error.JsException;
++        }
++    }
++}
++
+ fn deletePrototypeMember(self: *const Env, v8_context: *const v8.Context, global_obj: *const v8.Object, comptime interface: []const u8, comptime member: []const u8) void {
+     const isolate = self.isolate.handle;
+     const names = &self.disabled_api_names;
+@@ -934,6 +984,10 @@ const DisabledApiNames = struct {
+     battery_manager: v8.Eternal,
+     can_share: v8.Eternal,
+     share: v8.Eternal,
++    media_devices: v8.Eternal,
++    media_devices_interface: v8.Eternal,
++    media_device_info: v8.Eternal,
++    input_device_info: v8.Eternal,
+ 
+     fn init(isolate: *v8.Isolate) DisabledApiNames {
+         var self: DisabledApiNames = undefined;
+@@ -947,6 +1001,10 @@ const DisabledApiNames = struct {
+         intern(isolate, &self.battery_manager, "BatteryManager");
+         intern(isolate, &self.can_share, "canShare");
+         intern(isolate, &self.share, "share");
++        intern(isolate, &self.media_devices, "mediaDevices");
++        intern(isolate, &self.media_devices_interface, "MediaDevices");
++        intern(isolate, &self.media_device_info, "MediaDeviceInfo");
++        intern(isolate, &self.input_device_info, "InputDeviceInfo");
+         return self;
+     }
+ 
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index c1bc6d2..80eb5de 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1030,6 +1030,9 @@ pub const SubType = enum {
+ // APIs for Page/Window contexts. Used by Snapshot.zig for Page snapshot creation.
+ pub const PageJsApis = flattenTypes(&.{
+     @import("../webapi/BatteryManager.zig"),
++    @import("../webapi/MediaDevices.zig"),
++    @import("../webapi/MediaDeviceInfo.zig"),
++    @import("../webapi/InputDeviceInfo.zig"),
+     @import("../webapi/NetworkInformation.zig"),
+     @import("../webapi/AbortController.zig"),
+     @import("../webapi/AbortSignal.zig"),
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index 1f18dc3..5d1c1bf 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -63,6 +63,7 @@ const RegisterOptions = EventManager.RegisterOptions;
+ 
+ const BatteryManager = @import("BatteryManager.zig");
+ const NetworkInformation = @import("NetworkInformation.zig");
++const MediaDevices = @import("MediaDevices.zig");
+ 
+ const EventTarget = @This();
+ 
+@@ -86,6 +87,7 @@ pub const Type = enum(u8) {
+     idb_database,
+     idb_request,
+     idb_transaction,
++    media_devices,
+     media_query_list,
+     message_port,
+     navigation,
+@@ -124,6 +126,7 @@ pub fn Subtype(comptime tag: Type) type {
+         .idb_database => IDBDatabase,
+         .idb_request => IDBRequest,
+         .idb_transaction => IDBTransaction,
++        .media_devices => MediaDevices,
+         .media_query_list => MediaQueryList,
+         .message_port => MessagePort,
+         .navigation => Navigation,
+@@ -198,6 +201,11 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
+         return !event._cancelable or !event._prevent_default;
+     }
+ 
++    if (self._type == .media_devices) {
++        try self.subtype(MediaDevices).dispatch(event, exec);
++        return !event._cancelable or !event._prevent_default;
++    }
++
+     if (self._type == .network_information) {
+         try self.subtype(NetworkInformation).dispatch(event, exec);
+         return !event._cancelable or !event._prevent_default;
+@@ -300,6 +308,10 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
+         _ = try self.subtype(BatteryManager)._events.register(self, typ, em_callback, options);
+         return;
+     }
++    if (self._type == .media_devices) {
++        _ = try self.subtype(MediaDevices)._events.register(self, typ, em_callback, options);
++        return;
++    }
+     if (self._type == .network_information) {
+         _ = try self.subtype(NetworkInformation)._events.register(self, typ, em_callback, options);
+         return;
+@@ -342,6 +354,10 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
+         self.subtype(BatteryManager)._events.remove(self, typ, em_callback, use_capture);
+         return;
+     }
++    if (self._type == .media_devices) {
++        self.subtype(MediaDevices)._events.remove(self, typ, em_callback, use_capture);
++        return;
++    }
+     if (self._type == .network_information) {
+         self.subtype(NetworkInformation)._events.remove(self, typ, em_callback, use_capture);
+         return;
+@@ -363,6 +379,7 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         .xhr => writer.writeAll("<XMLHttpRequestEventTarget>"),
+         .abort_signal => writer.writeAll("<AbortSignal>"),
+         .battery_manager => writer.writeAll("<BatteryManager>"),
++        .media_devices => writer.writeAll("<MediaDevices>"),
+         .media_query_list => writer.writeAll("<MediaQueryList>"),
+         .message_port => writer.writeAll("<MessagePort>"),
+         .broadcast_channel => writer.writeAll("<BroadcastChannel>"),
+@@ -398,6 +415,7 @@ pub fn toString(self: *EventTarget) []const u8 {
+         .idb_database => return "[object IDBDatabase]",
+         .idb_request => return "[object IDBRequest]",
+         .idb_transaction => return "[object IDBTransaction]",
++        .media_devices => return "[object MediaDevices]",
+         .media_query_list => return "[object MediaQueryList]",
+         .message_port => return "[object MessagePort]",
+         .navigation => return "[object Navigation]",
+diff --git a/src/browser/webapi/InputDeviceInfo.zig b/src/browser/webapi/InputDeviceInfo.zig
+new file mode 100644
+index 0000000..e2fed8c
+--- /dev/null
++++ b/src/browser/webapi/InputDeviceInfo.zig
+@@ -0,0 +1,44 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const js = @import("../js/js.zig");
++const MediaDeviceInfo = @import("MediaDeviceInfo.zig");
++
++const InputDeviceInfo = @This();
++pub const Proto = MediaDeviceInfo;
++
++_proto: *MediaDeviceInfo,
++
++pub fn creationContext(self: *const InputDeviceInfo, local: *const js.Local) *const js.v8.Context {
++    return self._proto.creationContext(local);
++}
++
++fn getCapabilities(_: *const InputDeviceInfo, exec: *js.Execution) js.Object {
++    // Input capabilities are withheld until capture permission is granted.
++    return exec.js.local.?.newObject();
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(InputDeviceInfo);
++    pub const Meta = struct {
++        pub const name = "InputDeviceInfo";
++        pub const creation_context = InputDeviceInfo.creationContext;
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const getCapabilities = bridge.function(InputDeviceInfo.getCapabilities, .{});
++};
+diff --git a/src/browser/webapi/MediaDeviceInfo.zig b/src/browser/webapi/MediaDeviceInfo.zig
+new file mode 100644
+index 0000000..f9558a7
+--- /dev/null
++++ b/src/browser/webapi/MediaDeviceInfo.zig
+@@ -0,0 +1,98 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Page = @import("../Page.zig");
++const Factory = @import("../Factory.zig");
++const InputDeviceInfo = @import("InputDeviceInfo.zig");
++const Navigator = @import("Navigator.zig");
++
++const MediaDeviceInfo = @This();
++
++_navigator: *Navigator,
++_kind: []const u8,
++_arena: *lp.Arena,
++_rc: lp.RC = .{},
++
++pub fn init(exec: *js.Execution, navigator: *Navigator, kind: []const u8) !js.Value {
++    const arena = try exec.getArena(.tiny, "MediaDeviceInfo");
++    var owned = true;
++    errdefer if (owned) arena.release();
++    const info = MediaDeviceInfo{ ._navigator = navigator, ._kind = kind, ._arena = arena, ._rc = lp.RC.init(1) };
++    if (@import("std").mem.eql(u8, kind, "audiooutput")) {
++        const device = try arena.create(MediaDeviceInfo);
++        device.* = info;
++        owned = false;
++        defer device.releaseRef(exec.page);
++        return exec.js.local.?.zigValueToJs(device, .{});
++    }
++    const device = try Factory.chainedWithAllocator(arena.allocator(), .{ info, InputDeviceInfo{ ._proto = undefined } });
++    owned = false;
++    defer device._proto.releaseRef(exec.page);
++    return exec.js.local.?.zigValueToJs(device, .{});
++}
++
++pub fn acquireRef(self: *MediaDeviceInfo) void {
++    self._rc.acquire();
++}
++
++pub fn releaseRef(self: *MediaDeviceInfo, page: *Page) void {
++    self._rc.release(self, page);
++}
++
++pub fn deinit(self: *MediaDeviceInfo, _: *Page) void {
++    self._arena.release();
++}
++
++pub fn creationContext(self: *const MediaDeviceInfo, local: *const js.Local) *const js.v8.Context {
++    return self._navigator.creationContext(local);
++}
++
++// Before a capture grant, Chrome exposes one anonymized device per kind.
++fn getPrivateString(_: *const MediaDeviceInfo) []const u8 {
++    return "";
++}
++
++fn getKind(self: *const MediaDeviceInfo) []const u8 {
++    return self._kind;
++}
++
++fn toJSON(self: *const MediaDeviceInfo, exec: *js.Execution) !js.Object {
++    const local = exec.js.local.?;
++    const result = local.newObject();
++    inline for (.{ "deviceId", "kind", "label", "groupId" }) |name| {
++        const value = if (comptime @import("std").mem.eql(u8, name, "kind")) self._kind else "";
++        if (!(result.defineOwnProperty(name, local.newString(value).toValue(), 0) orelse return error.JsException)) return error.TypeError;
++    }
++    return result;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(MediaDeviceInfo);
++    pub const Meta = struct {
++        pub const name = "MediaDeviceInfo";
++        pub const creation_context = MediaDeviceInfo.creationContext;
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const deviceId = bridge.accessor(getPrivateString, null, .{});
++    pub const kind = bridge.accessor(getKind, null, .{});
++    pub const label = bridge.accessor(getPrivateString, null, .{});
++    pub const groupId = bridge.accessor(getPrivateString, null, .{});
++    pub const toJSON = bridge.function(MediaDeviceInfo.toJSON, .{});
++};
+diff --git a/src/browser/webapi/MediaDevices.zig b/src/browser/webapi/MediaDevices.zig
+new file mode 100644
+index 0000000..6e1c003
+--- /dev/null
++++ b/src/browser/webapi/MediaDevices.zig
+@@ -0,0 +1,313 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const lp = @import("lightpanda");
++const js = @import("../js/js.zig");
++const Frame = @import("../Frame.zig");
++const URL = @import("../URL.zig");
++const Navigator = @import("Navigator.zig");
++const MediaDeviceInfo = @import("MediaDeviceInfo.zig");
++const Event = @import("Event.zig");
++const EventTarget = @import("EventTarget.zig");
++const EventManagerBase = @import("../EventManagerBase.zig");
++const DOMException = @import("DOMException.zig");
++const Constraints = @import("media_constraints.zig");
++
++const MediaDevices = @This();
++pub const Proto = EventTarget;
++
++_proto: *EventTarget,
++_navigator: *Navigator,
++_events: EventManagerBase,
++_onchange: ?js.Object.Global = null,
++_change_listener: ?js.Function.Global = null,
++
++pub fn init(exec: *js.Execution, navigator: *Navigator) !*MediaDevices {
++    return exec._factory.eventTargetWithAllocator(exec.arena, MediaDevices{
++        ._proto = undefined,
++        ._navigator = navigator,
++        ._events = EventManagerBase.init(exec.arena),
++    });
++}
++
++pub fn creationContext(self: *const MediaDevices, local: *const js.Local) *const js.v8.Context {
++    return self._navigator.creationContext(local);
++}
++
++fn active(self: *const MediaDevices) bool {
++    if (self._navigator._pdf_detached) return false;
++    const frame = self._navigator._frame orelse return false;
++    return frame.document._frame == frame;
++}
++
++fn enumerateDevices(self: *MediaDevices, exec: *js.Execution) !js.Promise {
++    const local = exec.js.local.?;
++    const resolver = local.createPromiseResolver();
++    if (!self.active()) {
++        try resolver.rejectValue(try exceptionValue(exec, "Current frame is detached", "NotSupportedError"));
++        return resolver.promise();
++    }
++    const frame = self._navigator._frame.?;
++    const array = local.newArray(0);
++    var index: u32 = 0;
++    // The Neo has one logical microphone, built-in camera, and speaker endpoint.
++    // No capture grants: expose only the anonymized default of each kind.
++    for ([_][]const u8{ "audioinput", "videoinput", "audiooutput" }, [_][]const u8{ "microphone", "camera", "speaker-selection" }) |kind, feature| {
++        if (!allowed(frame, feature)) continue;
++        const value = try MediaDeviceInfo.init(exec, self._navigator, kind);
++        var key_buf: [10]u8 = undefined;
++        const key = try std.fmt.bufPrint(&key_buf, "{d}", .{index});
++        if (!(array.toObject().defineOwnProperty(key, value, 0) orelse return error.JsException)) return error.TypeError;
++        index += 1;
++    }
++    try resolver.resolveValue(array.toValue());
++    return resolver.promise();
++}
++
++fn getSupportedConstraints(_: *const MediaDevices, exec: *js.Execution) !js.Object {
++    return Constraints.supported(exec.js.local.?);
++}
++
++fn getUserMedia(self: *MediaDevices, value: ?js.Value, exec: *js.Execution) !js.Promise {
++    return self.capture(value, false, exec);
++}
++
++fn getDisplayMedia(self: *MediaDevices, value: ?js.Value, exec: *js.Execution) !js.Promise {
++    return self.capture(value, true, exec);
++}
++
++fn capture(self: *MediaDevices, value: ?js.Value, display: bool, exec: *js.Execution) !js.Promise {
++    const local = exec.js.local.?;
++    var caught: js.TryCatch = undefined;
++    caught.init(local);
++    defer caught.deinit();
++    self.validateCapture(value, display) catch |err| {
++        if (err == error.ExecutionTerminated or exec.js.env.terminatePending()) return error.ExecutionTerminated;
++        const resolver = local.createPromiseResolver();
++        if (caught.exceptionValue()) |exception| {
++            try resolver.rejectValue(exception);
++        } else if (err == error.TypeError) {
++            try resolver.rejectValue(.{ .local = local, .handle = local.isolate.createTypeError("Invalid media constraints") });
++        } else {
++            const exception = switch (err) {
++                error.NotAllowedError => try exceptionValue(exec, "Permission denied", "NotAllowedError"),
++                error.InvalidStateError => try exceptionValue(exec, "The document is not active or transient activation is missing", "InvalidStateError"),
++                else => return err,
++            };
++            try resolver.rejectValue(exception);
++        }
++        return resolver.promise();
++    };
++    unreachable;
++}
++
++fn validateCapture(self: *MediaDevices, value: ?js.Value, display: bool) !void {
++    const stream = try Constraints.stream(value, display);
++    if (!self.active()) return error.InvalidStateError;
++    if (display) {
++        const frame = self._navigator._frame.?;
++        if (!allowed(frame, "display-capture")) return error.NotAllowedError;
++        const activation = self._navigator._share_activation_ms orelse return error.InvalidStateError;
++        if (lp.datetime.milliTimestamp(.boot) - activation >= 5000) return error.InvalidStateError;
++        if (!stream.video.requested or stream.audio.restricted or stream.video.restricted) return error.TypeError;
++    } else if (!stream.audio.requested and !stream.video.requested) return error.TypeError;
++    // Model the user denying capture, never a successful but non-existent stream.
++    return error.NotAllowedError;
++}
++
++fn exceptionValue(exec: *js.Execution, message: []const u8, name: []const u8) !js.Value {
++    // Native DOMExceptions must survive destruction of their creating context.
++    return exec.js.local.?.zigValueToJs(try exec._factory.create(DOMException.init(message, name)), .{});
++}
++
++fn setCaptureHandleConfig(self: *MediaDevices, value: ?js.Value, exec: *js.Execution) !void {
++    self.validateHandleConfig(value, exec) catch |err| {
++        const exception = switch (err) {
++            error.InvalidStateError => try exceptionValue(exec, "The document is detached or not top-level", "InvalidStateError"),
++            error.NotSupported => try exceptionValue(exec, "Invalid permitted origins", "NotSupportedError"),
++            else => return err,
++        };
++        _ = exec.js.local.?.isolate.throwException(exception.handle);
++        return error.JsException;
++    };
++}
++
++fn validateHandleConfig(self: *MediaDevices, value: ?js.Value, exec: *js.Execution) !void {
++    var origins: std.ArrayList([]const u8) = .empty;
++    var handle_length: c_int = 0;
++    if (try Constraints.dictionary(value)) |object| {
++        _ = (try object.get("exposeOrigin")).toBool();
++        const handle = try object.get("handle");
++        if (!handle.isUndefined()) handle_length = js.v8.v8__String__Length((try Constraints.domString(handle)).handle);
++        const permitted = try object.get("permittedOrigins");
++        if (!permitted.isUndefined()) {
++            const iterator = try permitted.iterator() orelse return error.TypeError;
++            while (try iterator.next()) |item| {
++                errdefer Constraints.closeIterator(iterator, exec.js.local.?);
++                try origins.append(exec.call_arena, try (try Constraints.domString(item)).toSlice());
++            }
++        }
++    }
++    if (handle_length > 1024) return error.TypeError;
++    if (!self.active() or self._navigator._frame.?.parent != null) return error.InvalidStateError;
++    if (origins.items.len == 1 and std.mem.eql(u8, origins.items[0], "*")) return;
++    for (origins.items) |origin| {
++        if (std.mem.eql(u8, origin, "*")) return error.NotSupported;
++        const resolved = URL.resolve(exec.call_arena, "", origin, .{}) catch |err| {
++            if (err == error.TypeError) return error.NotSupported;
++            return err;
++        };
++        if (try URL.getOrigin(exec.call_arena, resolved) == null) return error.NotSupported;
++    }
++    // With no capture backend there is no consumer of an accepted handle config.
++}
++
++fn getOnChange(self: *const MediaDevices) ?js.Object.Global {
++    return self._onchange;
++}
++
++fn setOnChange(self: *MediaDevices, value: js.Value, exec: *js.Execution) !void {
++    const local = exec.js.local.?;
++    const callback = if (value.isObject())
++        try (js.Object{ .local = local, .handle = @ptrCast(value.handle) }).persist()
++    else
++        null;
++    errdefer if (callback) |cb| cb.release();
++
++    // Keep the handler's place among listeners when replacing its callback.
++    if (self._onchange == null and callback != null) {
++        if (self._change_listener == null) {
++            self._change_listener = try local.newCallback(invokeOnChange, self).persist();
++        }
++        _ = try self._events.register(self._proto, "devicechange", .{
++            .function = self._change_listener.?.local(local),
++        }, .{});
++    } else if (self._onchange != null and callback == null) {
++        self._events.remove(self._proto, "devicechange", .{
++            .function = self._change_listener.?.local(local),
++        }, false);
++    }
++
++    if (self._onchange) |old| old.release();
++    self._onchange = callback;
++}
++
++fn invokeOnChange(self: *MediaDevices, event: *Event, exec: *js.Execution) !void {
++    const callback = self._onchange orelse return;
++    const local = exec.js.local.?;
++    const object = callback.local(local);
++    if (!object.toValue().isFunction()) return local.typeError("The event handler is not callable");
++    const function = js.Function{ .local = local, .handle = @ptrCast(object.handle) };
++    const result = try function.callWithThisRethrow(js.Value, self, .{event});
++    if (result.isBoolean() and result.isFalse()) event.preventDefault();
++}
++
++pub fn dispatch(self: *MediaDevices, event: *Event, exec: *js.Execution) !void {
++    event._target = self._proto;
++    event._dispatch_target = self._proto;
++    event._event_phase = .at_target;
++    defer {
++        event._event_phase = .none;
++        event._current_target = null;
++        event._dispatch_target = null;
++        event._stop_propagation = false;
++        event._stop_immediate_propagation = false;
++        event._in_passive_listener = false;
++    }
++    if (event._stop_propagation) return;
++    try self._events.dispatchDirect(exec.page.frame_arena, exec.js, self._proto, event, null, exec.page, .{ .run_microtasks = false });
++}
++
++fn sameOrigin(a: *Frame, b: *Frame) bool {
++    return URL.isSameOrigin(a.origin orelse return false, b.origin orelse return false);
++}
++
++// Only media-device directives are interpreted; this is not a general policy API.
++fn allowed(frame: *Frame, feature: []const u8) bool {
++    return headerAllows(frame, frame, feature) and inheritedAllows(frame, feature);
++}
++
++fn inheritedAllows(frame: *Frame, feature: []const u8) bool {
++    const parent = frame.parent orelse return true;
++    // A parent may delegate to a child without allowing its own origin.
++    if (!inheritedAllows(parent, feature) or !headerAllows(parent, frame, feature)) return false;
++    const iframe = frame.iframe orelse return sameOrigin(parent, frame);
++    const allow = iframe.asElement().getAttributeSafe(.wrap("allow")) orelse return sameOrigin(parent, frame);
++    var directives = std.mem.splitScalar(u8, allow, ';');
++    while (directives.next()) |directive| {
++        var tokens = std.mem.tokenizeAny(u8, directive, " \t\r\n");
++        if (!std.mem.eql(u8, tokens.next() orelse continue, feature)) continue;
++        var token = tokens.next();
++        if (token == null) return sourceMatches(frame, parent, iframe.asElement().getAttributeSafe(.wrap("src")) orelse "");
++        var matches = false;
++        while (token) |item| : (token = tokens.next()) {
++            if (std.mem.eql(u8, item, "'none'")) return false;
++            if (std.mem.eql(u8, item, "*") or
++                (std.mem.eql(u8, item, "'self'") and sameOrigin(parent, frame)) or
++                (std.mem.eql(u8, item, "'src'") and sourceMatches(frame, parent, iframe.asElement().getAttributeSafe(.wrap("src")) orelse "")) or
++                URL.isSameOrigin(item, frame.origin orelse "")) matches = true;
++        }
++        return matches;
++    }
++    return sameOrigin(parent, frame);
++}
++
++fn sourceMatches(frame: *Frame, parent: *Frame, source: []const u8) bool {
++    if (source.len == 0) return sameOrigin(frame, parent);
++    const resolved = URL.resolve(parent.call_arena, parent.base(), source, .{}) catch return false;
++    return frame.isSameOrigin(resolved);
++}
++
++fn headerAllows(owner: *Frame, target: *Frame, feature: []const u8) bool {
++    for (owner._http_headers.items) |header| {
++        if (!std.ascii.eqlIgnoreCase(header.name, "permissions-policy")) continue;
++        var directives = std.mem.splitScalar(u8, header.value, ',');
++        while (directives.next()) |directive| {
++            const equal = std.mem.indexOfScalar(u8, directive, '=') orelse continue;
++            if (!std.mem.eql(u8, std.mem.trim(u8, directive[0..equal], " \t"), feature)) continue;
++            const list = std.mem.trim(u8, directive[equal + 1 ..], " \t");
++            if (std.mem.eql(u8, list, "*")) continue;
++            if (list.len < 2 or list[0] != '(' or list[list.len - 1] != ')') continue;
++            var tokens = std.mem.tokenizeAny(u8, list[1 .. list.len - 1], " \t");
++            var matches = false;
++            while (tokens.next()) |token| {
++                if (std.mem.eql(u8, token, "self") and sameOrigin(owner, target)) matches = true;
++                if (token.len >= 2 and token[0] == '"' and token[token.len - 1] == '"' and
++                    URL.isSameOrigin(token[1 .. token.len - 1], target.origin orelse "")) matches = true;
++            }
++            if (!matches) return false;
++        }
++    }
++    return true;
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(MediaDevices);
++    pub const Meta = struct {
++        pub const name = "MediaDevices";
++        pub const creation_context = MediaDevices.creationContext;
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++    pub const ondevicechange = bridge.accessor(getOnChange, setOnChange, .{});
++    pub const enumerateDevices = bridge.function(MediaDevices.enumerateDevices, .{});
++    pub const getSupportedConstraints = bridge.function(MediaDevices.getSupportedConstraints, .{});
++    pub const getUserMedia = bridge.function(MediaDevices.getUserMedia, .{});
++    pub const getDisplayMedia = bridge.function(MediaDevices.getDisplayMedia, .{});
++    pub const setCaptureHandleConfig = bridge.function(MediaDevices.setCaptureHandleConfig, .{});
++};
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index 009c1b6..fc6318c 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -34,6 +34,7 @@ const Geolocation = @import("geolocation/Geolocation.zig");
+ const ServiceWorkerContainer = @import("ServiceWorkerContainer.zig");
+ const BatteryManager = @import("BatteryManager.zig");
+ const NetworkInformation = @import("NetworkInformation.zig");
++const MediaDevices = @import("MediaDevices.zig");
+ const WebShare = @import("WebShare.zig");
+ 
+ const Navigator = @This();
+@@ -56,6 +57,7 @@ _geolocation: ?*Geolocation = null,
+ _storage: StorageManager = .{},
+ _ua_data: NavigatorUAData = .{},
+ _service_worker: ?*ServiceWorkerContainer = null,
++_media_devices: ?*MediaDevices = null,
+ _share_pending: bool = false,
+ _share_activation_ms: ?u64 = null,
+ 
+@@ -214,6 +216,13 @@ fn getStorage(self: *Navigator) *StorageManager {
+     return &self._storage;
+ }
+ 
++fn getMediaDevices(self: *Navigator, exec: *Execution) !*MediaDevices {
++    if (self._media_devices) |devices| return devices;
++    const devices = try MediaDevices.init(exec, self);
++    self._media_devices = devices;
++    return devices;
++}
++
+ fn getConnection(_: *Navigator, exec: *Execution) !*NetworkInformation {
+     return NetworkInformation.init(exec);
+ }
+@@ -359,6 +368,7 @@ pub const JsApi = struct {
+     pub const permissions = bridge.accessor(Navigator.getPermissions, null, .{});
+     pub const storage = bridge.accessor(Navigator.getStorage, null, .{});
+     pub const connection = bridge.accessor(Navigator.getConnection, null, .{ .cache = .{ .private = "network_information" } });
++    pub const mediaDevices = bridge.accessor(Navigator.getMediaDevices, null, .{ .exposed = .window });
+     pub const serviceWorker = bridge.accessor(Navigator.getServiceWorker, null, .{});
+     pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});
+     pub const plugins = bridge.accessor(Navigator.getPlugins, null, .{});
+diff --git a/src/browser/webapi/media_constraints.zig b/src/browser/webapi/media_constraints.zig
+new file mode 100644
+index 0000000..12fbbd2
+--- /dev/null
++++ b/src/browser/webapi/media_constraints.zig
+@@ -0,0 +1,254 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const js = @import("../js/js.zig");
++
++const Kind = enum { integer, number, boolean, boolean_string, string, points, boolean_number };
++const Constraint = struct { name: []const u8, kind: Kind };
++
++// Chrome 155's enabled MediaTrackSupportedConstraints, in Web IDL order.
++const constraints = [_]Constraint{
++    .{ .name = "aspectRatio", .kind = .number },
++    .{ .name = "autoGainControl", .kind = .boolean },
++    .{ .name = "brightness", .kind = .number },
++    .{ .name = "channelCount", .kind = .integer },
++    .{ .name = "colorTemperature", .kind = .number },
++    .{ .name = "contrast", .kind = .number },
++    .{ .name = "deviceId", .kind = .string },
++    .{ .name = "displaySurface", .kind = .string },
++    .{ .name = "echoCancellation", .kind = .boolean_string },
++    .{ .name = "exposureCompensation", .kind = .number },
++    .{ .name = "exposureMode", .kind = .string },
++    .{ .name = "exposureTime", .kind = .number },
++    .{ .name = "facingMode", .kind = .string },
++    .{ .name = "focusDistance", .kind = .number },
++    .{ .name = "focusMode", .kind = .string },
++    .{ .name = "frameRate", .kind = .number },
++    .{ .name = "groupId", .kind = .string },
++    .{ .name = "height", .kind = .integer },
++    .{ .name = "iso", .kind = .number },
++    .{ .name = "latency", .kind = .number },
++    .{ .name = "noiseSuppression", .kind = .boolean },
++    .{ .name = "pan", .kind = .boolean_number },
++    .{ .name = "pointsOfInterest", .kind = .points },
++    .{ .name = "resizeMode", .kind = .string },
++    .{ .name = "restrictOwnAudio", .kind = .boolean },
++    .{ .name = "sampleRate", .kind = .integer },
++    .{ .name = "sampleSize", .kind = .integer },
++    .{ .name = "saturation", .kind = .number },
++    .{ .name = "sharpness", .kind = .number },
++    .{ .name = "suppressLocalAudioPlayback", .kind = .boolean },
++    .{ .name = "tilt", .kind = .boolean_number },
++    .{ .name = "torch", .kind = .boolean },
++    .{ .name = "voiceIsolation", .kind = .boolean },
++    .{ .name = "whiteBalanceMode", .kind = .string },
++    .{ .name = "width", .kind = .integer },
++    .{ .name = "zoom", .kind = .boolean_number },
++};
++
++pub fn supported(local: *const js.Local) !js.Object {
++    const result = local.newObject();
++    for (constraints) |constraint| {
++        if (!(result.defineOwnProperty(constraint.name, try local.zigValueToJs(true, .{}), 0) orelse return error.JsException)) return error.TypeError;
++    }
++    return result;
++}
++
++pub fn dictionary(value: ?js.Value) !?js.Object {
++    const input = value orelse return null;
++    if (input.isNullOrUndefined()) return null;
++    if (!input.isObject()) return error.TypeError;
++    return input.toObject();
++}
++
++pub fn domString(value: js.Value) !js.String {
++    if (value.isSymbol()) return error.TypeError;
++    return value.toString();
++}
++
++pub const Track = struct {
++    requested: bool,
++    restricted: bool = false,
++};
++
++pub fn track(value: js.Value, default: bool) !Track {
++    if (value.isUndefined()) return .{ .requested = default };
++    if (!value.isObject() and !value.isNull()) return .{ .requested = value.toBool() };
++    var result: Track = .{ .requested = true };
++    if (!value.isNull()) {
++        const object = value.toObject();
++        result.restricted = try constraintSet(object);
++        // MediaTrackConstraints inherits MediaTrackConstraintSet; advanced is
++        // read after all the base members, not between aspectRatio and audio.
++        const advanced = try object.get("advanced");
++        if (!advanced.isUndefined()) {
++            const iterator = try advanced.iterator() orelse return error.TypeError;
++            while (try iterator.next()) |item| {
++                errdefer closeIterator(iterator, value.local);
++                const set = try dictionary(item);
++                if (set) |o| _ = try constraintSet(o);
++            }
++            result.restricted = true;
++        }
++    }
++    return result;
++}
++
++fn constraintSet(object: js.Object) !bool {
++    var restricted = false;
++    const optional = try object.get("_optional");
++    if (!optional.isUndefined()) {
++        const iterator = try optional.iterator() orelse return error.TypeError;
++        while (try iterator.next()) |item| {
++            errdefer closeIterator(iterator, object.local);
++            if (!item.isObject()) return error.TypeError;
++        }
++    }
++    for (constraints) |constraint| {
++        // mandatory sorts between latency and noiseSuppression.
++        if (std.mem.eql(u8, constraint.name, "noiseSuppression")) {
++            const mandatory = try object.get("mandatory");
++            if (!mandatory.isUndefined() and !mandatory.isObject()) return error.TypeError;
++        }
++        const value = try object.get(constraint.name);
++        if (value.isUndefined()) continue;
++        restricted = (try convertConstraint(value, constraint.kind)) or restricted;
++    }
++    return restricted;
++}
++
++fn convertConstraint(value: js.Value, kind: Kind) !bool {
++    if (kind == .string and value.isObject()) {
++        if (try value.iterator()) |iterator| {
++            try stringSequence(iterator, value.local);
++            return false;
++        }
++    }
++    if (kind == .points) {
++        if (try value.iterator()) |iterator| {
++            try pointSequence(iterator);
++            return false;
++        }
++    }
++    if (value.isObject() or value.isNull()) {
++        const object = try dictionary(value) orelse return false;
++        var restricted = false;
++        // Numeric ranges inherit max/min; read the base dictionary first.
++        // Nonnumeric parameter dictionaries have only exact/ideal.
++        for ([_][]const u8{ "max", "min", "exact", "ideal" }) |name| {
++            const numeric = kind == .integer or kind == .number or kind == .boolean_number;
++            if (!numeric and (std.mem.eql(u8, name, "max") or std.mem.eql(u8, name, "min"))) continue;
++            const member = try object.get(name);
++            if (member.isUndefined()) continue;
++            try scalar(member, if (kind == .boolean_number) .number else kind);
++            if (std.mem.eql(u8, name, "exact") or std.mem.eql(u8, name, "min")) restricted = true;
++        }
++        return restricted;
++    }
++    try scalar(value, kind);
++    return false;
++}
++
++fn scalar(value: js.Value, kind: Kind) !void {
++    switch (kind) {
++        .integer => {
++            _ = try value.toI32();
++        },
++        .number, .boolean_number => {
++            if (kind == .boolean_number and value.isBoolean()) return;
++            if (!std.math.isFinite(try value.toF64())) return error.TypeError;
++        },
++        .boolean => {
++            _ = value.toBool();
++        },
++        .boolean_string => {
++            if (value.isBoolean()) return;
++            _ = try domString(value);
++        },
++        .string => {
++            if (value.isObject()) {
++                if (try value.iterator()) |iterator| {
++                    try stringSequence(iterator, value.local);
++                    return;
++                }
++            }
++            _ = try domString(value);
++        },
++        .points => {
++            const iterator = try value.iterator() orelse return error.TypeError;
++            try pointSequence(iterator);
++        },
++    }
++}
++
++fn stringSequence(iterator: js.Value.Iterator, local: *const js.Local) !void {
++    while (try iterator.next()) |item| {
++        errdefer closeIterator(iterator, local);
++        _ = try domString(item);
++    }
++}
++
++pub fn closeIterator(iterator: js.Value.Iterator, local: *const js.Local) void {
++    // IteratorClose with a throwing completion preserves the original error.
++    var caught: js.TryCatch = undefined;
++    caught.init(local);
++    defer caught.deinit();
++    const method = iterator.object.getFunction("return") catch return;
++    const function = method orelse return;
++    _ = function.callWithThisRethrow(js.Value, iterator.object, .{}) catch {};
++}
++
++fn pointSequence(iterator: js.Value.Iterator) !void {
++    while (try iterator.next()) |item| {
++        errdefer closeIterator(iterator, item.local);
++        if (try dictionary(item)) |point| {
++            inline for (.{ "x", "y" }) |name| {
++                const v = try point.get(name);
++                if (!v.isUndefined() and !std.math.isFinite(try v.toF64())) return error.TypeError;
++            }
++        }
++    }
++}
++
++pub const Stream = struct { audio: Track = .{ .requested = false }, video: Track = .{ .requested = false } };
++
++pub fn stream(value: ?js.Value, display: bool) !Stream {
++    var result: Stream = .{ .video = .{ .requested = display } };
++    const object = try dictionary(value) orelse return result;
++    result.audio = try track(try object.get("audio"), false);
++    if (display) {
++        const controller = try object.get("controller");
++        if (!controller.isUndefined()) return error.TypeError;
++        _ = try enumMember(object, "monitorTypeSurfaces", &.{ "include", "exclude" });
++        _ = (try object.get("preferCurrentTab")).toBool();
++        _ = try enumMember(object, "selfBrowserSurface", &.{ "include", "exclude" });
++        _ = try enumMember(object, "surfaceSwitching", &.{ "include", "exclude" });
++        _ = try enumMember(object, "systemAudio", &.{ "include", "exclude" });
++    }
++    result.video = try track(try object.get("video"), display);
++    if (display) _ = try enumMember(object, "windowAudio", &.{ "system", "window", "exclude" });
++    return result;
++}
++
++fn enumMember(object: js.Object, name: []const u8, choices: []const []const u8) !?[]const u8 {
++    const value = try object.get(name);
++    if (value.isUndefined()) return null;
++    const text = try (try domString(value)).toSlice();
++    for (choices) |choice| if (std.mem.eql(u8, text, choice)) return text;
++    return error.TypeError;
++}

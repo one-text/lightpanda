@@ -1,0 +1,570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 5 Nov 2026 01:21:16 -0300
+Subject: [PATCH] webapi: resolve native fixed and absolute positioned
+ rectangles
+
+Add cascaded position/top/left to the existing geometry group, retaining
+explicit zero, fractional and negative insets and existing absolute/viewport
+length conversion. Use the owning frame and the normal cascade invalidation
+paths. Computed styles expose resolved insets without replacing unresolved
+inline percentages, em or calc expressions with fabricated zero/auto values.
+
+Resolve explicit fixed/absolute coordinates through containing blocks using
+an iterative native walk. Keep getBoundingClientRect and getClientRects on
+native DOMRect objects, preserve visibility:hidden boxes and display:none
+suppression, and retain the existing X-translation subset. Explicit positioned
+offsetTop/offsetLeft remain rounded, untransformed containing-block offsets.
+
+Keep range/observer rectangles and hit testing on the same coordinate model.
+Reject out-of-viewport hit tests and reuse traversal preorder positions to
+avoid recounting sibling subtrees for each descendant of a positioned wrapper.
+Include supported positioned bounds in document/direct-child scroll extents.
+Clamp large scroll targets before integer conversion; viewport-fixed chains
+stay put while fixed descendants of transformed ancestors can scroll into view.
+
+This remains synthetic layout, not a general CSS renderer. Normal flow keeps
+its existing heuristic coordinates. Percentage/auto inset layout, relative
+and sticky displacement, complete padding/border boxes, full transforms,
+painting order and complete scrollIntoView options are outside this patch.
+No benchmark or upstream test changes, and no new upstream tests.
+
+Validation: ReleaseFast build, all 1658 upstream tests and 41 temporary native
+geometry/API-safety diagnostics pass. The unchanged benchmark improves from
+120/130 (92.31%) to 122/130 (93.85%): only zero-size-ghost-geometry and
+domrect-consistency change verdict, both to passing. One reviewer pass found
+scroll-target overflow, extent/scrolling inconsistencies, unresolved CSSOM
+regression, viewport hit-test bounds and repeated preorder work; addressed
+before final validation.
+
+References:
+https://drafts.csswg.org/css-position-3/
+https://drafts.csswg.org/cssom-view/#extension-to-the-element-interface
+---
+ src/browser/StyleManager.zig                  |  65 ++++++-
+ src/browser/webapi/Document.zig               |  42 +++--
+ src/browser/webapi/Element.zig                | 171 ++++++++++++++++--
+ .../webapi/css/CSSStyleDeclaration.zig        |  13 +-
+ 4 files changed, 252 insertions(+), 39 deletions(-)
+
+diff --git a/src/browser/StyleManager.zig b/src/browser/StyleManager.zig
+index 853a08c..fbb706e 100644
+--- a/src/browser/StyleManager.zig
++++ b/src/browser/StyleManager.zig
+@@ -562,6 +562,7 @@ pub fn sheetModified(self: *StyleManager) void {
+ 
+ fn cascadeChanged(self: *StyleManager) void {
+     self.frame.styleChanged();
++    Frame.observers.scheduleIntersectionChecks(self.frame);
+     Frame.observers.scheduleResizeDelivery(self.frame);
+ }
+ 
+@@ -694,6 +695,36 @@ pub fn declaredSize(self: *StyleManager, el: *Element, comptime axis: Element.Ax
+     return length.resolve(self.frame.page.getViewport());
+ }
+ 
++pub const Position = enum(u3) {
++    static,
++    relative,
++    absolute,
++    fixed,
++    sticky,
++
++    fn parse(value: []const u8) ?Position {
++        inline for (std.meta.tags(Position)) |tag| {
++            if (std.ascii.eqlIgnoreCase(value, @tagName(tag))) return tag;
++        }
++        if (std.ascii.eqlIgnoreCase(value, "initial") or std.ascii.eqlIgnoreCase(value, "unset")) return .static;
++        return null;
++    }
++};
++
++pub const Positioning = struct {
++    position: Position = .static,
++    left: ?f64 = null,
++    top: ?f64 = null,
++};
++
++pub fn positioning(self: *StyleManager, el: *Element) Positioning {
++    self.assertOwns(el);
++    self.rebuildIfDirty() catch return .{};
++    const p = self.geometryProps(el);
++    const viewport = self.frame.page.getViewport();
++    return .{ .position = p.position, .left = p.left.resolve(viewport), .top = p.top.resolve(viewport) };
++}
++
+ /// Like declaredSize, but only the inline style counts.
+ pub fn inlineSize(self: *StyleManager, el: *Element, comptime axis: Element.Axis) ?f64 {
+     self.assertOwns(el);
+@@ -1210,9 +1241,21 @@ pub const Length = packed struct(u34) {
+ 
+     fn parse(text: []const u8) Length {
+         const parsed = units.parse(text) catch return .{};
+-        if (parsed.value < 0) {
+-            return .{};
+-        }
++        if (parsed.value < 0) return .{};
++        return fromParsed(parsed);
++    }
++
++    // Insets can be negative, unlike width/height. Unresolved lengths still
++    // win the cascade, but must not masquerade as an explicit zero.
++    fn parseOffset(text: []const u8) Length {
++        const parsed = units.parse(text) catch return .{};
++        if (parsed.unit == .none and parsed.value != 0) return .{};
++        return fromParsed(parsed);
++    }
++
++    fn fromParsed(parsed: units.Parsed) Length {
++        const value = parsed.value * (units.absoluteLengthFactor(parsed.unit) orelse 1);
++        if (@abs(value) > std.math.floatMax(f32)) return .{};
+         return switch (parsed.unit) {
+             inline .vw, .vh => |unit| .{ .value = @floatCast(parsed.value), .unit = @field(Unit, @tagName(unit)) },
+             else => .{
+@@ -1293,7 +1336,7 @@ const Visibility = struct {
+ /// An element's box: its size and how it scrolls.
+ const Geometry = struct {
+     const Declared = struct {
+-        const names = [_][]const u8{ "overflow-x", "overflow-y", "overscroll-behavior-x", "overscroll-behavior-y", "width", "height" };
++        const names = [_][]const u8{ "overflow-x", "overflow-y", "overscroll-behavior-x", "overscroll-behavior-y", "width", "height", "position", "left", "top" };
+ 
+         overflow_x_scrolls: ?bool = null,
+         overflow_y_scrolls: ?bool = null,
+@@ -1301,6 +1344,9 @@ const Geometry = struct {
+         overscroll_y_contains: ?bool = null,
+         width: ?Length = null,
+         height: ?Length = null,
++        position: ?Position = null,
++        left: ?Length = null,
++        top: ?Length = null,
+ 
+         fn apply(self: *Declared, name: []const u8, value: []const u8) void {
+             if (std.ascii.eqlIgnoreCase(name, "overflow-x")) {
+@@ -1315,6 +1361,12 @@ const Geometry = struct {
+                 self.width = Length.parse(value);
+             } else if (std.ascii.eqlIgnoreCase(name, "height")) {
+                 self.height = Length.parse(value);
++            } else if (std.ascii.eqlIgnoreCase(name, "position")) {
++                if (Position.parse(value)) |position| self.position = position;
++            } else if (std.ascii.eqlIgnoreCase(name, "left")) {
++                self.left = Length.parseOffset(value);
++            } else if (std.ascii.eqlIgnoreCase(name, "top")) {
++                self.top = Length.parseOffset(value);
+             }
+         }
+ 
+@@ -1333,13 +1385,16 @@ const Geometry = struct {
+         }
+     };
+ 
+-    const Computed = packed struct(u72) {
++    const Computed = packed struct(u143) {
+         overflow_x_scrolls: bool = false,
+         overflow_y_scrolls: bool = false,
+         overscroll_x_contains: bool = false,
+         overscroll_y_contains: bool = false,
+         width: Length = .{},
+         height: Length = .{},
++        position: Position = .static,
++        left: Length = .{},
++        top: Length = .{},
+     };
+ };
+ 
+diff --git a/src/browser/webapi/Document.zig b/src/browser/webapi/Document.zig
+index e24fa35..95ec0e5 100644
+--- a/src/browser/webapi/Document.zig
++++ b/src/browser/webapi/Document.zig
+@@ -534,6 +534,22 @@ pub fn extent(self: *Document) Extent {
+     while (tw.next()) |node| : (index += 1) {
+         const el = node.is(Element) orelse continue;
+         const parent = el.parentElement() orelse continue;
++        if (!el.isRootContainer() and el.isVisible(frame)) {
++            const position = style_manager.positioning(el).position;
++            if ((position == .absolute or position == .fixed) and !el.isViewportFixed(frame)) {
++                // Supported out-of-flow boxes must remain reachable by window
++                // scrolling. A scroll container owns its own overflow instead.
++                const container = parent.scrollContainer(.{ .x = true, .y = true }, frame);
++                if (container == .viewport) {
++                    if (el.positionedClientCoordinate(frame, .height)) |y| {
++                        size.height = @max(size.height, y + @as(f64, @floatFromInt(frame.window.getScrollY())) + el.boxAxis(frame, .height));
++                    }
++                    if (el.positionedClientCoordinate(frame, .width)) |x| {
++                        size.width = @max(size.width, x + @as(f64, @floatFromInt(frame.window.getScrollX())) + el.boxAxis(frame, .width));
++                    }
++                }
++            }
++        }
+         if (parent.isRootContainer()) {
+             continue;
+         }
+@@ -547,7 +563,7 @@ pub fn extent(self: *Document) Extent {
+         if (html_doc.getBody()) |html_body| {
+             const body = html_body.asElement();
+             size.height = @max(size.height, body.contentAxis(frame, .height), style_manager.inlineSize(body, .height) orelse 0);
+-            size.width = style_manager.inlineSize(body, .width) orelse 0;
++            size.width = @max(size.width, style_manager.inlineSize(body, .width) orelse 0);
+             var child = body.asNode().firstChild();
+             while (child) |node| : (child = node.nextSibling()) {
+                 const el = node.is(Element) orelse continue;
+@@ -990,18 +1006,21 @@ pub fn elementFromVerticalPoint(self: *Document, y: f64, frame: *Frame) !?*Eleme
+ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame: *Frame) !?*Element {
+     // DFS in document order; topmost = last visited element whose rect contains (x, y).
+     //
+-    // Faux-layout shortcut: rect.top is calculateDocumentPosition × 5, which is
+-    // monotonically increasing in document order. So we maintain a running
+-    // preorder counter instead of calling calculateDocumentPosition per node
+-    // (which itself is O(N)). Once the counter's y passes the query y, no
+-    // later element can contain the point, and we can return.
++    // Keep the preorder shortcut for ordinary flow coordinates, but positioned
++    // boxes can occur anywhere in the viewport regardless of document order.
++    // Do not stop early: a later absolute/fixed element may cover the point.
+     //
+     // Hidden subtrees still count towards the index so positions agree with
+     // getBoundingClientRect; the hidden verdict just rides down the stack.
+     var topmost: ?*Element = null;
+ 
+     const root = self.asNode();
+-    const style_manager = &(root.ownerFrame(frame) orelse return null)._style_manager;
++    const owner = root.ownerFrame(frame) orelse return null;
++    const viewport = owner.page.getViewport();
++    if (!std.math.isFinite(y) or y < 0 or y >= @as(f64, @floatFromInt(viewport.height))) return null;
++    if (!ignore_x and (!std.math.isFinite(x) or x < 0 or x >= @as(f64, @floatFromInt(viewport.width)))) return null;
++    const style_manager = &owner._style_manager;
++    var flow_positions: Element.FlowPositions = .empty;
+     const Entry = struct { node: *Node, hidden: bool };
+     var stack: std.ArrayList(Entry) = .empty;
+     try stack.append(frame.local_arena, .{ .node = root, .hidden = false });
+@@ -1014,16 +1033,13 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame:
+         var hidden = entry.hidden;
+         const pos = preorder_index * 5.0;
+ 
+-        if (pos > y) {
+-            // Monotonic: no later element has top <= y, so none can contain (x, y).
+-            return topmost;
+-        }
+-
+         preorder_index += 1;
+         if (node.is(Element)) |element| {
++            try flow_positions.put(frame.local_arena, element, pos);
+             hidden = hidden or style_manager.hasDisplayNone(element);
+             if (!hidden) {
+-                if (y >= pos and y <= pos + element.boxAxis(frame, .height)) {
++                const top = element.positionedCoordinate(frame, .height, &flow_positions) orelse pos;
++                if (y >= top and y <= top + element.boxAxis(frame, .height)) {
+                     if (ignore_x) {
+                         topmost = element;
+                     } else {
+diff --git a/src/browser/webapi/Element.zig b/src/browser/webapi/Element.zig
+index e6168ea..c0b24b5 100644
+--- a/src/browser/webapi/Element.zig
++++ b/src/browser/webapi/Element.zig
+@@ -23,6 +23,7 @@ const lp = @import("lightpanda");
+ const js = @import("../js/js.zig");
+ const dump = @import("../dump.zig");
+ const Frame = @import("../Frame.zig");
++const StyleManager = @import("../StyleManager.zig");
+ const Factory = @import("../Factory.zig");
+ const text_measure = @import("../text_measure.zig");
+ 
+@@ -1634,7 +1635,7 @@ pub fn boundingClientRectValues(self: *Element, frame: *Frame) DOMRect.Data {
+ pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect.Data {
+     return .{
+         .x = self.horizontalPosition(frame),
+-        .y = calculateDocumentPosition(self.asNode()),
++        .y = self.positionedClientCoordinate(frame, .height) orelse calculateDocumentPosition(self.asNode()),
+         .width = self.boxAxis(frame, .width),
+         .height = self.boxAxis(frame, .height),
+     };
+@@ -1780,6 +1781,7 @@ fn scrollExtent(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
+ // Otherwise almost every element with text would report overflow.
+ pub fn contentAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
+     var total: f64 = 0;
++    var positioned_end: f64 = 0;
+     const owner = self.ownerFrame(frame) orelse return 0;
+     const style_manager = &owner._style_manager;
+ 
+@@ -1795,7 +1797,15 @@ pub fn contentAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
+     while (child) |node| : (child = node.nextSibling()) {
+         if (node.is(Element)) |el| {
+             if (!style_manager.hasDisplayNone(el)) {
+-                total += el.getElementAxis(frame, axis).value;
++                const p = style_manager.positioning(el);
++                if (p.position == .absolute or p.position == .fixed) {
++                    if (el.positionedContainingBlock(frame, p.position == .fixed) == self) {
++                        const inset = (if (axis == .width) p.left else p.top) orelse 0;
++                        positioned_end = @max(positioned_end, inset + el.getElementAxis(frame, axis).value);
++                    }
++                } else {
++                    total += el.getElementAxis(frame, axis).value;
++                }
+             }
+         } else if (wrap) |*w| {
+             if (node.is(Node.CData.Text)) |text| {
+@@ -1808,7 +1818,7 @@ pub fn contentAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
+         // Whole pixels, like scroll offsets
+         total += @ceil(w.height());
+     }
+-    return total;
++    return @max(total, positioned_end);
+ }
+ 
+ // Unlike clientHeight, the root's offsetHeight is the document height.
+@@ -1832,6 +1842,7 @@ pub fn getOffsetTop(self: *Element, frame: *Frame) f64 {
+     if (!self.isVisible(frame)) {
+         return 0.0;
+     }
++    if (self.positionedOffset(frame, .height)) |value| return @floor(value + 0.5);
+     return calculateDocumentPosition(self.asNode());
+ }
+ 
+@@ -1839,7 +1850,8 @@ pub fn getOffsetLeft(self: *Element, frame: *Frame) f64 {
+     if (!self.isVisible(frame)) {
+         return 0.0;
+     }
+-    return self.horizontalPosition(frame);
++    if (self.positionedOffset(frame, .width)) |value| return @floor(value + 0.5);
++    return self.flowHorizontalPosition(frame);
+ }
+ 
+ pub fn getOffsetParent(self: *Element, frame: *Frame) ?*Element {
+@@ -1853,10 +1865,10 @@ pub fn getOffsetParent(self: *Element, frame: *Frame) ?*Element {
+     }
+ 
+     const self_position = self.positionStyle(frame);
+-    if (std.mem.eql(u8, self_position, "fixed")) {
++    if (self_position == .fixed) {
+         return null;
+     }
+-    const self_static = self_position.len == 0 or std.mem.eql(u8, self_position, "static");
++    const self_static = self_position == .static;
+ 
+     var node: ?*Node = self.asNode()._parent;
+     while (node) |n| {
+@@ -1872,7 +1884,7 @@ pub fn getOffsetParent(self: *Element, frame: *Frame) ?*Element {
+             return ancestor;
+         }
+         const position = ancestor.positionStyle(frame);
+-        if (position.len > 0 and !std.mem.eql(u8, position, "static")) {
++        if (position != .static) {
+             return ancestor;
+         }
+         if (self_static and (tag == .td or tag == .th or tag == .table)) {
+@@ -1883,9 +1895,16 @@ pub fn getOffsetParent(self: *Element, frame: *Frame) ?*Element {
+     return null;
+ }
+ 
+-fn positionStyle(self: *Element, frame: *Frame) []const u8 {
+-    const style = self.inlineStyle(frame) orelse return "";
+-    return style.asCSSStyleDeclaration().getPropertyValue("position", frame);
++fn positionStyle(self: *Element, frame: *Frame) StyleManager.Position {
++    const owner = self.ownerFrame(frame) orelse return .static;
++    return owner._style_manager.positioning(self).position;
++}
++
++fn positionedOffset(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
++    const owner = self.ownerFrame(frame) orelse return null;
++    const p = owner._style_manager.positioning(self);
++    if (p.position != .absolute and p.position != .fixed) return null;
++    return if (axis == .width) p.left else p.top;
+ }
+ 
+ pub fn getClientTop(_: *Element) f64 {
+@@ -1961,6 +1980,10 @@ fn countSubtreeNodes(node: *Node) f64 {
+ // translateX is commonly used to shift elements around, e.g. in a carousel to
+ // shift things around. So we honor any transform: translateX inline styles.
+ pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
++    return self.positionedClientCoordinate(frame, .width) orelse self.flowHorizontalPosition(frame);
++}
++
++fn flowHorizontalPosition(self: *Element, frame: *Frame) f64 {
+     var x: f64 = 0.0;
+     var current = self.asNode();
+     const owner = self.ownerFrame(frame) orelse return 0;
+@@ -1991,6 +2014,113 @@ pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
+     return x;
+ }
+ 
++// Resolve explicit fixed/absolute insets without replacing the renderless
++// flow model. Walk containing blocks iteratively so deeply nested page DOMs
++// cannot exhaust the native stack. Each axis may independently remain auto.
++pub const FlowPositions = std.AutoHashMapUnmanaged(*Element, f64);
++
++pub fn positionedClientCoordinate(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
++    return self.positionedCoordinate(frame, axis, null);
++}
++
++// Hit testing already knows every ancestor's preorder position. Reuse those
++// values instead of recounting sibling subtrees for every positioned descendant.
++pub fn positionedCoordinate(self: *Element, frame: *Frame, comptime axis: Axis, flow_positions: ?*const FlowPositions) ?f64 {
++    const owner = self.ownerFrame(frame) orelse return null;
++    const manager = &owner._style_manager;
++    const window_scroll: f64 = @floatFromInt(if (axis == .width) owner.window.getScrollX() else owner.window.getScrollY());
++    var current = self;
++    var value: f64 = 0;
++    var positioned = false;
++
++    while (true) {
++        var anchor: ?*Element = current;
++        var p: StyleManager.Positioning = .{};
++        var inset: f64 = 0;
++        while (anchor) |element| : (anchor = layoutParent(element)) {
++            p = manager.positioning(element);
++            if (p.position != .absolute and p.position != .fixed) continue;
++            inset = (if (axis == .width) p.left else p.top) orelse continue;
++            break;
++        }
++        const element = anchor orelse {
++            if (!positioned) return null;
++            return value + current.flowCoordinate(frame, axis, flow_positions) - current.ancestorScroll(null, frame, axis) - window_scroll;
++        };
++        positioned = true;
++        if (current != element) {
++            value += current.flowCoordinate(frame, axis, flow_positions) - element.flowCoordinate(frame, axis, flow_positions);
++            value -= current.ancestorScroll(element, frame, axis);
++        }
++        value += inset;
++        if (axis == .width) value += element.translateX(frame);
++
++        const containing = element.positionedContainingBlock(frame, p.position == .fixed) orelse {
++            return value - if (p.position == .fixed) @as(f64, 0) else window_scroll;
++        };
++        if (!containing.isRootContainer()) {
++            value -= @as(f64, @floatFromInt(if (axis == .width) containing.getScrollLeft(frame) else containing.getScrollTop(frame)));
++        }
++        current = containing;
++    }
++}
++
++fn flowCoordinate(self: *Element, frame: *Frame, comptime axis: Axis, positions: ?*const FlowPositions) f64 {
++    if (axis == .width) return self.flowHorizontalPosition(frame);
++    if (positions) |known| {
++        if (known.get(self)) |value| return value;
++    }
++    return calculateDocumentPosition(self.asNode());
++}
++
++pub fn isViewportFixed(self: *Element, frame: *Frame) bool {
++    var current: ?*Element = self;
++    while (current) |element| : (current = layoutParent(element)) {
++        if (element.positionStyle(frame) == .fixed and element.positionedContainingBlock(frame, true) == null) return true;
++    }
++    return false;
++}
++
++fn translateX(self: *Element, frame: *Frame) f64 {
++    const style = self.inlineStyle(frame) orelse return 0;
++    return CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
++}
++
++fn layoutParent(self: *Element) ?*Element {
++    var node = self.asNode().parentNode();
++    while (node) |parent| : (node = parent.parentNode()) {
++        if (parent.is(Element)) |element| return element;
++        if (parent.is(ShadowRoot)) |shadow| return shadow.getHost();
++    }
++    return null;
++}
++
++fn positionedContainingBlock(self: *Element, frame: *Frame, fixed: bool) ?*Element {
++    var parent = layoutParent(self);
++    while (parent) |element| : (parent = layoutParent(element)) {
++        // Preserve the existing translateX subset; a transformed ancestor also
++        // establishes a containing block for fixed descendants.
++        if (element.inlineStyle(frame)) |style| {
++            const transform = style.asCSSStyleDeclaration().getPropertyValue("transform", frame);
++            if (transform.len > 0 and !std.ascii.eqlIgnoreCase(transform, "none")) return element;
++        }
++        if (!fixed and element.positionStyle(frame) != .static) return element;
++    }
++    return null;
++}
++
++fn ancestorScroll(self: *Element, stop: ?*Element, frame: *Frame, comptime axis: Axis) f64 {
++    var value: f64 = 0;
++    var parent = layoutParent(self);
++    while (parent) |element| : (parent = layoutParent(element)) {
++        if (!element.isRootContainer()) {
++            value += @as(f64, @floatFromInt(if (axis == .width) element.getScrollLeft(frame) else element.getScrollTop(frame)));
++        }
++        if (element == stop) break;
++    }
++    return value;
++}
++
+ pub fn getElementsByTagName(self: *Element, tag_name: []const u8, frame: *Frame) !Node.GetElementsByTagNameResult {
+     return self.asNode().getElementsByTagName(tag_name, frame);
+ }
+@@ -2047,8 +2177,9 @@ pub fn clone(self: *Element, deep: bool, document: *const Node.Document, frame:
+ 
+ pub fn scrollIntoViewIfNeeded(self: *Element, center_if_needed: ?bool, frame: *Frame) void {
+     _ = center_if_needed;
+-    const y = calculateDocumentPosition(self.asNode());
+-    const scroll_y: f64 = @floatFromInt(frame.window.getScrollY());
++    const positioned_y = self.positionedClientCoordinate(frame, .height);
++    const y = positioned_y orelse calculateDocumentPosition(self.asNode());
++    const scroll_y: f64 = if (positioned_y != null) 0 else @floatFromInt(frame.window.getScrollY());
+     const viewport_height: f64 = @floatFromInt(frame.window.getInnerHeight(frame));
+     if (y >= scroll_y and y <= scroll_y + viewport_height) {
+         return;
+@@ -2062,11 +2193,15 @@ const ScrollIntoViewOpts = union {
+ };
+ pub fn scrollIntoView(self: *Element, opts: ?ScrollIntoViewOpts, frame: *Frame) void {
+     _ = opts;
+-    // Scroll the window so the element's top is brought into the viewport.
+-    // Positions come from the faux-layout document position (top = preorder
+-    // depth-scaled y), the same source getBoundingClientRect uses.
+-    const y = calculateDocumentPosition(self.asNode());
+-    frame.window.scrollTo(.{ .x = 0 }, @trunc(@max(0, y)), frame) catch {};
++    // Convert supported positioned client coordinates back to document space.
++    if (self.isViewportFixed(frame)) return;
++    const owner = self.ownerFrame(frame) orelse return;
++    const y = if (self.positionedClientCoordinate(frame, .height)) |client_y|
++        client_y + @as(f64, @floatFromInt(owner.window.getScrollY()))
++    else
++        calculateDocumentPosition(self.asNode());
++    const target: i32 = @intFromFloat(std.math.clamp(y, 0, std.math.maxInt(i32)));
++    owner.window.scrollTo(.{ .x = 0 }, target, owner) catch {};
+ }
+ 
+ // The scrollTo/scrollBy argument shape shared with Window: positional (x, y)
+@@ -2165,7 +2300,7 @@ fn clampScroll(self: *Element, frame: *Frame, comptime axis: Axis, target: i64)
+     if (clamped < 0) {
+         clamped = 0;
+     } else if (self.scrollExtent(frame, axis)) |extent| {
+-        const max: i64 = @floor(extent);
++        const max: i64 = @intFromFloat(@floor(@min(extent, std.math.maxInt(u32))));
+         clamped = @min(clamped, max);
+     }
+     return @intCast(@min(clamped, std.math.maxInt(u32)));
+diff --git a/src/browser/webapi/css/CSSStyleDeclaration.zig b/src/browser/webapi/css/CSSStyleDeclaration.zig
+index ea4b0bc..e581def 100644
+--- a/src/browser/webapi/css/CSSStyleDeclaration.zig
++++ b/src/browser/webapi/css/CSSStyleDeclaration.zig
+@@ -77,9 +77,7 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
+     const normalized = normalizePropertyName(property_name, &frame.buf);
+     const wrapped = String.wrap(normalized);
+ 
+-    // Computed styles must reflect stylesheet rules, not just the element's
+-    // inline `style=` attribute. Limited to display/visibility — what aria
+-    // tree builders (Playwright ariaSnapshot) consult on every element.
++    // Computed styles must reflect the same cascaded values as native layout.
+     if (self._is_computed) {
+         if (self._element) |element| {
+             if (element.ownerFrame(frame)) |owner| {
+@@ -92,6 +90,15 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
+                     if (style_manager.hasVisibilityHiddenInherited(element)) {
+                         return "hidden";
+                     }
++                } else if (wrapped.eql(comptime .wrap("position"))) {
++                    return @tagName(style_manager.positioning(element).position);
++                } else if (wrapped.eql(comptime .wrap("left")) or wrapped.eql(comptime .wrap("top"))) {
++                    const positioning = style_manager.positioning(element);
++                    const offset = if (wrapped.eql(comptime .wrap("left"))) positioning.left else positioning.top;
++                    if (offset) |value| return std.fmt.allocPrint(frame.local_arena, "{d}px", .{value}) catch "auto";
++                    // Keep unresolved inline values (%, em, calc, ...) visible
++                    // through CSSOM even though this geometry subset can't use them.
++                    return style_manager.inlineStyleValue(element, wrapped) orelse "auto";
+                 }
+             }
+         }

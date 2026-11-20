@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 29 Oct 2026 15:39:36 -0300
+Subject: [PATCH] http2: align pseudo-header order and navigation priority
+
+Serialize ordinary HTTP/2 pseudo-headers in Chromium's measured m,a,s,p
+order without changing CONNECT's reduced header set or HTTP/1.1 requests.
+Select weight 256 for non-internal document navigations and explicitly
+reset other attempts to 16, using curl's existing stream-weight option.
+The curl overlay uses that navigation weight to add the default ordinary
+Priority: u=0, i only after HTTP/2 selection. Explicit Priority values,
+including empty/suppression forms, win; fetches inherit no navigation
+default. Classification is independent of caller-supplied Sec-Fetch headers.
+
+nghttp2 1.70.0 discards the legacy priority specification accepted by
+nghttp2_submit_request. Overlay its v1 request submission path (the one
+curl uses) to pass navigation priority through the existing native HEADERS
+encoder: exclusive, dependency zero, weight 256. Restore only this bounded
+wire field, not the removed legacy priority scheduler or standalone PRIORITY
+updates. Honor a peer's NO_RFC7540_PRIORITIES setting once received. Keep
+body-provider copying and header ownership/error cleanup backend-owned.
+Other submit APIs and non-navigation priority behavior remain unchanged.
+
+Both source overlays are generated in the build cache with exact matches,
+never by editing shared dependency packages. The generator is host-native
+and the resulting C still uses the requested compilation target and flags.
+
+This targets fingerprint recorder HTTP diagnostics, not the TLS verdict.
+Use the same fresh Linux Chrome reference and temporary recorder workload
+for navigation, JSON fetch, overrides, redirects, multiple streams and
+responses larger than the stream/connection windows. HTTP/1.1 and no-ALPN
+fallback must remain functional and omit only the generated default, not
+caller-supplied Priority. No new upstream unit tests are added.
+
+Full ordinary-header ordering, fetch priority/scheduler parity, HPACK
+encoding, TLS/resumption and target-Mac evidence remain separate work.
+References: fingerprint/README.md; docs/tls-patch-group-plan.md, group 4.
+---
+ build.zig                    |   9 ++-
+ src/network/HttpClient.zig   |   1 +
+ src/network/http.zig         |   6 ++
+ src/sys/libcurl.zig          |   2 +
+ tools/curl_http2_profile.zig | 126 ++++++++++++++++++++++++++++++++++-
+ 5 files changed, 139 insertions(+), 5 deletions(-)
+
+diff --git a/build.zig b/build.zig
+index 133cab0..72b0926 100644
+--- a/build.zig
++++ b/build.zig
+@@ -669,6 +669,11 @@ fn buildNghttp2(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.O
+ 
+     lib.installConfigHeader(config);
+     lib.installHeadersDirectory(dep.path("lib/includes/nghttp2"), "nghttp2", .{});
++    mod.addIncludePath(dep.path("lib"));
++    mod.addCSourceFile(.{
++        .file = http2ProfileSource(b, dep.path("lib/nghttp2_submit.c"), "nghttp2_submit.c"),
++        .flags = &.{ "-DNGHTTP2_STATICLIB", "-DHAVE_TIME_H", "-DHAVE_ARPA_INET_H", "-DHAVE_NETINET_IN_H" },
++    });
+     mod.addCSourceFiles(.{
+         .root = dep.path("lib"),
+         .flags = &.{
+@@ -685,8 +690,8 @@ fn buildNghttp2(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.O
+             "nghttp2_map.c",             "nghttp2_mem.c",    "nghttp2_option.c",
+             "nghttp2_outbound_item.c",   "nghttp2_pq.c",     "nghttp2_priority_spec.c",
+             "nghttp2_queue.c",           "nghttp2_rcbuf.c",  "nghttp2_session.c",
+-            "nghttp2_stream.c",          "nghttp2_submit.c", "nghttp2_version.c",
+-            "nghttp2_ratelim.c",         "nghttp2_time.c",
++            "nghttp2_stream.c",          "nghttp2_time.c",   "nghttp2_version.c",
++            "nghttp2_ratelim.c",
+         },
+     });
+ 
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index badc635..c6a3a5a 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -3647,6 +3647,7 @@ pub const Transfer = struct {
+         try conn.setProxy(client.http_proxy);
+         try conn.setTlsVerify(client.tls_verify, client.use_proxy);
+         try conn.setHttpVersion(client.http_version);
++        try conn.setNavigationPriority(!req.internal and req.request_mode == .navigate);
+ 
+         try conn.setURL(req.url);
+         try conn.setMethod(req.method);
+diff --git a/src/network/http.zig b/src/network/http.zig
+index 2cc8461..cbe8310 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -561,6 +561,12 @@ pub const Connection = struct {
+         try libcurl.curl_easy_setopt(self._easy, .http_version, v);
+     }
+ 
++    pub fn setNavigationPriority(self: *const Connection, navigation: bool) !void {
++        // The curl HTTP/2 overlay uses weight 256 for navigation defaults.
++        // Set both paths on every attempt so pooled handles cannot leak it.
++        try libcurl.curl_easy_setopt(self._easy, .stream_weight, @as(u16, if (navigation) 256 else 16));
++    }
++
+     pub fn setFollowLocation(self: *const Connection, follow: bool) !void {
+         try libcurl.curl_easy_setopt(self._easy, .follow_location, @as(c_long, if (follow) 2 else 0));
+     }
+diff --git a/src/sys/libcurl.zig b/src/sys/libcurl.zig
+index 80c06fb..6cd8743 100644
+--- a/src/sys/libcurl.zig
++++ b/src/sys/libcurl.zig
+@@ -200,6 +200,7 @@ const CurlOption = enum(c.CURLoption) {
+     connect_timeout_ms = c.CURLOPT_CONNECTTIMEOUT_MS,
+     follow_location = c.CURLOPT_FOLLOWLOCATION,
+     http_version = c.CURLOPT_HTTP_VERSION,
++    stream_weight = c.CURLOPT_STREAM_WEIGHT,
+     proxy = c.CURLOPT_PROXY,
+     ssl_verify_host = c.CURLOPT_SSL_VERIFYHOST,
+     ssl_verify_peer = c.CURLOPT_SSL_VERIFYPEER,
+@@ -633,6 +634,7 @@ pub fn curl_easy_setopt(easy: *Curl, comptime option: CurlOption, value: anytype
+         .follow_location,
+         .post_field_size,
+         .connect_only,
++        .stream_weight,
+         => @as(c_long, @intCast(value)),
+ 
+         .url,
+diff --git a/tools/curl_http2_profile.zig b/tools/curl_http2_profile.zig
+index 8834e26..ffab2f3 100644
+--- a/tools/curl_http2_profile.zig
++++ b/tools/curl_http2_profile.zig
+@@ -2,7 +2,7 @@
+ // Brenno Flávio <contato@brennoflavio.com.br>
+ // SPDX-License-Identifier: AGPL-3.0-or-later
+ 
+-//! Apply the bounded HTTP/2 profile to the pinned curl source in the build cache.
++//! Apply the bounded HTTP/2 profile to pinned dependency sources in the build cache.
+ //! Exact, unique matches make dependency drift a build failure, not a silent fallback.
+ const std = @import("std");
+ 
+@@ -15,9 +15,10 @@ pub fn main(init: std.process.Init) !void {
+     if (args.next() != null) return error.Usage;
+     const cwd = std.Io.Dir.cwd();
+     var source = try cwd.readFileAlloc(init.io, input, allocator, .unlimited);
+-    for (edits) |edit| {
++    const changes: []const Edit = if (std.mem.endsWith(u8, input, "nghttp2_submit.c")) &nghttp2_edits else &edits;
++    for (changes) |edit| {
+         if (std.mem.count(u8, source, edit.before) != 1) {
+-            std.debug.print("Pinned curl HTTP/2 source changed; expected one match for:\n{s}\n", .{edit.before});
++            std.debug.print("Pinned HTTP/2 source changed ({s}); expected one match for:\n{s}\n", .{ input, edit.before });
+             return error.CurlSourceMismatch;
+         }
+         source = try std.mem.replaceOwned(u8, allocator, source, edit.before, edit.after);
+@@ -86,4 +87,123 @@ const edits = [_]Edit{
+         \\  return 4;
+         ,
+     },
++    .{
++        .before = "  nghttp2_priority_spec_init(pri_spec, 0, sweight_wanted(data), FALSE);",
++        .after =
++        \\  /* Weight 256 is selected by Lightpanda for document navigations. */
++        \\  nghttp2_priority_spec_init(pri_spec, 0, sweight_wanted(data),
++        \\                             data->set.weight == 256);
++        ,
++    },
++    .{
++        .before = "  nva = Curl_dynhds_to_nva(&h2_headers, &nheader);",
++        .after =
++        \\  /* Generate the navigation default only after HTTP/2 is selected. A
++        \\   * caller's Priority (including curl's empty suppression form) wins. */
++        \\  if(data->set.weight == 256 &&
++        \\     (data->state.http_ignorecustom ||
++        \\      !Curl_checkheaders(data, STRCONST("Priority")))) {
++        \\    result = Curl_dynhds_cadd(&h2_headers, "priority", "u=0, i");
++        \\    if(result)
++        \\      goto out;
++        \\  }
++        \\
++        \\  nva = Curl_dynhds_to_nva(&h2_headers, &nheader);
++        ,
++    },
++    .{
++        .before =
++        \\  h2_pri_spec(data, &pri_spec);
++        \\  if(!nghttp2_session_check_request_allowed(ctx->h2))
++        ,
++        .after =
++        \\  /* Curl's converter emits m,s,a,p. Reorder only the ordinary request
++        \\   * shape; CONNECT's reduced pseudo-header set remains untouched. */
++        \\  if(nheader >= 3 && nva[1].namelen == 7 &&
++        \\     !memcmp(nva[1].name, ":scheme", 7) &&
++        \\     nva[2].namelen == 10 &&
++        \\     !memcmp(nva[2].name, ":authority", 10)) {
++        \\    nghttp2_nv tmp = nva[1];
++        \\    nva[1] = nva[2];
++        \\    nva[2] = tmp;
++        \\  }
++        \\
++        \\  h2_pri_spec(data, &pri_spec);
++        \\  if(!nghttp2_session_check_request_allowed(ctx->h2))
++        ,
++    },
++};
++
++// nghttp2 1.70 discards legacy request priority. Restore only the navigation
++// HEADERS field through its existing encoder, not the removed priority scheduler.
++const nghttp2_edits = [_]Edit{
++    .{
++        .before =
++        \\                                     void *stream_user_data) {
++        \\  int rv;
++        \\  uint8_t flags_copy;
++        ,
++        .after =
++        \\                                     void *stream_user_data,
++        \\                                     const nghttp2_priority_spec *pri_spec) {
++        \\  int rv;
++        \\  uint8_t flags_copy;
++        ,
++    },
++    .{
++        .before =
++        \\  nghttp2_frame_headers_init(&frame->headers, flags_copy, stream_id, hcat, NULL,
++        \\                             nva_copy, nvlen);
++        ,
++        .after =
++        \\  if (!session->server &&
++        \\      session->remote_settings.no_rfc7540_priorities != 1 &&
++        \\      pri_spec && pri_spec->stream_id == 0 &&
++        \\      pri_spec->weight == 256 && pri_spec->exclusive) {
++        \\    flags_copy |= NGHTTP2_FLAG_PRIORITY;
++        \\  } else {
++        \\    pri_spec = NULL;
++        \\  }
++        \\  nghttp2_frame_headers_init(&frame->headers, flags_copy, stream_id, hcat,
++        \\                             pri_spec, nva_copy, nvlen);
++        ,
++    },
++    .{
++        .before =
++        \\  return submit_headers_shared(session, flags, stream_id, nva_copy, nvlen, dpw,
++        \\                               stream_user_data);
++        ,
++        .after =
++        \\  return submit_headers_shared(session, flags, stream_id, nva_copy, nvlen, dpw,
++        \\                               stream_user_data, NULL);
++        ,
++    },
++    .{
++        .before =
++        \\  nghttp2_data_provider_wrap dpw;
++        \\  (void)pri_spec;
++        \\
++        \\  return submit_request_shared(session, nva, nvlen,
++        \\                               nghttp2_data_provider_wrap_v1(&dpw, data_prd),
++        \\                               stream_user_data);
++        ,
++        .after =
++        \\  nghttp2_data_provider_wrap dpw;
++        \\  const nghttp2_data_provider_wrap *wrapped;
++        \\  nghttp2_nv *nva_copy;
++        \\  int rv;
++        \\
++        \\  if (session->server) {
++        \\    return NGHTTP2_ERR_PROTO;
++        \\  }
++        \\  rv = nghttp2_nv_array_copy(&nva_copy, nva, nvlen, &session->mem);
++        \\  if (rv < 0) {
++        \\    return rv;
++        \\  }
++        \\  wrapped = nghttp2_data_provider_wrap_v1(&dpw, data_prd);
++        \\  return submit_headers_shared(session, set_request_flags(wrapped), -1,
++        \\                               nva_copy, nvlen, wrapped, stream_user_data,
++        \\                               pri_spec);
++        ,
++    },
+ };

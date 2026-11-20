@@ -1,0 +1,747 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 19 Oct 2026 12:49:06 -0300
+Subject: [PATCH] webapi: mock Neo WebGPU adapter discovery natively
+
+Expose a secure-context Chrome 155 WebGPU discovery surface in window and
+worker realms: GPU, GPUAdapter, GPUAdapterInfo, GPUSupportedFeatures,
+GPUSupportedLimits and WGSLLanguageFeatures. Use native wrappers, real
+Promises, stable navigator/subobject identities, readonly setlike behavior,
+and descriptor conversion including iterator close and record keys.
+
+Use an Apple A18 Pro persona with normalized apple vendor/architecture,
+32-wide subgroups, conservative mocked features/limits and a 16384px
+texture dimension consistent with the existing WebGL mock. These are
+chosen discovery values, not measurements from a matching Mac.
+
+Match Chrome 155's fallback flag on GPUAdapterInfo; omit removed legacy
+GPUAdapter members. Force-fallback and unknown feature-level requests
+resolve null; both power preferences select the single integrated GPU.
+GPU device execution is intentionally unsupported: requestDevice converts
+its descriptor, then rejects with OperationError rather than pretending
+to execute GPU commands.
+
+Capture secure-context descriptors and record intrinsics before page code
+can replace them; release those handles at context teardown. Keep native
+query and rejection objects page-owned and settle promises without a
+nested microtask checkpoint.
+
+References:
+https://github.com/chromium/chromium/tree/155.0.8059.40/third_party/blink/renderer/modules/webgpu
+https://www.apple.com/macbook-neo/specs/
+---
+ src/browser/js/Context.zig             |   6 +
+ src/browser/js/Env.zig                 |   6 +
+ src/browser/js/bridge.zig              |   2 +
+ src/browser/webapi/Navigator.zig       |   7 +
+ src/browser/webapi/WebGPU.zig          | 570 +++++++++++++++++++++++++
+ src/browser/webapi/WorkerNavigator.zig |   7 +
+ 6 files changed, 598 insertions(+)
+ create mode 100644 src/browser/webapi/WebGPU.zig
+
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index f2c90c9..54f4e15 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -72,6 +72,8 @@ media_device_bindings: ?struct {
+     interfaces: [3]v8.Global,
+ } = null,
+ 
++webgpu_bindings: ?[10]v8.Global = null,
++webgpu_hidden: bool = false,
+ eme_bindings: ?[10]v8.Global = null,
+ eme_hidden: bool = false,
+ video_bindings: ?[4]v8.Global = null,
+@@ -264,6 +266,9 @@ pub fn deinit(self: *Context) void {
+         v8.v8__Global__Reset(&bindings.define_property);
+         for (&bindings.interfaces) |*binding| v8.v8__Global__Reset(binding);
+     }
++    if (self.webgpu_bindings) |*bindings| {
++        for (bindings) |*binding| v8.v8__Global__Reset(binding);
++    }
+     if (self.eme_bindings) |*bindings| {
+         for (bindings) |*binding| v8.v8__Global__Reset(binding);
+     }
+@@ -302,6 +307,7 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
+         if (self.global == .frame) {
+             const global_obj = v8.v8__Context__Global(ls.local.handle).?;
+             const secure = self.execution.isSecureContext();
++            try @import("../webapi/WebGPU.zig").expose(self, ls.local.handle, global_obj, secure);
+             try env.setEncryptedMediaExposure(self, ls.local.handle, global_obj, secure);
+             env.setVideoDecoderExposure(self, ls.local.handle, global_obj, secure);
+             env.setBatteryExposure(self, ls.local.handle, global_obj, secure);
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index d584644..a1481ca 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -435,6 +435,12 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context
+     // a v8 context, we can get our context out
+     v8.v8__Context__SetAlignedPointerInEmbedderData(v8_context, 1, @ptrCast(context));
+ 
++    try @import("../webapi/WebGPU.zig").capture(context, v8_context, global_obj, if (is_frame) "Navigator" else "WorkerNavigator");
++    errdefer if (context.webgpu_bindings) |*bindings| {
++        for (bindings) |*binding| v8.v8__Global__Reset(binding);
++    };
++    if (comptime !is_frame) try @import("../webapi/WebGPU.zig").expose(context, v8_context, global_obj, global._secure_context);
++
+     if (comptime is_frame) try self.captureEncryptedMediaBindings(context, v8_context, global_obj);
+     errdefer if (context.eme_bindings) |*bindings| {
+         for (bindings) |*binding| v8.v8__Global__Reset(binding);
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 7fd6105..7176a97 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1269,6 +1269,7 @@ pub const PageJsApis = flattenTypes(&.{
+     @import("../webapi/Location.zig"),
+     @import("../webapi/ModelContext.zig"),
+     @import("../webapi/Navigator.zig"),
++    @import("../webapi/WebGPU.zig"),
+     @import("../webapi/NavigatorUAData.zig"),
+     @import("../webapi/Notification.zig"),
+     @import("../webapi/net/FormData.zig"),
+@@ -1353,6 +1354,7 @@ const worker_common_apis = [_]type{
+     @import("../webapi/WorkerGlobalScope.zig"),
+     @import("../webapi/WorkerLocation.zig"),
+     @import("../webapi/WorkerNavigator.zig"),
++    @import("../webapi/WebGPU.zig"),
+     @import("../webapi/NavigatorUAData.zig"),
+     @import("../webapi/Permissions.zig"),
+     @import("../webapi/StorageManager.zig"),
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index ea9e50c..cd70179 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -58,6 +58,7 @@ _storage: StorageManager = .{},
+ _ua_data: NavigatorUAData = .{},
+ _service_worker: ?*ServiceWorkerContainer = null,
+ _media_devices: ?*MediaDevices = null,
++_gpu: ?*@import("WebGPU.zig").GPU = null,
+ _share_pending: bool = false,
+ _share_activation_ms: ?u64 = null,
+ _speech_has_activation: bool = false,
+@@ -225,6 +226,11 @@ fn getMediaDevices(self: *Navigator, exec: *Execution) !*MediaDevices {
+     return devices;
+ }
+ 
++fn getGPU(self: *Navigator, exec: *Execution) !*@import("WebGPU.zig").GPU {
++    if (self._gpu == null) self._gpu = try @import("WebGPU.zig").GPU.init(exec);
++    return self._gpu.?;
++}
++
+ fn getConnection(_: *Navigator, exec: *Execution) !*NetworkInformation {
+     return NetworkInformation.init(exec);
+ }
+@@ -372,6 +378,7 @@ pub const JsApi = struct {
+     pub const storage = bridge.accessor(Navigator.getStorage, null, .{});
+     pub const connection = bridge.accessor(Navigator.getConnection, null, .{ .cache = .{ .private = "network_information" } });
+     pub const mediaDevices = bridge.accessor(Navigator.getMediaDevices, null, .{ .exposed = .window });
++    pub const gpu = bridge.accessor(Navigator.getGPU, null, .{});
+     pub const serviceWorker = bridge.accessor(Navigator.getServiceWorker, null, .{});
+     pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});
+     pub const plugins = bridge.accessor(Navigator.getPlugins, null, .{});
+diff --git a/src/browser/webapi/WebGPU.zig b/src/browser/webapi/WebGPU.zig
+new file mode 100644
+index 0000000..1f4971c
+--- /dev/null
++++ b/src/browser/webapi/WebGPU.zig
+@@ -0,0 +1,570 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const js = @import("../js/js.zig");
++const Convert = @import("media_constraints.zig");
++const DOMException = @import("DOMException.zig");
++const v8 = js.v8;
++
++// Chrome 155 discovery surface. Values are a conservative A18 Pro mock,
++// not measurements or a rendering backend.
++pub fn registerTypes() []const type {
++    return &.{ GPU, Adapter, Info, Features, Limits, LanguageFeatures, ValueIterator, PairIterator };
++}
++
++pub const GPU = struct {
++    _pad: bool = false,
++    _languages: LanguageFeatures = .{},
++
++    pub fn init(exec: *js.Execution) !*GPU {
++        return exec._factory.create(GPU{});
++    }
++    fn languages(self: *GPU) *LanguageFeatures {
++        return &self._languages;
++    }
++    fn format(_: *GPU) []const u8 {
++        return "bgra8unorm";
++    }
++    fn request(self: *GPU, input: ?js.Value, exec: *js.Execution) !js.Promise {
++        var caught: js.TryCatch = undefined;
++        caught.init(exec.js.local.?);
++        defer caught.deinit();
++        return self.adapter(input, exec) catch |err| reject(exec, &caught, err);
++    }
++    fn adapter(_: *GPU, input: ?js.Value, exec: *js.Execution) !js.Promise {
++        var fallback = false;
++        var supported = true;
++        if (try Convert.dictionary(input)) |options| {
++            const level = try options.get("featureLevel");
++            if (!level.isUndefined()) {
++                const text = try (try Convert.domString(level)).toSlice();
++                supported = std.mem.eql(u8, text, "core") or std.mem.eql(u8, text, "compatibility");
++            }
++            fallback = (try options.get("forceFallbackAdapter")).toBool();
++            const preference = try options.get("powerPreference");
++            if (!preference.isUndefined()) {
++                const text = try (try Convert.domString(preference)).toSlice();
++                if (!std.mem.eql(u8, text, "low-power") and !std.mem.eql(u8, text, "high-performance")) return error.TypeError;
++            }
++        }
++        const result = if (!fallback and supported) try exec._factory.create(Adapter{}) else null;
++        return resolved(exec, result);
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(GPU);
++        pub const Meta = struct {
++            pub const name = "GPU";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const requestAdapter = bridge.function(GPU.request, .{});
++        pub const getPreferredCanvasFormat = bridge.function(GPU.format, .{});
++        pub const wgslLanguageFeatures = bridge.accessor(GPU.languages, null, .{});
++    };
++};
++
++pub const Adapter = struct {
++    _pad: bool = false,
++    _features: Features = .{},
++    _limits: Limits = .{},
++    _info: Info = .{},
++
++    fn features(self: *Adapter) *Features {
++        return &self._features;
++    }
++    fn limits(self: *Adapter) *Limits {
++        return &self._limits;
++    }
++    fn info(self: *Adapter) *Info {
++        return &self._info;
++    }
++    fn requestDevice(_: *Adapter, input: ?js.Value, exec: *js.Execution) !js.Promise {
++        var caught: js.TryCatch = undefined;
++        caught.init(exec.js.local.?);
++        defer caught.deinit();
++        deviceDescriptor(input) catch |err| return reject(exec, &caught, err);
++        const local = exec.js.local.?;
++        const resolver = local.createPromiseResolver();
++        const exception = try exec._factory.create(DOMException.init("WebGPU device execution is not implemented", "OperationError"));
++        try resolver.rejectValue(try local.zigValueToJs(exception, .{}));
++        return resolver.promise();
++    }
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Adapter);
++        pub const Meta = struct {
++            pub const name = "GPUAdapter";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const features = bridge.accessor(Adapter.features, null, .{});
++        pub const limits = bridge.accessor(Adapter.limits, null, .{});
++        pub const info = bridge.accessor(Adapter.info, null, .{});
++        pub const requestDevice = bridge.function(Adapter.requestDevice, .{});
++    };
++};
++
++fn resolved(exec: *js.Execution, value: anytype) !js.Promise {
++    const local = exec.js.local.?;
++    const resolver = local.createPromiseResolver();
++    try resolver.resolveValue(try local.zigValueToJs(value, .{}));
++    return resolver.promise();
++}
++fn reject(exec: *js.Execution, caught: *js.TryCatch, err: anyerror) !js.Promise {
++    if (err == error.ExecutionTerminated or exec.js.env.terminatePending()) return error.ExecutionTerminated;
++    if (err == error.OutOfMemory) return err;
++    const local = exec.js.local.?;
++    const reason = caught.exceptionValue() orelse js.Value{ .local = local, .handle = local.isolate.createTypeError("Invalid WebGPU arguments") };
++    const resolver = local.createPromiseResolver();
++    try resolver.rejectValue(reason);
++    return resolver.promise();
++}
++
++const feature_names = [_][]const u8{
++    "core-features-and-limits", "depth-clip-control",       "depth32float-stencil8",
++    "texture-compression-bc",   "texture-compression-etc2", "texture-compression-astc",
++    "timestamp-query",          "indirect-first-instance",  "shader-f16",
++    "rg11b10ufloat-renderable", "bgra8unorm-storage",       "float32-filterable",
++    "subgroups",
++};
++const language_names = [_][]const u8{
++    "readonly_and_readwrite_storage_textures", "packed_4x8_integer_dot_product",
++    "unrestricted_pointer_parameters",         "pointer_composite_access",
++};
++pub const Features = Setlike("GPUSupportedFeatures", &feature_names);
++pub const LanguageFeatures = Setlike("WGSLLanguageFeatures", &language_names);
++
++fn Setlike(comptime interface_name: [:0]const u8, comptime names: []const []const u8) type {
++    return struct {
++        _pad: bool = false,
++        const Self = @This();
++        fn size(_: *const Self) u32 {
++            return names.len;
++        }
++        fn has(_: *const Self, input: js.Value) !bool {
++            const text = try (try Convert.domString(input)).toSlice();
++            for (names) |entry| {
++                if (std.mem.eql(u8, text, entry)) return true;
++            }
++            return false;
++        }
++        fn values(_: *const Self, exec: *js.Execution) !*ValueIterator {
++            return ValueIterator.init(.{ .names = names }, exec);
++        }
++        fn entries(_: *const Self, exec: *js.Execution) !*PairIterator {
++            return PairIterator.init(.{ .names = names }, exec);
++        }
++        fn forEach(self: *Self, cb: js.Function, this_arg: ?js.Value, exec: *js.Execution) !void {
++            const receiver = this_arg orelse try exec.js.local.?.zigValueToJs(js.Undefined{}, .{});
++            for (names) |entry| {
++                try cb.callWithThisRethrow(void, receiver, .{ entry, entry, self });
++            }
++        }
++        pub const JsApi = struct {
++            pub const bridge = js.Bridge(Self);
++            pub const Meta = struct {
++                pub const name = interface_name;
++                pub const prototype_chain = bridge.prototypeChain();
++                pub var class_id: bridge.ClassId = undefined;
++            };
++            pub const size = bridge.accessor(Self.size, null, .{});
++            pub const has = bridge.function(Self.has, .{});
++            pub const values = bridge.function(Self.values, .{});
++            pub const keys = bridge.function(Self.values, .{});
++            pub const entries = bridge.function(Self.entries, .{});
++            pub const forEach = bridge.function(Self.forEach, .{});
++            pub const symbol_iterator = bridge.iterator(Self.values, .{});
++        };
++    };
++}
++
++const InnerIterator = struct {
++    names: []const []const u8,
++    index: usize = 0,
++    pub fn next(self: *InnerIterator, _: *js.Execution) ?struct { []const u8, []const u8 } {
++        if (self.index == self.names.len) return null;
++        const text = self.names[self.index];
++        self.index += 1;
++        return .{ text, text };
++    }
++};
++const Iterator = @import("collections/iterator.zig").Entry;
++const ValueIterator = Iterator(InnerIterator, "0");
++const PairIterator = Iterator(InnerIterator, null);
++
++pub const Info = struct {
++    _pad: bool = false,
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Info);
++        pub const Meta = struct {
++            pub const name = "GPUAdapterInfo";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const vendor = bridge.accessor(struct {
++            fn get(_: *const Info) []const u8 {
++                return "apple";
++            }
++        }.get, null, .{});
++        pub const architecture = bridge.accessor(struct {
++            fn get(_: *const Info) []const u8 {
++                return "apple";
++            }
++        }.get, null, .{});
++        pub const device = bridge.accessor(struct {
++            fn get(_: *const Info) []const u8 {
++                return "";
++            }
++        }.get, null, .{});
++        pub const description = bridge.accessor(struct {
++            fn get(_: *const Info) []const u8 {
++                return "";
++            }
++        }.get, null, .{});
++        pub const subgroupMinSize = bridge.accessor(struct {
++            fn get(_: *const Info) u32 {
++                return 32;
++            }
++        }.get, null, .{});
++        pub const subgroupMaxSize = bridge.accessor(struct {
++            fn get(_: *const Info) u32 {
++                return 32;
++            }
++        }.get, null, .{});
++        pub const isFallbackAdapter = bridge.accessor(struct {
++            fn get(_: *const Info) bool {
++                return false;
++            }
++        }.get, null, .{});
++    };
++};
++
++pub const Limits = struct {
++    _pad: bool = false,
++    pub const JsApi = struct {
++        pub const bridge = js.Bridge(Limits);
++        pub const Meta = struct {
++            pub const name = "GPUSupportedLimits";
++            pub const prototype_chain = bridge.prototypeChain();
++            pub var class_id: bridge.ClassId = undefined;
++        };
++        pub const maxTextureDimension1D = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 16384;
++            }
++        }.get, null, .{});
++        pub const maxTextureDimension2D = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 16384;
++            }
++        }.get, null, .{});
++        pub const maxTextureDimension3D = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 2048;
++            }
++        }.get, null, .{});
++        pub const maxTextureArrayLayers = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 2048;
++            }
++        }.get, null, .{});
++        pub const maxBindGroups = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 4;
++            }
++        }.get, null, .{});
++        pub const maxBindGroupsPlusVertexBuffers = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 24;
++            }
++        }.get, null, .{});
++        pub const maxBindingsPerBindGroup = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 1000;
++            }
++        }.get, null, .{});
++        pub const maxDynamicUniformBuffersPerPipelineLayout = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 8;
++            }
++        }.get, null, .{});
++        pub const maxDynamicStorageBuffersPerPipelineLayout = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 4;
++            }
++        }.get, null, .{});
++        pub const maxSampledTexturesPerShaderStage = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 16;
++            }
++        }.get, null, .{});
++        pub const maxSamplersPerShaderStage = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 16;
++            }
++        }.get, null, .{});
++        pub const maxStorageBuffersPerShaderStage = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 8;
++            }
++        }.get, null, .{});
++        pub const maxStorageTexturesPerShaderStage = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 4;
++            }
++        }.get, null, .{});
++        pub const maxUniformBuffersPerShaderStage = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 12;
++            }
++        }.get, null, .{});
++        pub const maxUniformBufferBindingSize = bridge.accessor(struct {
++            fn get(_: *const Limits) u64 {
++                return 65536;
++            }
++        }.get, null, .{});
++        pub const maxStorageBufferBindingSize = bridge.accessor(struct {
++            fn get(_: *const Limits) u64 {
++                return 134217728;
++            }
++        }.get, null, .{});
++        pub const minUniformBufferOffsetAlignment = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 256;
++            }
++        }.get, null, .{});
++        pub const minStorageBufferOffsetAlignment = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 256;
++            }
++        }.get, null, .{});
++        pub const maxVertexBuffers = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 8;
++            }
++        }.get, null, .{});
++        pub const maxBufferSize = bridge.accessor(struct {
++            fn get(_: *const Limits) u64 {
++                return 268435456;
++            }
++        }.get, null, .{});
++        pub const maxVertexAttributes = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 16;
++            }
++        }.get, null, .{});
++        pub const maxVertexBufferArrayStride = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 2048;
++            }
++        }.get, null, .{});
++        pub const maxInterStageShaderVariables = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 16;
++            }
++        }.get, null, .{});
++        pub const maxColorAttachments = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 8;
++            }
++        }.get, null, .{});
++        pub const maxColorAttachmentBytesPerSample = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 32;
++            }
++        }.get, null, .{});
++        pub const maxComputeWorkgroupStorageSize = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 16384;
++            }
++        }.get, null, .{});
++        pub const maxComputeInvocationsPerWorkgroup = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 256;
++            }
++        }.get, null, .{});
++        pub const maxComputeWorkgroupSizeX = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 256;
++            }
++        }.get, null, .{});
++        pub const maxComputeWorkgroupSizeY = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 256;
++            }
++        }.get, null, .{});
++        pub const maxComputeWorkgroupSizeZ = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 64;
++            }
++        }.get, null, .{});
++        pub const maxComputeWorkgroupsPerDimension = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 65535;
++            }
++        }.get, null, .{});
++        pub const maxImmediateSize = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 0;
++            }
++        }.get, null, .{});
++        pub const maxStorageBuffersInFragmentStage = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 8;
++            }
++        }.get, null, .{});
++        pub const maxStorageTexturesInFragmentStage = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 4;
++            }
++        }.get, null, .{});
++        pub const maxStorageBuffersInVertexStage = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 8;
++            }
++        }.get, null, .{});
++        pub const maxStorageTexturesInVertexStage = bridge.accessor(struct {
++            fn get(_: *const Limits) u32 {
++                return 4;
++            }
++        }.get, null, .{});
++    };
++};
++
++fn deviceDescriptor(input: ?js.Value) !void {
++    const descriptor = try Convert.dictionary(input) orelse return;
++    const label = try descriptor.get("label");
++    if (!label.isUndefined()) _ = try Convert.domString(label);
++    if (try Convert.dictionary(try descriptor.get("defaultQueue"))) |queue| {
++        const queue_label = try queue.get("label");
++        if (!queue_label.isUndefined()) _ = try Convert.domString(queue_label);
++    }
++    const features = try descriptor.get("requiredFeatures");
++    if (!features.isUndefined()) {
++        const iterator = try features.iterator() orelse return error.TypeError;
++        while (try iterator.next()) |entry| {
++            errdefer Convert.closeIterator(iterator, entry.local);
++            const text = try (try Convert.domString(entry)).toSlice();
++            if (!validFeature(text)) return error.TypeError;
++        }
++    }
++    const limits = try descriptor.get("requiredLimits");
++    if (!limits.isUndefined()) {
++        if (!limits.isObject()) return error.TypeError;
++        const local = limits.local;
++        const bindings = &(local.ctx.webgpu_bindings orelse return error.JsException);
++        const own_keys = js.Function{ .local = local, .handle = @ptrCast(v8.v8__Global__Get(&bindings[9], local.isolate.handle)) };
++        const key_array = try own_keys.callRethrow(js.Value, .{limits});
++        const keys = js.Array{ .local = local, .handle = @ptrCast(key_array.handle) };
++        for (0..keys.len()) |i| {
++            const key = try keys.get(@intCast(i));
++            const handle = v8.v8__Object__GetOwnPropertyDescriptor(limits.toObject().handle, local.handle, @ptrCast(key.handle)) orelse return error.JsException;
++            const descriptor_value = js.Value{ .local = local, .handle = handle };
++            if (descriptor_value.isUndefined()) continue;
++            if (!(try descriptor_value.toObject().get("enumerable")).toBool()) continue;
++            const name = try Convert.domString(key);
++            const member = try limits.toObject().get(name.handle);
++            if (member.isUndefined()) continue;
++            const value = try member.toF64();
++            // [EnforceRange] unsigned long long.
++            if (!std.math.isFinite(value) or @trunc(value) < 0 or @trunc(value) >= 18446744073709551616.0) return error.TypeError;
++        }
++    }
++}
++fn validFeature(text: []const u8) bool {
++    const extra = [_][]const u8{
++        "texture-compression-bc-sliced-3d",                    "texture-compression-astc-sliced-3d",
++        "float32-blendable",                                   "clip-distances",
++        "dual-source-blending",                                "texture-component-swizzle",
++        "texture-formats-tier1",                               "texture-formats-tier2",
++        "primitive-index",                                     "subgroup-size-control",
++        "atomic-vec2u-min-max",                                "chromium-experimental-sampling-resource-table",
++        "chromium-experimental-timestamp-query-inside-passes", "chromium-experimental-multi-draw-indirect",
++        "chromium-experimental-subgroup-matrix",               "texture-compression-unaligned",
++    };
++    for (feature_names ++ extra) |name| {
++        if (std.mem.eql(u8, text, name)) return true;
++    }
++    return false;
++}
++
++const interface_names = .{ "GPU", "GPUAdapter", "GPUAdapterInfo", "GPUSupportedFeatures", "GPUSupportedLimits", "WGSLLanguageFeatures" };
++
++pub fn capture(ctx: *js.Context, context: *const v8.Context, global: *const v8.Object, comptime navigator_name: []const u8) !void {
++    const isolate = ctx.isolate;
++    const key = isolate.initStringHandle("gpu");
++    const navigator = v8.v8__Object__Get(global, context, isolate.initStringHandle(navigator_name)) orelse return error.JsException;
++    const prototype = v8.v8__Object__Get(@ptrCast(navigator), context, isolate.initStringHandle("prototype")) orelse return error.JsException;
++    var bindings: [10]v8.Global = @splat(.{ .data_ptr = 0 });
++    errdefer for (&bindings) |*binding| v8.v8__Global__Reset(binding);
++    inline for (interface_names, 0..) |name, i| {
++        const constructor = v8.v8__Object__Get(global, context, isolate.initStringHandle(name)) orelse return error.JsException;
++        v8.v8__Global__New(isolate.handle, constructor, &bindings[i]);
++        if (comptime std.mem.eql(u8, name, "GPUSupportedFeatures") or std.mem.eql(u8, name, "WGSLLanguageFeatures")) {
++            const proto = v8.v8__Object__Get(@ptrCast(constructor), context, isolate.initStringHandle("prototype")) orelse return error.JsException;
++            const values = v8.v8__Object__Get(@ptrCast(proto), context, isolate.initStringHandle("values")) orelse return error.JsException;
++            var result: v8.MaybeBool = undefined;
++            v8.v8__Object__DefineOwnProperty(@ptrCast(proto), context, isolate.initStringHandle("keys"), values, v8.None, &result);
++            if (!result.has_value or !result.value) return error.JsException;
++            v8.v8__Object__DefineOwnProperty(@ptrCast(proto), context, @ptrCast(v8.v8__Symbol__GetIterator(isolate.handle)), values, v8.DontEnum, &result);
++            if (!result.has_value or !result.value) return error.JsException;
++        }
++    }
++    const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(@ptrCast(prototype), context, key) orelse return error.JsException;
++    const object = v8.v8__Object__Get(global, context, isolate.initStringHandle("Object")) orelse return error.JsException;
++    const define = v8.v8__Object__Get(@ptrCast(object), context, isolate.initStringHandle("defineProperty")) orelse return error.JsException;
++    v8.v8__Global__New(isolate.handle, descriptor, &bindings[6]);
++    v8.v8__Global__New(isolate.handle, define, &bindings[7]);
++    v8.v8__Global__New(isolate.handle, prototype, &bindings[8]);
++    const reflect = v8.v8__Object__Get(global, context, isolate.initStringHandle("Reflect")) orelse return error.JsException;
++    const own_keys = v8.v8__Object__Get(@ptrCast(reflect), context, isolate.initStringHandle("ownKeys")) orelse return error.JsException;
++    v8.v8__Global__New(isolate.handle, own_keys, &bindings[9]);
++    ctx.webgpu_bindings = bindings;
++}
++
++pub fn expose(ctx: *js.Context, context: *const v8.Context, global: *const v8.Object, secure: bool) !void {
++    if (secure == !ctx.webgpu_hidden) return;
++    const isolate = ctx.isolate;
++    const bindings = &(ctx.webgpu_bindings orelse return error.JsException);
++    const prototype: *const v8.Object = @ptrCast(v8.v8__Global__Get(&bindings[8], isolate.handle));
++    var result: v8.MaybeBool = undefined;
++    if (secure) {
++        const define: *const v8.Function = @ptrCast(v8.v8__Global__Get(&bindings[7], isolate.handle));
++        const args = [_]?*const v8.Value{ @ptrCast(prototype), isolate.initStringHandle("gpu"), v8.v8__Global__Get(&bindings[6], isolate.handle) };
++        _ = v8.v8__Function__Call(define, context, @ptrCast(global), args.len, &args) orelse return error.JsException;
++    } else {
++        v8.v8__Object__Delete(prototype, context, isolate.initStringHandle("gpu"), &result);
++        if (!result.has_value or !result.value) return error.JsException;
++    }
++    inline for (interface_names, 0..) |name, i| {
++        const key = isolate.initStringHandle(name);
++        if (secure) {
++            v8.v8__Object__DefineOwnProperty(global, context, key, v8.v8__Global__Get(&bindings[i], isolate.handle), v8.DontEnum, &result);
++        } else {
++            v8.v8__Object__Delete(global, context, key, &result);
++        }
++        if (!result.has_value or !result.value) return error.JsException;
++    }
++    ctx.webgpu_hidden = !secure;
++}
++
++comptime {
++    if (@offsetOf(GPU, "_languages") == 0) @compileError("GPU aliases language features");
++    for (.{ "_features", "_limits", "_info" }) |field| {
++        if (@offsetOf(Adapter, field) == 0) @compileError("GPUAdapter aliases " ++ field);
++    }
++}
+diff --git a/src/browser/webapi/WorkerNavigator.zig b/src/browser/webapi/WorkerNavigator.zig
+index 5158dd5..442b134 100644
+--- a/src/browser/webapi/WorkerNavigator.zig
++++ b/src/browser/webapi/WorkerNavigator.zig
+@@ -41,6 +41,7 @@ _pad: bool = false,
+ _permissions: Permissions = .{},
+ _storage: StorageManager = .{},
+ _ua_data: NavigatorUAData = .{},
++_gpu: ?*@import("WebGPU.zig").GPU = null,
+ 
+ pub const init: WorkerNavigator = .{};
+ 
+@@ -100,6 +101,11 @@ fn getStorage(self: *WorkerNavigator) *StorageManager {
+     return &self._storage;
+ }
+ 
++fn getGPU(self: *WorkerNavigator, exec: *Execution) !*@import("WebGPU.zig").GPU {
++    if (self._gpu == null) self._gpu = try @import("WebGPU.zig").GPU.init(exec);
++    return self._gpu.?;
++}
++
+ fn getConnection(_: *WorkerNavigator, exec: *Execution) !*NetworkInformation {
+     return NetworkInformation.init(exec);
+ }
+@@ -134,4 +140,5 @@ pub const JsApi = struct {
+     pub const storage = bridge.accessor(WorkerNavigator.getStorage, null, .{});
+     pub const connection = bridge.accessor(WorkerNavigator.getConnection, null, .{ .cache = .{ .private = "network_information" } });
+     pub const userAgentData = bridge.accessor(WorkerNavigator.getUserAgentData, null, .{});
++    pub const gpu = bridge.accessor(WorkerNavigator.getGPU, null, .{});
+ };

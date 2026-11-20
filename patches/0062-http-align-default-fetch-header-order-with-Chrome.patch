@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 2 Nov 2026 16:49:45 -0300
+Subject: [PATCH] http: align default fetch header order with Chrome
+
+Serialize non-internal fetch headers in the order observed in local
+Chrome 154 recorder captures. Reuse the navigation serializer with a
+fetch-specific sequence, materializing implicit Accept and the supported
+Accept-Encoding list at their intended positions. Keep native curl
+response decoding enabled and preserve explicit values, empty values,
+source precedence and trailing custom headers without duplicates.
+
+Leave navigation order, internal requests, XHR, HTTP/1.1 keep-alive,
+HTTP/2 pseudo-headers/priorities, TLS and the macOS Chrome 155 persona
+unchanged. Compression advertising remains deflate, gzip, br; no zstd
+support is claimed or added.
+
+Validation: ReleaseFast build; all 1658 upstream tests; Zig formatting
+and harness TypeScript checks. Recorder comparisons cover Chrome, the
+previous binary and this change: 54 page visits, 108 selected requests,
+HTTP/2, HTTP/1.1 ALPN and no-ALPN fallback, cold and opted-in navigation.
+All 18 fetch header-name/casing/order comparisons match Chrome; request
+header values, navigation ordering and the previous binary's HTTP/2
+summaries are unchanged. Temporary wire diagnostics pass 30 checks per
+binary across 20 requests on one reused connection, including author/CDP
+overrides, empty headers, redirect retention, HEAD/POST, XHR and native
+gzip/deflate/Brotli decoding. The repeated TLS gate passes all eight
+scenarios with 20 processes per browser. Reviewer found no issues.
+No new unit tests.
+
+References: fingerprint/README.md; patches/0057; pinned curl 8.22.0.
+---
+ src/network/HttpClient.zig | 29 +++++++++++++++++++++++++++--
+ 1 file changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index 4c9bee4..4caf9b5 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -3690,8 +3690,8 @@ pub const Transfer = struct {
+         // accumulate duplicates.
+         conn.clearHeaders();
+         const arena = self.arena.allocator();
+-        if (!req.internal and req.request_mode == .navigate) {
+-            const order = [_][]const u8{
++        if (!req.internal and (req.request_mode == .navigate or req.resource_type == .fetch)) {
++            const order: []const []const u8 = if (req.request_mode == .navigate) &.{
+                 "sec-ch-ua",
+                 "sec-ch-ua-mobile",
+                 "sec-ch-ua-platform",
+@@ -3705,8 +3705,33 @@ pub const Transfer = struct {
+                 "accept-encoding",
+                 "accept-language",
+                 "priority",
++            } else &.{
++                "pragma",
++                "cache-control",
++                "sec-ch-ua-full-version-list",
++                "sec-ch-ua-platform",
++                "device-memory",
++                "sec-ch-ua",
++                "sec-ch-ua-model",
++                "sec-ch-ua-mobile",
++                "sec-ch-ua-bitness",
++                "sec-ch-ua-arch",
++                "dpr",
++                "user-agent",
++                "sec-ch-ua-platform-version",
++                "accept",
++                "sec-fetch-site",
++                "sec-fetch-mode",
++                "sec-fetch-dest",
++                "referer",
++                "accept-encoding",
++                "accept-language",
++                "priority",
+             };
+             for (order) |name| {
++                if (req.request_mode != .navigate and std.ascii.eqlIgnoreCase(name, "accept") and self.findRequestHeader(name) == null) {
++                    try conn.addHeader(arena, "Accept", "*/*");
++                }
+                 // A custom header suppresses curl's earlier automatic emission,
+                 // while CURLOPT_ACCEPT_ENCODING still enables native decoding.
+                 if (std.ascii.eqlIgnoreCase(name, "accept-encoding") and self.findRequestHeader(name) == null) {

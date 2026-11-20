@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 17 Nov 2026 17:20:55 -0300
+Subject: [PATCH] webapi: serialize postMessage sender security origin
+
+MessageEvent.origin is the sender's security origin, not the origin of its
+Location URL. about:blank and srcdoc inherit a tuple origin while their URL
+origin remains null. Using Location.getOrigin therefore delivered null from
+these same-origin senders even though window.origin was already correct.
+
+Read Window.getOrigin (Frame.origin with opaque fallback null) and retain the
+existing synchronous copy into the queued callback arena. Keep incumbent-source
+selection, cloning, source identity, dispatch trust, and targetOrigin behavior
+unchanged. Mark the now-unused implicit Frame parameter anonymous.
+
+An isolated local Chrome/native reduction covers HTTP, blank, document.write,
+srcdoc, opaque data and blob senders. All six message-origin/source/trust cases
+match after this change; the separate document.write URL-update mismatch remains.
+All 1658 existing upstream tests pass; no new tests are added.
+
+This was found during Sephora handoff diagnosis but the observed live SDK
+messages did not exhibit the inherited-origin mismatch. It is a separate API
+fix, not an established binary-submission blocker or a verification workaround.
+---
+ src/browser/webapi/Window.zig | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/browser/webapi/Window.zig b/src/browser/webapi/Window.zig
+index 11e3dd8..5d7a1d5 100644
+--- a/src/browser/webapi/Window.zig
++++ b/src/browser/webapi/Window.zig
+@@ -889,7 +889,7 @@ pub fn stop(self: *Window) void {
+     self._frame.stopLoading();
+ }
+ 
+-pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8, transfer: ?[]const *MessagePort, frame: *Frame) !void {
++pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8, transfer: ?[]const *MessagePort, _: *Frame) !void {
+     // For now, we ignore targetOrigin checking and just dispatch the message
+     // In a full implementation, we would validate the origin
+     _ = target_origin;
+@@ -924,7 +924,7 @@ pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8,
+     errdefer cloned.release();
+ 
+     // Origin should be the source window's origin (where the message came from)
+-    const origin = try source_window._location.getOrigin(&frame.js.execution);
++    const origin = source_window.getOrigin();
+     const callback = try arena.create(PostMessageCallback);
+     callback.* = .{
+         .arena = arena,

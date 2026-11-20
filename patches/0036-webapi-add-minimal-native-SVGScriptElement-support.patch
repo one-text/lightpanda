@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 20 Oct 2026 11:33:34 -0300
+Subject: [PATCH] webapi: add minimal native SVGScriptElement support
+
+Expose SVGScriptElement as an SVGElement subtype and route SVG script
+creation through the element factory. Reflect type and reuse the cached
+SVGAnimatedString href implementation.
+
+American Eagle's security instrumentation caches SVGScriptElement and
+uses it in an unguarded instanceof check. The missing interface throws
+while processing application requests and prevents the cart from loading.
+
+This adds only interface and attribute support, not SVG script loading or
+execution. The separate Window constructor identity issue that makes
+Ember report hasDOM=false remains unfixed.
+
+Validation: 1658 upstream tests passed; runtime inheritance and attribute
+reflection checks passed. The benchmark matches the unmodified baseline
+at 109/111, with inspector-timing and sw-ua-consistency still failing.
+---
+ src/browser/frame/node_factory.zig        |  1 +
+ src/browser/js/bridge.zig                 |  1 +
+ src/browser/webapi/element/Svg.zig        |  4 ++
+ src/browser/webapi/element/svg/Script.zig | 55 +++++++++++++++++++++++
+ 4 files changed, 61 insertions(+)
+ create mode 100644 src/browser/webapi/element/svg/Script.zig
+
+diff --git a/src/browser/frame/node_factory.zig b/src/browser/frame/node_factory.zig
+index 41cf0df..abdcf09 100644
+--- a/src/browser/frame/node_factory.zig
++++ b/src/browser/frame/node_factory.zig
+@@ -928,6 +928,7 @@ pub fn createElementNS(document: *const Node.Document, namespace: Element.Namesp
+                     else => {},
+                 },
+                 6 => switch (@as(u48, @bitCast(name[0..6].*))) {
++                    asUint("script") => return createSvgElementT(document, Element.Svg.Script, name, attribute_iterator, .{}),
+                     asUint("circle") => return createSvgElementT(document, Geometry.Circle, name, attribute_iterator, .{}),
+                     asUint("marker") => return createSvgElementT(document, Element.Svg.Marker, name, attribute_iterator, .{}),
+                     asUint("switch") => return createSvgElementT(document, Graphics.Switch, name, attribute_iterator, .{}),
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 541711d..9c2b196 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -1189,6 +1189,7 @@ pub const PageJsApis = flattenTypes(&.{
+     @import("../webapi/element/svg/TextPath.zig"),
+     @import("../webapi/element/svg/View.zig"),
+     @import("../webapi/element/svg/Title.zig"),
++    @import("../webapi/element/svg/Script.zig"),
+     @import("../webapi/element/svg/Desc.zig"),
+     @import("../webapi/element/svg/Metadata.zig"),
+     @import("../webapi/element/svg/GradientElement.zig"),
+diff --git a/src/browser/webapi/element/Svg.zig b/src/browser/webapi/element/Svg.zig
+index 00ccfb8..0769e1d 100644
+--- a/src/browser/webapi/element/Svg.zig
++++ b/src/browser/webapi/element/Svg.zig
+@@ -30,6 +30,7 @@ pub const Generic = @import("svg/Generic.zig");
+ pub const Graphics = @import("svg/Graphics.zig");
+ pub const View = @import("svg/View.zig");
+ pub const Title = @import("svg/Title.zig");
++pub const Script = @import("svg/Script.zig");
+ pub const Desc = @import("svg/Desc.zig");
+ pub const Metadata = @import("svg/Metadata.zig");
+ pub const GradientElement = @import("svg/GradientElement.zig");
+@@ -52,6 +53,7 @@ pub const Type = enum(u8) {
+     graphics,
+     view,
+     title,
++    script,
+     desc,
+     metadata,
+     gradient,
+@@ -68,6 +70,7 @@ pub fn Subtype(comptime tag: Type) type {
+         .graphics => Graphics,
+         .view => View,
+         .title => Title,
++        .script => Script,
+         .desc => Desc,
+         .metadata => Metadata,
+         .gradient => GradientElement,
+@@ -142,6 +145,7 @@ pub fn getTag(self: *const Svg) Element.Tag {
+         },
+         .generic => self.subtype(Generic)._tag,
+         .title => .title,
++        .script => .script,
+         .view, .desc, .metadata, .gradient, .clip_path, .marker, .mask, .pattern, .stop => .unknown,
+     };
+ }
+diff --git a/src/browser/webapi/element/svg/Script.zig b/src/browser/webapi/element/svg/Script.zig
+new file mode 100644
+index 0000000..0755f1e
+--- /dev/null
++++ b/src/browser/webapi/element/svg/Script.zig
+@@ -0,0 +1,55 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const lp = @import("lightpanda");
++const Factory = @import("../../../Factory.zig");
++const js = @import("../../../js/js.zig");
++const Frame = @import("../../../Frame.zig");
++
++const Node = @import("../../Node.zig");
++const Element = @import("../../Element.zig");
++const AnimatedString = @import("../../svg/AnimatedString.zig");
++const Svg = @import("../Svg.zig");
++
++const Script = @This();
++
++pub const Proto = Svg;
++_pad: bool = false,
++_proto_canary: if (lp.IS_DEBUG) *Svg else void = undefined,
++
++pub fn asElement(self: *Script) *Element {
++    return Factory.protoOf(self).asElement();
++}
++pub fn asNode(self: *Script) *Node {
++    return self.asElement().asNode();
++}
++
++fn getHref(self: *Script, frame: *Frame) !*AnimatedString {
++    return AnimatedString.getOrCreate(self.asElement(), .href, frame);
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(Script);
++    pub const Meta = struct {
++        pub const name = "SVGScriptElement";
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++
++    pub const @"type" = Element.Reflect(Script).string("type");
++    pub const href = bridge.accessor(Script.getHref, null, .{});
++};

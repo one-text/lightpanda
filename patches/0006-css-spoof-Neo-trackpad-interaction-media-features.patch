@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Tue, 13 Oct 2026 19:19:37 -0300
+Subject: [PATCH] css: spoof Neo trackpad interaction media features
+
+Expose the base MacBook Neo's built-in Multi-Touch trackpad as the fixed
+fine, hover-capable primary input device. Match pointer/any-pointer: fine
+and hover/any-hover: hover, including boolean forms, through the shared
+media-query evaluator rather than replacing matchMedia in JavaScript.
+The any-* features agree with the primary input because this desktop
+profile has no coarse touchscreen; navigator.maxTouchPoints stays zero.
+No host input probing, actual macOS integration, or mobile emulation is
+introduced.
+
+Keep case-insensitive keywords, existing query composition, native
+MediaQueryList objects and CSS media conditions on the same evaluator.
+Discrete-feature ranges, unknown keywords and none/coarse remain false.
+Replace hover in the two existing unsupported-feature assertions with an
+actually unknown feature; do not add unit tests or change the benchmark.
+
+References:
+https://www.w3.org/TR/mediaqueries-4/#mf-interaction
+https://www.apple.com/macbook-neo/specs/
+---
+ src/browser/css/MediaQuery.zig              | 14 ++++++++++++--
+ src/browser/tests/css/media_query_list.html |  2 +-
+ 2 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/browser/css/MediaQuery.zig b/src/browser/css/MediaQuery.zig
+index a0a975d..4923090 100644
+--- a/src/browser/css/MediaQuery.zig
++++ b/src/browser/css/MediaQuery.zig
+@@ -28,7 +28,9 @@
+ //!               `height` / `min-height` / `max-height`,
+ //!               `device-width` / `min-device-width` / `max-device-width`,
+ //!               `device-height` / `min-device-height` / `max-device-height`,
+-//!               `orientation` (portrait | landscape).
++//!               `orientation` (portrait | landscape),
++//!               `pointer` / `any-pointer` (fine),
++//!               `hover` / `any-hover` (hover).
+ //!   - Length values: `<int>px`, `<int>em` (1em = 16px), `<int>rem`,
+ //!     and bare `0`.
+ //!   - Operators: `,` (OR), `and`, `not`, `only`.
+@@ -323,6 +325,12 @@ fn evalNameValue(name: []const u8, value: []const u8, viewport: Viewport) bool {
+         const px = parseLengthPx(value) orelse return false;
+         return height == px;
+     }
++    if (std.mem.eql(u8, lname, "pointer") or std.mem.eql(u8, lname, "any-pointer")) {
++        return std.ascii.eqlIgnoreCase(value, "fine");
++    }
++    if (std.mem.eql(u8, lname, "hover") or std.mem.eql(u8, lname, "any-hover")) {
++        return std.ascii.eqlIgnoreCase(value, "hover");
++    }
+     if (std.mem.eql(u8, lname, "orientation")) {
+         if (std.ascii.eqlIgnoreCase(value, "landscape")) return viewport.width >= viewport.height;
+         if (std.ascii.eqlIgnoreCase(value, "portrait")) return viewport.height > viewport.width;
+@@ -345,6 +353,8 @@ fn evalBoolean(name: []const u8, viewport: Viewport) bool {
+     if (std.mem.eql(u8, lname, "width")) return width > 0;
+     if (std.mem.eql(u8, lname, "height")) return height > 0;
+     if (std.mem.eql(u8, lname, "orientation")) return true;
++    if (std.mem.eql(u8, lname, "pointer") or std.mem.eql(u8, lname, "any-pointer")) return true;
++    if (std.mem.eql(u8, lname, "hover") or std.mem.eql(u8, lname, "any-hover")) return true;
+     return false;
+ }
+ 
+@@ -539,7 +549,7 @@ test "MediaQuery: unknown feature is false" {
+     try testing.expect(!matches("(monochrome)", v));
+     try testing.expect(!matches("(prefers-color-scheme: dark)", v));
+     try testing.expect(!matches("(prefers-reduced-motion: reduce)", v));
+-    try testing.expect(!matches("(hover: hover)", v));
++    try testing.expect(!matches("(unknown-feature: unknown)", v));
+     try testing.expect(!matches("(color)", v));
+ }
+ 
+diff --git a/src/browser/tests/css/media_query_list.html b/src/browser/tests/css/media_query_list.html
+index 8c9fec4..ee90ade 100644
+--- a/src/browser/tests/css/media_query_list.html
++++ b/src/browser/tests/css/media_query_list.html
+@@ -84,7 +84,7 @@
+ {
+   // Unknown features evaluate to false per Media Queries Level 4.
+   testing.expectEqual(false, window.matchMedia('(prefers-color-scheme: dark)').matches);
+-  testing.expectEqual(false, window.matchMedia('(hover: hover)').matches);
++  testing.expectEqual(false, window.matchMedia('(unknown-feature: unknown)').matches);
+ }
+ </script>
+ 

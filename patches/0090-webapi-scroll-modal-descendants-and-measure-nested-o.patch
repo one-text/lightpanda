@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Sun, 15 Nov 2026 17:03:44 -0300
+Subject: [PATCH] webapi: scroll modal descendants and measure nested overflow
+
+Fix native Playwright navigation to Amazon Brazil's Subscribe & Save
+address selector. The address link lives below the viewport in a fixed
+modal, but scrollIntoViewIfNeeded previously returned for every fixed
+descendant and otherwise scrolled only the owning window. The inner
+scroller also reported only five pixels of content, clamping any manual
+scroll before it could expose the link.
+
+Walk ancestor scroll containers inside-out, recomputing target geometry
+after each move. Stop window propagation at viewport-fixed boundaries,
+not before scrolling the modal's contents. Skip scrollers that an
+out-of-flow target escapes through its containing block. Compute deltas
+in each scroller's local space, excluding its and outer transforms while
+preserving transforms inside it.
+
+Measure descendant overflow on scrollable axes without changing the
+existing synthetic client-box sizing. Keep outer ranges independent of
+nested scrolling, hidden/clip boundaries, and escaping positioned boxes.
+Cache both flow coordinates in one preorder pass to avoid recounting
+preceding sibling subtrees for every descendant. Extend the existing
+inline-style parser expectations for the new clipping flags; add no
+upstream tests.
+
+Validation: Debug and ReleaseFast builds; all 1658 upstream tests pass.
+The account-free fixed-modal fixture now scrolls its inner container and
+accepts a normal Playwright click (published baseline times out; Chrome
+control succeeds). Thirteen temporary probe cases cover scale/rotation,
+inner transforms, positioned overflow stability, hidden/clip/nested
+scrollers, deeply wrapped collapsed content, visible targets, relative
+CDP rectangles, and a 2000-element list. Address-selector navigation
+succeeds with ordinary link clicks at 1280x720 and 1920x1080 after reload;
+separate CDP geometry checks agree and elementFromPoint hits the link.
+No forced clicks, direct-link navigation, or account changes are needed.
+One reviewer pass identified transformed deltas, escaping positioned
+boxes, clipping propagation, and repeated traversal costs; all addressed.
+---
+ src/browser/StyleManager.zig    |  32 +++++--
+ src/browser/webapi/Document.zig |   2 +-
+ src/browser/webapi/Element.zig  | 154 ++++++++++++++++++++++++++------
+ 3 files changed, 154 insertions(+), 34 deletions(-)
+
+diff --git a/src/browser/StyleManager.zig b/src/browser/StyleManager.zig
+index d333d06..4e4a193 100644
+--- a/src/browser/StyleManager.zig
++++ b/src/browser/StyleManager.zig
+@@ -686,6 +686,14 @@ pub fn overflowAxes(self: *StyleManager, el: *Element) Element.ScrollAxes {
+     return .{ .x = p.overflow_x_scrolls, .y = p.overflow_y_scrolls };
+ }
+ 
++/// Overflow boundaries stop descendants from enlarging an outer scroller,
++/// including hidden/clip boxes that do not accept wheel scrolling.
++pub fn overflowClipAxes(self: *StyleManager, el: *Element) Element.ScrollAxes {
++    self.rebuildIfDirty() catch return .{};
++    const p = self.geometryProps(el);
++    return .{ .x = p.overflow_x_clips, .y = p.overflow_y_clips };
++}
++
+ /// The axes along which `el` keeps a scroll from chaining out of it: its own
+ /// computed overscroll-behavior on that axis is contain or none. No ancestor
+ /// walk.
+@@ -1365,6 +1373,8 @@ const Geometry = struct {
+ 
+         overflow_x_scrolls: ?bool = null,
+         overflow_y_scrolls: ?bool = null,
++        overflow_x_clips: ?bool = null,
++        overflow_y_clips: ?bool = null,
+         overscroll_x_contains: ?bool = null,
+         overscroll_y_contains: ?bool = null,
+         width: ?Length = null,
+@@ -1376,8 +1386,10 @@ const Geometry = struct {
+         fn apply(self: *Declared, name: []const u8, value: []const u8) void {
+             if (std.ascii.eqlIgnoreCase(name, "overflow-x")) {
+                 self.overflow_x_scrolls = overflowScrolls(value);
++                self.overflow_x_clips = overflowClips(value);
+             } else if (std.ascii.eqlIgnoreCase(name, "overflow-y")) {
+                 self.overflow_y_scrolls = overflowScrolls(value);
++                self.overflow_y_clips = overflowClips(value);
+             } else if (std.ascii.eqlIgnoreCase(name, "overscroll-behavior-x")) {
+                 self.overscroll_x_contains = overscrollContains(value);
+             } else if (std.ascii.eqlIgnoreCase(name, "overscroll-behavior-y")) {
+@@ -1402,6 +1414,10 @@ const Geometry = struct {
+                 std.ascii.eqlIgnoreCase(value, "overlay");
+         }
+ 
++        fn overflowClips(value: []const u8) bool {
++            return overflowScrolls(value) or std.ascii.eqlIgnoreCase(value, "hidden") or std.ascii.eqlIgnoreCase(value, "clip");
++        }
++
+         // `contain` keeps the scroll in the box, `none` also kills the bounce we
+         // don't render anyway; only `auto` lets a scroll chain outward.
+         fn overscrollContains(value: []const u8) bool {
+@@ -1410,9 +1426,11 @@ const Geometry = struct {
+         }
+     };
+ 
+-    const Computed = packed struct(u143) {
++    const Computed = packed struct(u145) {
+         overflow_x_scrolls: bool = false,
+         overflow_y_scrolls: bool = false,
++        overflow_x_clips: bool = false,
++        overflow_y_clips: bool = false,
+         overscroll_x_contains: bool = false,
+         overscroll_y_contains: bool = false,
+         width: Length = .{},
+@@ -2186,12 +2204,12 @@ test "StyleManager: inlineDeclared: scan matches the parsed style object" {
+         .{ .visibility = .{ .visibility_hidden = true, .visibility_inherits = false } },
+         .{},
+         .{},
+-        .{ .geometry = .{ .overflow_x_scrolls = true, .overflow_y_scrolls = true } },
+-        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_y_scrolls = true } },
+-        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_y_scrolls = true } },
+-        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_y_scrolls = false } },
+-        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_y_scrolls = true } },
+-        .{ .geometry = .{ .overflow_x_scrolls = true } },
++        .{ .geometry = .{ .overflow_x_scrolls = true, .overflow_y_scrolls = true, .overflow_x_clips = true, .overflow_y_clips = true } },
++        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_y_scrolls = true, .overflow_x_clips = true, .overflow_y_clips = true } },
++        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_y_scrolls = true, .overflow_x_clips = true, .overflow_y_clips = true } },
++        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_y_scrolls = false, .overflow_x_clips = true, .overflow_y_clips = true } },
++        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_y_scrolls = true, .overflow_x_clips = true, .overflow_y_clips = true } },
++        .{ .geometry = .{ .overflow_x_scrolls = true, .overflow_x_clips = true } },
+         .{},
+         .{ .geometry = .{ .width = .{ .value = 100, .unit = .px }, .height = .{ .value = 96, .unit = .px } } },
+         .{ .geometry = .{ .height = .{} } },
+diff --git a/src/browser/webapi/Document.zig b/src/browser/webapi/Document.zig
+index 7cc008a..f57aa83 100644
+--- a/src/browser/webapi/Document.zig
++++ b/src/browser/webapi/Document.zig
+@@ -1046,7 +1046,7 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame:
+ 
+         preorder_index += 1;
+         if (node.is(Element)) |element| {
+-            try flow_positions.put(frame.local_arena, element, pos);
++            try flow_positions.put(frame.local_arena, element, .{ .y = pos });
+             hidden = hidden or style_manager.hasDisplayNone(element);
+             if (!hidden) {
+                 const transform = style_manager.transformStyle(element).transform;
+diff --git a/src/browser/webapi/Element.zig b/src/browser/webapi/Element.zig
+index df12c16..df99d89 100644
+--- a/src/browser/webapi/Element.zig
++++ b/src/browser/webapi/Element.zig
+@@ -1671,7 +1671,11 @@ pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect
+ }
+ 
+ pub fn clientRectValues(self: *Element, frame: *Frame, positions: ?*const FlowPositions) DOMRect.Data {
+-    const corners = self.clientQuadValues(frame, positions);
++    return self.clientRectValuesUntil(frame, positions, null);
++}
++
++fn clientRectValuesUntil(self: *Element, frame: *Frame, positions: ?*const FlowPositions, stop: ?*Element) DOMRect.Data {
++    const corners = self.clientQuadValues(frame, positions, stop);
+     var left = corners[0][0];
+     var right = left;
+     var top = corners[0][1];
+@@ -1696,7 +1700,7 @@ pub fn hasVisualTransform(self: *Element, frame: *Frame) bool {
+ }
+ 
+ pub fn transformedContains(self: *Element, x: f64, y: f64, ignore_x: bool, frame: *Frame, positions: *const FlowPositions) bool {
+-    const corners = self.clientQuadValues(frame, positions);
++    const corners = self.clientQuadValues(frame, positions, null);
+     if (ignore_x) {
+         var top = corners[0][1];
+         var bottom = top;
+@@ -1720,7 +1724,7 @@ pub fn transformedContains(self: *Element, x: f64, y: f64, ignore_x: bool, frame
+ 
+ // Keep layout coordinates untransformed. Apply each ancestor's visual matrix
+ // to the original corners, not intermediate bounding boxes (which lose rotation).
+-fn clientQuadValues(self: *Element, frame: *Frame, positions: ?*const FlowPositions) [4][2]f64 {
++fn clientQuadValues(self: *Element, frame: *Frame, positions: ?*const FlowPositions, stop: ?*Element) [4][2]f64 {
+     const rect: DOMRect.Data = .{
+         .x = self.clientCoordinate(frame, .width, positions),
+         .y = self.clientCoordinate(frame, .height, positions),
+@@ -1737,6 +1741,7 @@ fn clientQuadValues(self: *Element, frame: *Frame, positions: ?*const FlowPositi
+     var corners = original;
+     var current: ?*Element = self;
+     while (current) |element| : (current = layoutParent(element)) {
++        if (element == stop) break;
+         const style = owner._style_manager.transformStyle(element);
+         if (style.transform.len == 0 or std.ascii.eqlIgnoreCase(style.transform, "none")) continue;
+         const width = element.boxAxis(owner, .width);
+@@ -1919,7 +1924,7 @@ pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
+         return self.rootScrollSize(frame, .height) orelse height;
+     }
+ 
+-    return self.integerTextAxis(frame, @max(height, self.contentAxis(frame, .height)));
++    return self.integerTextAxis(frame, @max(height, self.scrollContentAxis(frame, .height)));
+ }
+ 
+ pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
+@@ -1935,7 +1940,68 @@ pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
+         return self.rootScrollSize(frame, .width) orelse width;
+     }
+ 
+-    return self.integerTextAxis(frame, @max(width, self.contentAxis(frame, .width)));
++    return self.integerTextAxis(frame, @max(width, self.scrollContentAxis(frame, .width)));
++}
++
++// Scrollable overflow can extend past an auto-sized child's synthetic box.
++// Cache both flow axes in one preorder pass instead of recounting sibling
++// subtrees per descendant. Clipping and escaping positioned subtrees do not
++// contribute, but still occupy preorder slots in the synthetic flow model.
++fn scrollContentAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
++    var extent = self.contentAxis(frame, axis);
++    const owner = self.ownerFrame(frame) orelse return extent;
++    const manager = &owner._style_manager;
++    const axes = manager.overflowAxes(self);
++    if (!(if (axis == .width) axes.x else axes.y)) return extent;
++    const origin = self.clientCoordinate(owner, axis, null);
++    const scroll: f64 = @floatFromInt(if (axis == .width) self.getScrollLeft(owner) else self.getScrollTop(owner));
++    var positions: FlowPositions = .empty;
++    defer positions.deinit(owner.local_arena);
++    const Entry = struct { node: *Node, x: f64, excluded: bool };
++    var stack: std.ArrayList(Entry) = .empty;
++    defer stack.deinit(owner.local_arena);
++    stack.append(owner.local_arena, .{ .node = self.asNode(), .x = self.flowHorizontalPosition(owner), .excluded = false }) catch return extent;
++    var y = self.flowCoordinate(owner, .height, null);
++    while (stack.pop()) |entry| {
++        var excluded = entry.excluded;
++        if (entry.node.is(Element)) |element| {
++            positions.put(owner.local_arena, element, .{ .x = entry.x, .y = y }) catch return extent;
++            if (element != self) {
++                excluded = excluded or manager.hasDisplayNone(element);
++                const position = element.positionStyle(owner);
++                if (!excluded and (position == .absolute or position == .fixed)) {
++                    excluded = !element.scrollsWithAncestor(self, owner);
++                }
++                if (!excluded) {
++                    // Direct children are already included by contentAxis.
++                    if (layoutParent(element) != self) {
++                        const rect = element.clientRectValuesUntil(owner, &positions, self);
++                        const end = (if (axis == .width) rect.x + rect.width else rect.y + rect.height) - origin + scroll;
++                        extent = @max(extent, end);
++                    }
++                    const clips = manager.overflowClipAxes(element);
++                    excluded = if (axis == .width) clips.x else clips.y;
++                }
++            }
++        }
++        y += 5;
++        // Push in reverse order while carrying horizontal sibling prefixes.
++        var end_x = entry.x;
++        var child = entry.node.firstChild();
++        while (child) |node| : (child = node.nextSibling()) {
++            if (node.is(Element)) |element| {
++                if (!manager.hasDisplayNone(element)) end_x += element.getElementAxis(owner, .width).value;
++            }
++        }
++        child = entry.node.lastChild();
++        while (child) |node| : (child = node.previousSibling()) {
++            if (node.is(Element)) |element| {
++                if (!manager.hasDisplayNone(element)) end_x -= element.getElementAxis(owner, .width).value;
++            }
++            stack.append(owner.local_arena, .{ .node = node, .x = end_x, .excluded = excluded }) catch return extent;
++        }
++    }
++    return extent;
+ }
+ 
+ /// Null where we can't prove a limit, which leaves the offset unbounded:
+@@ -2216,7 +2282,7 @@ fn flowHorizontalPosition(self: *Element, frame: *Frame) f64 {
+ // Resolve explicit fixed/absolute insets without replacing the renderless
+ // flow model. Walk containing blocks iteratively so deeply nested page DOMs
+ // cannot exhaust the native stack. Each axis may independently remain auto.
+-pub const FlowPositions = std.AutoHashMapUnmanaged(*Element, f64);
++pub const FlowPositions = std.AutoHashMapUnmanaged(*Element, struct { x: ?f64 = null, y: f64 });
+ 
+ pub fn positionedClientCoordinate(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
+     return self.positionedCoordinate(frame, axis, null);
+@@ -2264,10 +2330,13 @@ pub fn positionedCoordinate(self: *Element, frame: *Frame, comptime axis: Axis,
+ }
+ 
+ fn flowCoordinate(self: *Element, frame: *Frame, comptime axis: Axis, positions: ?*const FlowPositions) f64 {
+-    if (axis == .width) return self.flowHorizontalPosition(frame);
+     if (positions) |known| {
+-        if (known.get(self)) |value| return value;
++        if (known.get(self)) |value| {
++            if (axis == .height) return value.y;
++            if (value.x) |x| return x;
++        }
+     }
++    if (axis == .width) return self.flowHorizontalPosition(frame);
+     return calculateDocumentPosition(self.asNode());
+ }
+ 
+@@ -2300,6 +2369,19 @@ fn positionedContainingBlock(self: *Element, frame: *Frame, fixed: bool) ?*Eleme
+     return null;
+ }
+ 
++// Out-of-flow boxes skip scrollers between them and their containing block.
++fn scrollsWithAncestor(self: *Element, ancestor: *Element, frame: *Frame) bool {
++    var current = self;
++    while (current != ancestor) {
++        const position = current.positionStyle(frame);
++        current = (if (position == .absolute or position == .fixed)
++            current.positionedContainingBlock(frame, position == .fixed)
++        else
++            layoutParent(current)) orelse return false;
++    }
++    return true;
++}
++
+ fn ancestorScroll(self: *Element, stop: ?*Element, frame: *Frame, comptime axis: Axis) f64 {
+     var value: f64 = 0;
+     var parent = layoutParent(self);
+@@ -2370,34 +2452,54 @@ pub fn scrollIntoViewIfNeeded(self: *Element, center_if_needed: ?bool, frame: *F
+     self.scrollClientRectIntoView(null, center_if_needed orelse false, frame) catch {};
+ }
+ 
+-// Shared by the DOM and CDP entry points. The optional rectangle is relative
+-// to the element; only axes outside the viewport need to move. This uses the
+-// existing window scroller, not a separate automation-only scroll state.
++// Shared by DOM and CDP. Fixed positioning stops window scrolling, not the
++// inner scroll containers. Recompute geometry after moving each ancestor.
+ pub fn scrollClientRectIntoView(self: *Element, relative_rect: ?DOMRect.Data, center: bool, frame: *Frame) !void {
+-    if (!self.isVisible(frame) or self.isViewportFixed(frame)) return;
+-    const owner = self.ownerFrame(frame) orelse return;
+-    var rect = self.boundingClientRectValuesForVisible(owner);
+     if (relative_rect) |relative| {
+         if (!std.math.isFinite(relative.x) or !std.math.isFinite(relative.y) or
+             !std.math.isFinite(relative.width) or !std.math.isFinite(relative.height) or
+             relative.width < 0 or relative.height < 0) return error.InvalidParams;
++    }
++    if (!self.isVisible(frame)) return;
++    const owner = self.ownerFrame(frame) orelse return;
++    var current: ?*Element = self;
++    while (current) |element| : (current = layoutParent(element)) {
++        if (element != self and !element.isRootContainer() and self.scrollsWithAncestor(element, owner)) {
++            const axes = owner._style_manager.overflowAxes(element);
++            if (axes.x or axes.y) {
++                // Scroll offsets are local layout pixels. Exclude this
++                // scroller's and outer transforms, keeping inner transforms.
++                const bounds = .{ .x = element.clientCoordinate(owner, .width, null), .y = element.clientCoordinate(owner, .height, null) };
++                const rect = self.scrollTargetRect(relative_rect, owner, element);
++                const left = if (axes.x) revealOffset(rect.x - bounds.x, rect.width, element.clientAxis(owner, .width), element.getScrollLeft(owner), center) else null;
++                const top = if (axes.y) revealOffset(rect.y - bounds.y, rect.height, element.clientAxis(owner, .height), element.getScrollTop(owner), center) else null;
++                _ = try element.writeScroll(.{ .to = .{ .left = left, .top = top } }, owner);
++            }
++        }
++        if (element.positionStyle(owner) == .fixed and element.positionedContainingBlock(owner, true) == null) return;
++    }
++    const viewport = owner.page.getViewport();
++    const rect = self.scrollTargetRect(relative_rect, owner, null);
++    const left = revealOffset(rect.x, rect.width, @floatFromInt(viewport.width), owner.window.getScrollX(), center);
++    const top = revealOffset(rect.y, rect.height, @floatFromInt(viewport.height), owner.window.getScrollY(), center);
++    try owner.window.scrollTo(.{ .opts = .{ .left = left, .top = top } }, null, owner);
++}
++
++fn scrollTargetRect(self: *Element, relative_rect: ?DOMRect.Data, frame: *Frame, stop: ?*Element) DOMRect.Data {
++    var rect = self.clientRectValuesUntil(frame, null, stop);
++    if (relative_rect) |relative| {
+         rect.x += relative.x;
+         rect.y += relative.y;
+         rect.width = relative.width;
+         rect.height = relative.height;
+     }
+-    const viewport = owner.page.getViewport();
+-    const width: f64 = @floatFromInt(viewport.width);
+-    const height: f64 = @floatFromInt(viewport.height);
+-    const left = if (rect.x < 0 or rect.x + rect.width > width)
+-        scrollOffset(@as(f64, @floatFromInt(owner.window.getScrollX())) + rect.x + if (center) (rect.width - width) / 2 else @as(f64, 0))
+-    else
+-        null;
+-    const top = if (rect.y < 0 or rect.y + rect.height > height)
+-        scrollOffset(@as(f64, @floatFromInt(owner.window.getScrollY())) + rect.y + if (center) (rect.height - height) / 2 else @as(f64, 0))
+-    else
+-        null;
+-    try owner.window.scrollTo(.{ .opts = .{ .left = left, .top = top } }, null, owner);
++    return rect;
++}
++
++fn revealOffset(start: f64, size: f64, available: f64, current: u32, center: bool) ?i32 {
++    if (start >= 0 and start + size <= available) return null;
++    const delta = if (center) start + (size - available) / 2 else start;
++    return scrollOffset(@as(f64, @floatFromInt(current)) + delta);
+ }
+ 
+ fn scrollOffset(value: f64) i32 {

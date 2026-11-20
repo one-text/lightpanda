@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Fri, 13 Nov 2026 00:20:21 -0300
+Subject: [PATCH] webapi: exclude CSS-hidden elements from pointer hit testing
+
+Sephora's hidden Medallia feedback spinner intercepted native mouse clicks
+on the search input controls. Exclude elements whose effective visibility
+is hidden or collapse, without changing their layout boxes or pruning
+visible descendants.
+
+Track visibility inheritance separately from its hidden value so explicit
+visible/initial descendants override hidden ancestors, while inherit/unset
+and cascade-reset inherited fallbacks remain hidden. Preserve transform
+propagation through hidden ancestors and opacity-zero hit behavior. Full
+revert-layer rollback remains outside the existing visibility cascade model.
+
+Update existing declaration-shape expectations; add no tests. Validation:
+scripts/build.sh; scripts/build.sh test (1658/1658); 15 temporary CDP
+visibility checks; live proxied Sephora native clear-button click succeeds
+with original Medallia styles unchanged. Modal/focus handling is unchanged.
+---
+ src/browser/StyleManager.zig    | 17 +++++++++++++----
+ src/browser/webapi/Document.zig |  2 ++
+ 2 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/src/browser/StyleManager.zig b/src/browser/StyleManager.zig
+index e8e3cb3..d333d06 100644
+--- a/src/browser/StyleManager.zig
++++ b/src/browser/StyleManager.zig
+@@ -664,7 +664,12 @@ pub fn hasAuthorDisplayNone(self: *StyleManager, el: *Element) bool {
+ pub fn hasVisibilityHiddenInherited(self: *StyleManager, el: *Element) bool {
+     self.assertOwns(el);
+     self.rebuildIfDirty() catch return false;
+-    return self.anyInChain(el, .visibility, .{});
++    var current: ?*Element = el;
++    while (current) |elem| : (current = elem.parentElement()) {
++        const p = self.visibilityProps(elem);
++        if (!p.visibility_inherits) return p.visibility_hidden;
++    }
++    return false;
+ }
+ 
+ pub fn hasPointerEventsNone(self: *StyleManager, el: *Element) bool {
+@@ -1298,6 +1303,7 @@ const Visibility = struct {
+ 
+         display: ?Display = null,
+         visibility_hidden: ?bool = null,
++        visibility_inherits: ?bool = null,
+         opacity_zero: ?bool = null,
+         pointer_events_none: ?bool = null,
+ 
+@@ -1306,6 +1312,8 @@ const Visibility = struct {
+                 self.display = Display.parse(value);
+             } else if (std.ascii.eqlIgnoreCase(name, "visibility")) {
+                 self.visibility_hidden = std.ascii.eqlIgnoreCase(value, "hidden") or std.ascii.eqlIgnoreCase(value, "collapse");
++                self.visibility_inherits = std.ascii.eqlIgnoreCase(value, "inherit") or std.ascii.eqlIgnoreCase(value, "unset") or
++                    std.ascii.eqlIgnoreCase(value, "revert") or std.ascii.eqlIgnoreCase(value, "revert-layer");
+             } else if (std.ascii.eqlIgnoreCase(name, "opacity")) {
+                 self.opacity_zero = std.ascii.eqlIgnoreCase(value, "0");
+             } else if (std.ascii.eqlIgnoreCase(name, "pointer-events")) {
+@@ -1314,12 +1322,13 @@ const Visibility = struct {
+         }
+     };
+ 
+-    const Computed = packed struct(u6) {
++    const Computed = packed struct(u7) {
+         // Author value (inline or sheet). Without `author_display` it's the UA
+         // fallback: .none when matchesUaDisplayNoneRule, else .other.
+         display: Display = .other,
+         author_display: bool = false,
+         visibility_hidden: bool = false,
++        visibility_inherits: bool = true,
+         opacity_zero: bool = false,
+         pointer_events_none: bool = false,
+ 
+@@ -2171,10 +2180,10 @@ test "StyleManager: inlineDeclared: scan matches the parsed style object" {
+         .{ .visibility = .{ .display = .none }, .text = .{ .display = .other } },
+         .{ .visibility = .{ .display = .none }, .text = .{ .display = .other } },
+         .{ .visibility = .{ .display = .other }, .text = .{ .display = .other } },
+-        .{ .visibility = .{ .display = .none, .visibility_hidden = true }, .text = .{ .display = .other } },
++        .{ .visibility = .{ .display = .none, .visibility_hidden = true, .visibility_inherits = false }, .text = .{ .display = .other } },
+         .{ .visibility = .{ .opacity_zero = true, .pointer_events_none = true } },
+         .{ .visibility = .{ .opacity_zero = false, .pointer_events_none = true } },
+-        .{ .visibility = .{ .visibility_hidden = true } },
++        .{ .visibility = .{ .visibility_hidden = true, .visibility_inherits = false } },
+         .{},
+         .{},
+         .{ .geometry = .{ .overflow_x_scrolls = true, .overflow_y_scrolls = true } },
+diff --git a/src/browser/webapi/Document.zig b/src/browser/webapi/Document.zig
+index a7a1bcd..7cc008a 100644
+--- a/src/browser/webapi/Document.zig
++++ b/src/browser/webapi/Document.zig
+@@ -1051,6 +1051,8 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame:
+             if (!hidden) {
+                 const transform = style_manager.transformStyle(element).transform;
+                 transformed = transformed or (transform.len > 0 and !std.ascii.eqlIgnoreCase(transform, "none"));
++            }
++            if (!hidden and !style_manager.hasVisibilityHiddenInherited(element)) {
+                 if (transformed) {
+                     if (element.transformedContains(x, y, ignore_x, frame, &flow_positions)) topmost = element;
+                 } else {

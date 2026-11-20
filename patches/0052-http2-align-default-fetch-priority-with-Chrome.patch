@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Sat, 31 Oct 2026 18:45:46 -0300
+Subject: [PATCH] http2: align default fetch priority with Chrome
+
+Select per-attempt weight 220 for non-internal fetches, retaining navigation 256 and other/internal 16. Extend curl/nghttp2 overlays to send Priority: u=1, i and exclusive dependency-zero weight-220 HEADERS. Preserve explicit Priority override/suppression, peer settings, navigation and HTTP/1.1 behavior. Scope is default fetch, not fetchPriority API or scheduler parity; TLS and Mac persona unchanged. Add no tests. Reference: fingerprint/README.md.
+---
+ src/network/HttpClient.zig   |  2 +-
+ src/network/http.zig         | 13 +++++++++----
+ tools/curl_http2_profile.zig | 21 ++++++++++++---------
+ 3 files changed, 22 insertions(+), 14 deletions(-)
+
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index b8a101d..fa115b2 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -3661,7 +3661,7 @@ pub const Transfer = struct {
+         try conn.setProxy(client.http_proxy);
+         try conn.setTlsVerify(client.tls_verify, client.use_proxy);
+         try conn.setHttpVersion(client.http_version);
+-        try conn.setNavigationPriority(!req.internal and req.request_mode == .navigate);
++        try conn.setRequestPriority(if (req.internal) .other else if (req.request_mode == .navigate) .navigation else if (req.resource_type == .fetch) .fetch else .other);
+ 
+         try conn.setURL(req.url);
+         try conn.setMethod(req.method);
+diff --git a/src/network/http.zig b/src/network/http.zig
+index d51da1e..6bdb650 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -567,10 +567,15 @@ pub const Connection = struct {
+         try libcurl.curl_easy_setopt(self._easy, .http_version, v);
+     }
+ 
+-    pub fn setNavigationPriority(self: *const Connection, navigation: bool) !void {
+-        // The curl HTTP/2 overlay uses weight 256 for navigation defaults.
+-        // Set both paths on every attempt so pooled handles cannot leak it.
+-        try libcurl.curl_easy_setopt(self._easy, .stream_weight, @as(u16, if (navigation) 256 else 16));
++    pub fn setRequestPriority(self: *const Connection, kind: enum { navigation, fetch, other }) !void {
++        // The HTTP/2 overlay uses these weights for browser-generated defaults.
++        // Set every path on every attempt so pooled handles cannot leak it.
++        const weight: u16 = switch (kind) {
++            .navigation => 256,
++            .fetch => 220,
++            .other => 16,
++        };
++        try libcurl.curl_easy_setopt(self._easy, .stream_weight, weight);
+     }
+ 
+     pub fn setFollowLocation(self: *const Connection, follow: bool) !void {
+diff --git a/tools/curl_http2_profile.zig b/tools/curl_http2_profile.zig
+index ffab2f3..29c1d49 100644
+--- a/tools/curl_http2_profile.zig
++++ b/tools/curl_http2_profile.zig
+@@ -90,20 +90,22 @@ const edits = [_]Edit{
+     .{
+         .before = "  nghttp2_priority_spec_init(pri_spec, 0, sweight_wanted(data), FALSE);",
+         .after =
+-        \\  /* Weight 256 is selected by Lightpanda for document navigations. */
++        \\  /* Lightpanda selects weights 256/220 for navigation/default fetch. */
+         \\  nghttp2_priority_spec_init(pri_spec, 0, sweight_wanted(data),
+-        \\                             data->set.weight == 256);
++        \\                             data->set.weight == 256 ||
++        \\                             data->set.weight == 220);
+         ,
+     },
+     .{
+         .before = "  nva = Curl_dynhds_to_nva(&h2_headers, &nheader);",
+         .after =
+-        \\  /* Generate the navigation default only after HTTP/2 is selected. A
+-        \\   * caller's Priority (including curl's empty suppression form) wins. */
+-        \\  if(data->set.weight == 256 &&
++        \\  /* Generate defaults only after HTTP/2 is selected. A caller's
++        \\   * Priority (including curl's empty suppression form) wins. */
++        \\  if((data->set.weight == 256 || data->set.weight == 220) &&
+         \\     (data->state.http_ignorecustom ||
+         \\      !Curl_checkheaders(data, STRCONST("Priority")))) {
+-        \\    result = Curl_dynhds_cadd(&h2_headers, "priority", "u=0, i");
++        \\    result = Curl_dynhds_cadd(&h2_headers, "priority",
++        \\                              data->set.weight == 256 ? "u=0, i" : "u=1, i");
+         \\    if(result)
+         \\      goto out;
+         \\  }
+@@ -134,8 +136,8 @@ const edits = [_]Edit{
+     },
+ };
+ 
+-// nghttp2 1.70 discards legacy request priority. Restore only the navigation
+-// HEADERS field through its existing encoder, not the removed priority scheduler.
++// nghttp2 1.70 discards legacy request priority. Restore navigation/default-fetch
++// HEADERS fields through its existing encoder, not the removed priority scheduler.
+ const nghttp2_edits = [_]Edit{
+     .{
+         .before =
+@@ -159,7 +161,8 @@ const nghttp2_edits = [_]Edit{
+         \\  if (!session->server &&
+         \\      session->remote_settings.no_rfc7540_priorities != 1 &&
+         \\      pri_spec && pri_spec->stream_id == 0 &&
+-        \\      pri_spec->weight == 256 && pri_spec->exclusive) {
++        \\      (pri_spec->weight == 256 || pri_spec->weight == 220) &&
++        \\      pri_spec->exclusive) {
+         \\    flags_copy |= NGHTTP2_FLAG_PRIORITY;
+         \\  } else {
+         \\    pri_spec = NULL;

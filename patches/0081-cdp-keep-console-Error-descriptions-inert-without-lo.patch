@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 9 Nov 2026 15:36:08 -0300
+Subject: [PATCH] cdp: keep console Error descriptions inert without losing
+ handles
+
+V8's default Error mirror reads the built-in stack getter even when remote
+object previews are disabled. This invokes Error.prepareStackTrace while
+serializing Runtime.consoleAPICalled in both page and worker scopes.
+
+Use the existing inspector client subtype/description callbacks only while
+wrapping the specific native Error console argument. Match the inspector
+client and original value and restore the thread-local scope afterward.
+Keep V8's original object handle, Error subtype and class name, then supply
+an inert description without touching .stack. Ordinary explicit Runtime
+inspection and JavaScript stack reads retain their existing behavior.
+Group console argument handles under console so normal object/group
+release and session teardown retain native inspector ownership semantics.
+
+Preserve safe own string Error names in inert formatting and ignore
+non-string messages, avoiding coercion and recursive/cyclic Error message
+traversal. Keep console methods, events and primitive handling unchanged.
+No JavaScript injection, V8 dependency changes or new upstream tests.
+
+Validation: Debug and ReleaseFast builds; all 1658 upstream tests passed.
+Temporary probes cover nine page console methods, six worker methods,
+Error subclasses and AggregateError, original-object identity, default and
+custom stack formatting, throwing hooks, frozen/accessor errors, cyclic
+messages, custom names, native console shape, explicit inspection, handle
+release and Runtime toggling. One reviewer pass found cyclic-message and
+custom-name issues; both were fixed and validated without a second pass.
+The unchanged passive benchmark improves from 123/130 to 125/130 (96.15%),
+fixing console-prepare-stack-trace and worker-console-prepare-stack-trace
+with no regressions and no collection/network-evidence errors.
+---
+ src/browser/js/Inspector.zig       | 32 +++++++++++++++++++++++++++++-
+ src/browser/js/Value.zig           | 24 +++++++++++++---------
+ src/browser/js/js.zig              |  7 +++++--
+ src/server/cdp/domains/runtime.zig |  9 +++------
+ 4 files changed, 54 insertions(+), 18 deletions(-)
+
+diff --git a/src/browser/js/Inspector.zig b/src/browser/js/Inspector.zig
+index 94d467e..f6f312e 100644
+--- a/src/browser/js/Inspector.zig
++++ b/src/browser/js/Inspector.zig
+@@ -1,7 +1,8 @@
+-// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
++// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -27,6 +28,18 @@ const Allocator = std.mem.Allocator;
+ const CONTEXT_GROUP_ID = 1;
+ const CLIENT_TRUST_LEVEL = 1;
+ 
++// V8's default Error mirror reads .stack even without a preview. Limit the
++// embedder description override to this synchronous console argument wrap.
++threadlocal var console_error: ?struct {
++    client: *v8.InspectorClientImpl,
++    value: *const v8.Value,
++} = null;
++
++pub fn isConsoleError(client: *v8.InspectorClientImpl, value: *const v8.Value) bool {
++    const current = console_error orelse return false;
++    return current.client == client and v8.v8__Value__StrictEquals(current.value, value);
++}
++
+ // Inspector exists for the lifetime of the Isolate/Env. 1 Isolate = 1 Inspector.
+ // It combines the v8.Inspector and the v8.InspectorClientImpl. The v8.InspectorClientImpl
+ // is our own implementation that fulfills the InspectorClient API, i.e. it's the
+@@ -293,6 +306,23 @@ pub const Session = struct {
+         );
+     }
+ 
++    pub fn getConsoleRemoteObject(self: *const Session, local: *const js.Local, value: js.Value) !RemoteObject {
++        if (!value.isNativeError()) return self.getRemoteObject(local, "console", value);
++
++        const previous = console_error;
++        console_error = .{ .client = self.inspector.client, .value = value.handle };
++        defer console_error = previous;
++
++        const remote_object = try self.getRemoteObject(local, "console", value);
++        errdefer remote_object.deinit();
++        const description = try std.fmt.allocPrint(local.call_arena, "{f}", .{value});
++        v8.v8_inspector__RemoteObject__setDescription(remote_object.handle, .{
++            .ptr = description.ptr,
++            .len = description.len,
++        });
++        return remote_object;
++    }
++
+     fn wrapObject(
+         self: Session,
+         isolate: *v8.Isolate,
+diff --git a/src/browser/js/Value.zig b/src/browser/js/Value.zig
+index e43f606..f3c25ae 100644
+--- a/src/browser/js/Value.zig
++++ b/src/browser/js/Value.zig
+@@ -1,7 +1,8 @@
+-// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
++// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -806,16 +807,21 @@ const Inert = struct {
+                 return self.writeString(source, writer);
+             }
+             if (v8.v8__Value__IsNativeError(handle)) {
+-                try self.writeString(v8.v8__Object__GetConstructorName(@ptrCast(handle)).?, writer);
+-                const message = self.ownDataProperty(@ptrCast(handle), "message") orelse return;
+-                if (v8.v8__Value__IsUndefined(message)) {
+-                    return;
+-                }
+-                if (v8.v8__Value__IsString(message) and v8.v8__String__Length(@ptrCast(message)) == 0) {
+-                    return;
++                var name = v8.v8__Object__GetConstructorName(@ptrCast(handle)).?;
++                if (self.ownDataProperty(@ptrCast(handle), "name")) |own_name| {
++                    if (v8.v8__Value__IsString(own_name) and v8.v8__String__Length(@ptrCast(own_name)) > 0 and
++                        !v8.v8__Value__StrictEquals(own_name, @ptrCast(local.isolate.initStringHandle("Error"))))
++                    {
++                        name = @ptrCast(own_name);
++                    }
+                 }
++                try self.writeString(name, writer);
++                const message = self.ownDataProperty(@ptrCast(handle), "message") orelse return;
++                // Like the inspector, describe only strings; coercing arbitrary
++                // messages can run JS or recurse through cyclic Error objects.
++                if (!v8.v8__Value__IsString(message) or v8.v8__String__Length(@ptrCast(message)) == 0) return;
+                 try writer.writeAll(": ");
+-                return self.write(message, writer);
++                return self.writeString(@ptrCast(message), writer);
+             }
+             if (v8.v8__Value__IsObject(handle)) {
+                 try writer.writeAll("[object ");
+diff --git a/src/browser/js/js.zig b/src/browser/js/js.zig
+index 3e4ac4b..b317cfc 100644
+--- a/src/browser/js/js.zig
++++ b/src/browser/js/js.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -473,9 +474,10 @@ pub const Undefined = struct {};
+ // it'll call this function to gets its [optional] subtype - which, from V8's
+ // point of view, is an arbitrary string.
+ pub export fn v8_inspector__Client__IMPL__valueSubtype(
+-    _: *v8.InspectorClientImpl,
++    client: *v8.InspectorClientImpl,
+     c_value: *const v8.Value,
+ ) callconv(.c) [*c]const u8 {
++    if (Inspector.isConsoleError(client, c_value)) return "error";
+     const external_entry = Inspector.getTaggedOpaque(c_value) orelse return null;
+     return if (external_entry.subtype) |st| @tagName(st) else null;
+ }
+@@ -485,11 +487,12 @@ pub export fn v8_inspector__Client__IMPL__valueSubtype(
+ // present, even if it's empty. So if we have a subType for the value, we'll
+ // put an empty description.
+ pub export fn v8_inspector__Client__IMPL__descriptionForValueSubtype(
+-    _: *v8.InspectorClientImpl,
++    client: *v8.InspectorClientImpl,
+     v8_context: *const v8.Context,
+     c_value: *const v8.Value,
+ ) callconv(.c) [*c]const u8 {
+     _ = v8_context;
++    if (Inspector.isConsoleError(client, c_value)) return "";
+ 
+     // We _must_ include a non-null description in order for the subtype value
+     // to be included. Besides that, I don't know if the value has any meaning
+diff --git a/src/server/cdp/domains/runtime.zig b/src/server/cdp/domains/runtime.zig
+index b5e1a1b..f9fbb60 100644
+--- a/src/server/cdp/domains/runtime.zig
++++ b/src/server/cdp/domains/runtime.zig
+@@ -1,7 +1,8 @@
+-// Copyright (C) 2023-2024  Lightpanda (Selecy SAS)
++// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -141,11 +142,7 @@ pub fn consoleMessage(arena: Allocator, bc: *CDP.BrowserContext, event: *const N
+ 
+     var args: std.ArrayList(RemoteObject) = .empty;
+     for (event.values) |value| {
+-        const remote_object = try inspector_session.getRemoteObject(
+-            &ls.local,
+-            "",
+-            value,
+-        );
++        const remote_object = try inspector_session.getConsoleRemoteObject(&ls.local, value);
+         defer remote_object.deinit();
+ 
+         const arg = try args.addOne(arena);

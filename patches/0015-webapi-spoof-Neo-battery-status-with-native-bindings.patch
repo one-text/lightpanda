@@ -1,0 +1,614 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 14 Oct 2026 11:11:12 -0300
+Subject: [PATCH] webapi: spoof Neo battery status with native bindings
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Expose the secure Window-only Battery Status API for the Chrome 155
+MacBook Neo persona. Report a plugged-in, fully charged laptop:
+charging=true, chargingTime=0, dischargingTime=Infinity, level=1.
+Do not query host power state or simulate battery changes.
+
+Use a native EventTarget-derived BatteryManager with read-only accessors
+and four EventHandler attributes. Keep its wrapper in the Navigator's
+creation realm. Cache the pending getBattery Promise on the Navigator
+wrapper before resolution can read a user-defined then getter; resolve
+without draining unrelated microtasks mid-call.
+
+Own event listeners on the BatteryManager so borrowed setters/methods
+and retained objects do not depend on a live originating Frame. Register
+stable native attribute listeners to preserve listener order across
+callback replacement, support cancellation and exception reporting, and
+retain non-callable objects per EventHandler conversion. Mark events as
+at-target while dispatching to reject same-event recursive dispatch, then
+clear transient dispatch/propagation state so events can be reused.
+
+Hide both the Navigator operation and global interface in insecure
+contexts. Save native entries while hidden and restore their descriptors
+if the reused popup context becomes secure after a redirect; release
+saved handles on context teardown. Worker API lists omit BatteryManager
+and the operation is Window-only.
+
+Update the existing Navigator getBattery case for the new contract,
+including reentrant identity, handler behavior and event dispatch state.
+Add no test cases. Attribute the new implementation to Brenno Flávio
+<contato@brennoflavio.com.br> while retaining the AGPL license block.
+
+References:
+https://github.com/chromium/chromium/blob/33b3fb5573761f547826bdff366260dc9b5e76d2/third_party/blink/renderer/modules/battery/battery_manager.idl
+https://github.com/chromium/chromium/blob/33b3fb5573761f547826bdff366260dc9b5e76d2/third_party/blink/renderer/modules/battery/navigator_battery.idl
+https://github.com/chromium/chromium/blob/33b3fb5573761f547826bdff366260dc9b5e76d2/third_party/blink/renderer/modules/battery/battery_manager.cc
+---
+ src/browser/js/Context.zig                 |  19 ++-
+ src/browser/js/Env.zig                     |  39 ++++-
+ src/browser/js/PromiseResolver.zig         |  10 +-
+ src/browser/js/bridge.zig                  |   2 +
+ src/browser/tests/navigator/navigator.html |  65 +++++++-
+ src/browser/webapi/BatteryManager.zig      | 166 +++++++++++++++++++++
+ src/browser/webapi/EventTarget.zig         |  20 +++
+ src/browser/webapi/Navigator.zig           |  17 +++
+ 8 files changed, 327 insertions(+), 11 deletions(-)
+ create mode 100644 src/browser/webapi/BatteryManager.zig
+
+diff --git a/src/browser/js/Context.zig b/src/browser/js/Context.zig
+index c508233..eef8eeb 100644
+--- a/src/browser/js/Context.zig
++++ b/src/browser/js/Context.zig
+@@ -63,6 +63,9 @@ handle: v8.Global,
+ // Captured before page scripts can replace Object.freeze.
+ object_freeze: v8.Global,
+ 
++// Native entries saved only while [SecureContext] battery APIs are hidden.
++battery_bindings: ?struct { method: v8.Global, interface: v8.Global } = null,
++
+ cpu_profiler: ?*v8.CpuProfiler = null,
+ 
+ heap_profiler: ?*v8.HeapProfiler = null,
+@@ -229,6 +232,10 @@ pub fn deinit(self: *Context) void {
+     // pointer null, v8 drops the job instead.
+     v8.v8__Context__DetachGlobal(entered.handle);
+ 
++    if (self.battery_bindings) |*bindings| {
++        v8.v8__Global__Reset(&bindings.method);
++        v8.v8__Global__Reset(&bindings.interface);
++    }
+     v8.v8__Global__Reset(&self.object_freeze);
+     v8.v8__Global__Reset(&self.handle);
+     env.isolate.notifyContextDisposed();
+@@ -258,10 +265,14 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
+         const token_local = v8.v8__Global__Get(&origin.security_token, isolate.handle);
+         v8.v8__Context__SetSecurityToken(ls.local.handle, token_local);
+ 
+-        // navigator.serviceWorker is [SecureContext]. With the feature
+-        // disabled, Env.createContext has already removed it.
+-        if (self.global == .frame and self.page.session.experimental_features.serviceworker and self.execution.isSecureContext() == false) {
+-            env.hideServiceWorker(true, ls.local.handle, v8.v8__Context__Global(ls.local.handle).?);
++        if (self.global == .frame) {
++            const global_obj = v8.v8__Context__Global(ls.local.handle).?;
++            const secure = self.execution.isSecureContext();
++            env.setBatteryExposure(self, ls.local.handle, global_obj, secure);
++            // With the feature disabled, Env.createContext already hid this API.
++            if (!secure and self.page.session.experimental_features.serviceworker) {
++                env.hideServiceWorker(true, ls.local.handle, global_obj);
++            }
+         }
+     }
+ }
+diff --git a/src/browser/js/Env.zig b/src/browser/js/Env.zig
+index 3afb6f1..bd06a29 100644
+--- a/src/browser/js/Env.zig
++++ b/src/browser/js/Env.zig
+@@ -98,7 +98,7 @@ inspector: ?*Inspector,
+ // which an be created once per isolate.
+ private_symbols: PrivateSymbols,
+ 
+-// Interned names for `hideServiceWorker`.
++// Interned names for secure-context and disabled API exposure.
+ disabled_api_names: DisabledApiNames,
+ 
+ microtask_queues_are_running: bool,
+@@ -467,6 +467,36 @@ pub fn hideServiceWorker(self: *const Env, comptime is_frame: bool, v8_context:
+     }
+ }
+ 
++pub fn setBatteryExposure(self: *const Env, ctx: *Context, v8_context: *const v8.Context, global_obj: *const v8.Object, secure: bool) void {
++    if (secure and ctx.battery_bindings == null) return;
++    if (!secure and ctx.battery_bindings != null) return;
++
++    const isolate = self.isolate.handle;
++    const names = &self.disabled_api_names;
++    const constructor = v8.v8__Object__Get(global_obj, v8_context, @ptrCast(names.get(isolate, "navigator"))) orelse return;
++    const prototype = v8.v8__Object__Get(@ptrCast(constructor), v8_context, @ptrCast(names.get(isolate, "prototype"))) orelse return;
++    const method_key = names.get(isolate, "get_battery");
++    const interface_key = names.get(isolate, "battery_manager");
++    var result: v8.MaybeBool = undefined;
++
++    if (secure) {
++        const bindings = &ctx.battery_bindings.?;
++        v8.v8__Object__DefineOwnProperty(@ptrCast(prototype), v8_context, @ptrCast(method_key), v8.v8__Global__Get(&bindings.method, isolate), v8.None, &result);
++        v8.v8__Object__DefineOwnProperty(global_obj, v8_context, @ptrCast(interface_key), v8.v8__Global__Get(&bindings.interface, isolate), v8.DontEnum, &result);
++        v8.v8__Global__Reset(&bindings.method);
++        v8.v8__Global__Reset(&bindings.interface);
++        ctx.battery_bindings = null;
++    } else {
++        const method = v8.v8__Object__Get(@ptrCast(prototype), v8_context, @ptrCast(method_key)) orelse return;
++        const interface = v8.v8__Object__Get(global_obj, v8_context, @ptrCast(interface_key)) orelse return;
++        ctx.battery_bindings = .{ .method = undefined, .interface = undefined };
++        v8.v8__Global__New(isolate, method, &ctx.battery_bindings.?.method);
++        v8.v8__Global__New(isolate, interface, &ctx.battery_bindings.?.interface);
++        v8.v8__Object__Delete(@ptrCast(prototype), v8_context, @ptrCast(method_key), &result);
++        v8.v8__Object__Delete(global_obj, v8_context, @ptrCast(interface_key), &result);
++    }
++}
++
+ fn deletePrototypeMember(self: *const Env, v8_context: *const v8.Context, global_obj: *const v8.Object, comptime interface: []const u8, comptime member: []const u8) void {
+     const isolate = self.isolate.handle;
+     const names = &self.disabled_api_names;
+@@ -875,6 +905,8 @@ const DisabledApiNames = struct {
+     prototype: v8.Eternal,
+     service_worker: v8.Eternal,
+     caches: v8.Eternal,
++    get_battery: v8.Eternal,
++    battery_manager: v8.Eternal,
+ 
+     fn init(isolate: *v8.Isolate) DisabledApiNames {
+         var self: DisabledApiNames = undefined;
+@@ -884,6 +916,8 @@ const DisabledApiNames = struct {
+         intern(isolate, &self.prototype, "prototype");
+         intern(isolate, &self.service_worker, "serviceWorker");
+         intern(isolate, &self.caches, "caches");
++        intern(isolate, &self.get_battery, "getBattery");
++        intern(isolate, &self.battery_manager, "BatteryManager");
+         return self;
+     }
+ 
+@@ -902,15 +936,18 @@ const PrivateSymbols = struct {
+     const Private = @import("Private.zig");
+ 
+     child_nodes: Private,
++    get_battery: Private,
+ 
+     fn init(isolate: *v8.Isolate) PrivateSymbols {
+         return .{
+             .child_nodes = Private.init(isolate, "child_nodes"),
++            .get_battery = Private.init(isolate, "get_battery"),
+         };
+     }
+ 
+     fn deinit(self: *PrivateSymbols) void {
+         self.child_nodes.deinit();
++        self.get_battery.deinit();
+     }
+ };
+ 
+diff --git a/src/browser/js/PromiseResolver.zig b/src/browser/js/PromiseResolver.zig
+index d6e9fe5..e0966c4 100644
+--- a/src/browser/js/PromiseResolver.zig
++++ b/src/browser/js/PromiseResolver.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -54,12 +55,17 @@ fn _resolve(self: PromiseResolver, value: anytype) !void {
+     const local = self.local;
+     const js_val = try local.zigValueToJs(value, .{});
+ 
++    try self.resolveValue(js_val);
++    local.runMicrotasks();
++}
++
++/// Resolve while a script is still on the stack without draining microtasks.
++pub fn resolveValue(self: PromiseResolver, value: js.Value) !void {
+     var out: v8.MaybeBool = undefined;
+-    v8.v8__Promise__Resolver__Resolve(self.handle, self.local.handle, js_val.handle, &out);
++    v8.v8__Promise__Resolver__Resolve(self.handle, self.local.handle, value.handle, &out);
+     if (!out.has_value or !out.value) {
+         return error.FailedToResolvePromise;
+     }
+-    local.runMicrotasks();
+ }
+ 
+ pub fn reject(self: PromiseResolver, comptime source: []const u8, value: anytype) void {
+diff --git a/src/browser/js/bridge.zig b/src/browser/js/bridge.zig
+index 17c3345..5fc2053 100644
+--- a/src/browser/js/bridge.zig
++++ b/src/browser/js/bridge.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -1028,6 +1029,7 @@ pub const SubType = enum {
+ 
+ // APIs for Page/Window contexts. Used by Snapshot.zig for Page snapshot creation.
+ pub const PageJsApis = flattenTypes(&.{
++    @import("../webapi/BatteryManager.zig"),
+     @import("../webapi/AbortController.zig"),
+     @import("../webapi/AbortSignal.zig"),
+     @import("../webapi/Scheduler.zig"),
+diff --git a/src/browser/tests/navigator/navigator.html b/src/browser/tests/navigator/navigator.html
+index f5daee5..a815a99 100644
+--- a/src/browser/tests/navigator/navigator.html
++++ b/src/browser/tests/navigator/navigator.html
+@@ -163,10 +163,67 @@
+ </script>
+ 
+ <script id=getBattery type=module>
+-  // Like Firefox, we don't expose navigator.getBattery. Sites already
+-  // have to handle it being undefined, so this is a real-browser shape
+-  // rather than a stub that always rejects.
+-  testing.expectEqual('undefined', typeof navigator.getBattery);
++  testing.expectEqual('function', typeof navigator.getBattery);
++  const state = await testing.async();
++  let reentrant;
++  Object.defineProperty(BatteryManager.prototype, "then", {
++    configurable: true,
++    get() { reentrant = navigator.getBattery(); }
++  });
++  let checkpoint = false;
++  Promise.resolve().then(() => { checkpoint = true; });
++  const promise = navigator.getBattery();
++  testing.expectFalse(checkpoint);
++  delete BatteryManager.prototype.then;
++  testing.expectEqual(promise, reentrant);
++  testing.expectEqual(promise, navigator.getBattery());
++  state.resolve(await promise);
++  await state.done((battery) => {
++    testing.expectTrue(battery instanceof BatteryManager);
++    testing.expectTrue(battery instanceof EventTarget);
++    testing.expectEqual(true, battery.charging);
++    testing.expectEqual(0, battery.chargingTime);
++    testing.expectEqual(Infinity, battery.dischargingTime);
++    testing.expectEqual(1, battery.level);
++    const order = [];
++    const listener = () => order.push("listener");
++    battery.addEventListener("levelchange", listener);
++    battery.onlevelchange = () => order.push("old");
++    battery.onlevelchange = function(event) {
++      testing.expectEqual(battery, this);
++      testing.expectEqual(battery, event.target);
++      order.push("handler");
++      return false;
++    };
++    testing.expectFalse(battery.dispatchEvent(new Event("levelchange", {cancelable: true})));
++    testing.expectEqual(["listener", "handler"], order);
++    battery.onlevelchange = null;
++    order.length = 0;
++    testing.expectTrue(battery.dispatchEvent(new Event("levelchange")));
++    testing.expectEqual(["listener"], order);
++    battery.removeEventListener("levelchange", listener);
++    const event = new Event("levelchange");
++    let nestedError;
++    battery.onlevelchange = (active) => {
++      testing.expectEqual(Event.AT_TARGET, active.eventPhase);
++      try {
++        battery.dispatchEvent(active);
++      } catch (error) {
++        nestedError = error.name;
++      }
++      active.stopImmediatePropagation();
++    };
++    battery.dispatchEvent(event);
++    testing.expectEqual("InvalidStateError", nestedError);
++    testing.expectEqual(Event.NONE, event.eventPhase);
++    testing.expectEqual(null, event.currentTarget);
++    testing.expectFalse(event.cancelBubble);
++    let reused = false;
++    battery.onlevelchange = () => { reused = true; };
++    battery.dispatchEvent(event);
++    testing.expectTrue(reused);
++    battery.onlevelchange = null;
++  });
+ </script>
+ 
+ 
+diff --git a/src/browser/webapi/BatteryManager.zig b/src/browser/webapi/BatteryManager.zig
+new file mode 100644
+index 0000000..40f78d4
+--- /dev/null
++++ b/src/browser/webapi/BatteryManager.zig
+@@ -0,0 +1,166 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++const std = @import("std");
++const js = @import("../js/js.zig");
++const Frame = @import("../Frame.zig");
++const Navigator = @import("Navigator.zig");
++const Event = @import("Event.zig");
++const EventTarget = @import("EventTarget.zig");
++const EventManagerBase = @import("../EventManagerBase.zig");
++
++const BatteryManager = @This();
++
++pub const Proto = EventTarget;
++
++_proto: *EventTarget,
++_navigator: *Navigator,
++_events: EventManagerBase,
++_handlers: [4]Handler = undefined,
++
++pub fn init(frame: *Frame, navigator: *Navigator) !*BatteryManager {
++    const self = try frame._factory.eventTarget(BatteryManager{
++        ._proto = undefined,
++        ._navigator = navigator,
++        ._events = EventManagerBase.init(frame.arena),
++    });
++    inline for (std.meta.tags(Kind), 0..) |kind, i| {
++        self._handlers[i] = .{ .battery = self, .kind = kind };
++    }
++    return self;
++}
++
++pub fn asEventTarget(self: *BatteryManager) *EventTarget {
++    return self._proto;
++}
++
++pub fn dispatch(self: *BatteryManager, event: *Event, exec: *js.Execution) !void {
++    event._target = self.asEventTarget();
++    event._dispatch_target = self.asEventTarget();
++    event._event_phase = .at_target;
++    defer {
++        event._event_phase = .none;
++        event._current_target = null;
++        event._dispatch_target = null;
++        event._stop_propagation = false;
++        event._stop_immediate_propagation = false;
++        event._in_passive_listener = false;
++    }
++    if (event._stop_propagation) return;
++    try self._events.dispatchDirect(exec.page.frame_arena, exec.js, self.asEventTarget(), event, null, exec.page, .{ .run_microtasks = false });
++}
++
++pub fn creationContext(self: *const BatteryManager, local: *const js.Local) *const js.v8.Context {
++    return self._navigator.creationContext(local);
++}
++
++// A plugged-in, fully charged MacBook Neo; never consult the host battery.
++fn getCharging(_: *const BatteryManager) bool {
++    return true;
++}
++
++fn getChargingTime(_: *const BatteryManager) f64 {
++    return 0;
++}
++
++fn getDischargingTime(_: *const BatteryManager) f64 {
++    return std.math.inf(f64);
++}
++
++fn getLevel(_: *const BatteryManager) f64 {
++    return 1;
++}
++
++const Kind = enum { chargingchange, chargingtimechange, dischargingtimechange, levelchange };
++
++// Register a stable native listener when the attribute first becomes non-null.
++// Replacing its callback keeps its position among addEventListener listeners.
++const Handler = struct {
++    battery: *BatteryManager,
++    kind: Kind,
++    callback: ?js.Object.Global = null,
++    listener: ?js.Function.Global = null,
++
++    fn set(self: *Handler, value: js.Value, exec: *js.Execution) !void {
++        const local = exec.js.local.?;
++        const callback = if (value.isObject())
++            try (js.Object{ .local = local, .handle = @ptrCast(value.handle) }).persist()
++        else
++            null;
++        errdefer if (callback) |cb| cb.release();
++
++        if (self.callback == null and callback != null) {
++            if (self.listener == null) {
++                self.listener = try local.newCallback(Handler.dispatch, self).persist();
++            }
++            _ = try self.battery._events.register(self.battery.asEventTarget(), @tagName(self.kind), .{
++                .function = self.listener.?.local(local),
++            }, .{});
++        } else if (self.callback != null and callback == null) {
++            self.battery._events.remove(self.battery.asEventTarget(), @tagName(self.kind), .{
++                .function = self.listener.?.local(local),
++            }, false);
++        }
++
++        if (self.callback) |old| old.release();
++        self.callback = callback;
++    }
++
++    fn dispatch(self: *Handler, event: *Event, exec: *js.Execution) !void {
++        const callback = self.callback orelse return;
++        const local = exec.js.local.?;
++        const object = callback.local(local);
++        if (!object.toValue().isFunction()) return local.typeError("The event handler is not callable");
++        const function = js.Function{ .local = local, .handle = @ptrCast(object.handle) };
++        const result = try function.callWithThisRethrow(js.Value, self.battery, .{event});
++        if (result.isBoolean() and result.isFalse()) {
++            event.preventDefault();
++        }
++    }
++};
++
++fn Binding(comptime kind: Kind) type {
++    return struct {
++        fn get(self: *const BatteryManager) ?js.Object.Global {
++            return self._handlers[@intFromEnum(kind)].callback;
++        }
++
++        fn set(self: *BatteryManager, value: js.Value, exec: *js.Execution) !void {
++            try self._handlers[@intFromEnum(kind)].set(value, exec);
++        }
++    };
++}
++
++pub const JsApi = struct {
++    pub const bridge = js.Bridge(BatteryManager);
++
++    pub const Meta = struct {
++        pub const name = "BatteryManager";
++        pub const creation_context = BatteryManager.creationContext;
++        pub const prototype_chain = bridge.prototypeChain();
++        pub var class_id: bridge.ClassId = undefined;
++    };
++
++    pub const charging = bridge.accessor(getCharging, null, .{});
++    pub const chargingTime = bridge.accessor(getChargingTime, null, .{});
++    pub const dischargingTime = bridge.accessor(getDischargingTime, null, .{});
++    pub const level = bridge.accessor(getLevel, null, .{});
++    pub const onchargingchange = bridge.accessor(Binding(.chargingchange).get, Binding(.chargingchange).set, .{});
++    pub const onchargingtimechange = bridge.accessor(Binding(.chargingtimechange).get, Binding(.chargingtimechange).set, .{});
++    pub const ondischargingtimechange = bridge.accessor(Binding(.dischargingtimechange).get, Binding(.dischargingtimechange).set, .{});
++    pub const onlevelchange = bridge.accessor(Binding(.levelchange).get, Binding(.levelchange).set, .{});
++};
+diff --git a/src/browser/webapi/EventTarget.zig b/src/browser/webapi/EventTarget.zig
+index 905b655..0ee670c 100644
+--- a/src/browser/webapi/EventTarget.zig
++++ b/src/browser/webapi/EventTarget.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -60,6 +61,8 @@ const XMLHttpRequestEventTarget = @import("net/XMLHttpRequestEventTarget.zig");
+ 
+ const RegisterOptions = EventManager.RegisterOptions;
+ 
++const BatteryManager = @import("BatteryManager.zig");
++
+ const EventTarget = @This();
+ 
+ pub const _prototype_root = true;
+@@ -72,6 +75,7 @@ _type: Type align(8),
+ 
+ pub const Type = enum(u8) {
+     abort_signal,
++    battery_manager,
+     broadcast_channel,
+     cookie_store,
+     event_source,
+@@ -108,6 +112,7 @@ pub const Type = enum(u8) {
+ pub fn Subtype(comptime tag: Type) type {
+     return switch (tag) {
+         .abort_signal => AbortSignal,
++        .battery_manager => BatteryManager,
+         .broadcast_channel => BroadcastChannel,
+         .cookie_store => CookieStore,
+         .event_source => EventSource,
+@@ -185,6 +190,11 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
+     }
+     event._is_trusted = false;
+ 
++    if (self._type == .battery_manager) {
++        try self.subtype(BatteryManager).dispatch(event, exec);
++        return !event._cancelable or !event._prevent_default;
++    }
++
+     switch (exec.js.global) {
+         .frame => |frame| {
+             event.acquireRef();
+@@ -278,6 +288,10 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nulla
+         .function => |func| .{ .function = func },
+     };
+ 
++    if (self._type == .battery_manager) {
++        _ = try self.subtype(BatteryManager)._events.register(self, typ, em_callback, options);
++        return;
++    }
+     return exec.registerListener(self, typ, em_callback, options);
+ }
+ 
+@@ -312,6 +326,10 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
+         };
+     };
+ 
++    if (self._type == .battery_manager) {
++        self.subtype(BatteryManager)._events.remove(self, typ, em_callback, use_capture);
++        return;
++    }
+     exec.removeListener(self, typ, em_callback, use_capture);
+ }
+ 
+@@ -328,6 +346,7 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+         .worker_global_scope => writer.writeAll("<WorkerGlobalScope>"),
+         .xhr => writer.writeAll("<XMLHttpRequestEventTarget>"),
+         .abort_signal => writer.writeAll("<AbortSignal>"),
++        .battery_manager => writer.writeAll("<BatteryManager>"),
+         .media_query_list => writer.writeAll("<MediaQueryList>"),
+         .message_port => writer.writeAll("<MessagePort>"),
+         .broadcast_channel => writer.writeAll("<BroadcastChannel>"),
+@@ -352,6 +371,7 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
+ pub fn toString(self: *EventTarget) []const u8 {
+     return switch (self._type) {
+         .abort_signal => return "[object AbortSignal]",
++        .battery_manager => return "[object BatteryManager]",
+         .broadcast_channel => return "[object BroadcastChannel]",
+         .cookie_store => return "[object CookieStore]",
+         .event_source => return "[object EventSource]",
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index 8639552..85ba7a2 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -32,6 +32,7 @@ const StorageManager = @import("StorageManager.zig");
+ const NavigatorUAData = @import("NavigatorUAData.zig");
+ const Geolocation = @import("geolocation/Geolocation.zig");
+ const ServiceWorkerContainer = @import("ServiceWorkerContainer.zig");
++const BatteryManager = @import("BatteryManager.zig");
+ 
+ const Navigator = @This();
+ 
+@@ -220,6 +221,21 @@ fn getServiceWorker(self: *Navigator, frame: *Frame) !*ServiceWorkerContainer {
+     return sw;
+ }
+ 
++fn getBattery(self: *Navigator, exec: *Execution) !js.Promise {
++    const local = exec.js.local.?;
++    const battery = try BatteryManager.init(self._frame.?, self);
++    const wrapper = try local.mapZigInstanceToJs(null, self);
++    const resolver = local.createPromiseResolver();
++    const promise = resolver.promise();
++    const key = js.v8.v8__Global__Get(&local.ctx.env.private_symbols.get_battery.handle, local.isolate.handle).?;
++    var saved: js.v8.MaybeBool = undefined;
++    // Resolving reads battery.then synchronously, which can reenter getBattery.
++    js.v8.v8__Object__SetPrivate(wrapper.handle, local.handle, @ptrCast(key), @ptrCast(promise.handle), &saved);
++    if (!saved.has_value or !saved.value) return error.OutOfMemory;
++    try resolver.resolveValue(try local.zigValueToJs(battery, .{}));
++    return promise;
++}
++
+ fn getUserAgentData(self: *Navigator) *NavigatorUAData {
+     return &self._ua_data;
+ }
+@@ -326,6 +342,7 @@ pub const JsApi = struct {
+     pub const doNotTrack = bridge.accessor(Navigator.getDoNotTrack, null, .{});
+     pub const globalPrivacyControl = bridge.accessor(Navigator.getGlobalPrivacyControl, null, .{});
+ 
++    pub const getBattery = bridge.function(Navigator.getBattery, .{ .exposed = .window, .cache = .{ .private = "get_battery" } });
+     pub const javaEnabled = bridge.function(Navigator.javaEnabled, .{});
+     pub const sendBeacon = bridge.function(Navigator.sendBeacon, .{});
+     pub const permissions = bridge.accessor(Navigator.getPermissions, null, .{});

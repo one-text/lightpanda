@@ -1,0 +1,1062 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Mon, 19 Oct 2026 10:29:15 -0300
+Subject: [PATCH] webapi: synthesize canvas output from lightweight draw
+ records
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Record clipped solid rectangles, clears, synthetic text glyphs and visible
+putImageData snapshots instead of allocating a persistent canvas bitmap.
+Share native paint/readback behavior between regular and offscreen 2D
+contexts. Reuse the existing Mac font advance model for text placement;
+small deterministic 5x7 masks do not claim CoreText rasterization fidelity.
+
+Generate dimension-correct RGBA PNGs on demand with the standard-library
+fastest DEFLATE encoder, CRCs, and a 4 KiB output tile. Pixel reads replay
+only intersecting spans and agree with the generated image. No graphics,
+font, image codec or GPU dependency is added. Retained memory follows draw
+records and explicit visible pixel uploads, not canvas width times height.
+Discard fully covered records on opaque replacements, clears and uploads,
+recycling obsolete pixel snapshots and retaining command capacity for reuse.
+
+Keep source-over alpha, supported style save/restore, text alignment and
+baseline, maxWidth, dirty pixel uploads, and negative readback dimensions
+coherent within this bounded model. Resize—including same-value attribute
+assignments—resets supported state and content. Match internal dimensions
+to reflected HTML integer parsing. Preserve explicit-null numeric coercion.
+Snapshot Blob bytes at invocation while retaining asynchronous delivery and
+cancellation cleanup. Keep the existing zero-size and PNG fallback behavior.
+
+Leave paths, transforms, gradients, shadows, image decoding, JPEG/WebP
+encoding and exact Mac typography outside the patch. Non-overwritten draw
+history can still grow; this is a display-list mock, not a general renderer.
+
+Update existing canvas assertions tied to the fixed 1x1 PNG and negative
+readback rejection; add no tests or benchmark predicate changes. Temporary
+validation covers 93 checks including decoded PNG CRCs/dimensions/pixels,
+Blob equality and snapshots, native shape, regular/offscreen/worker/iframe
+and isolated-world parity, resets, integer/coercion regressions, navigation,
+and partial-update memory reuse. Upstream tests pass (1658/1658).
+---
+ .../canvas/canvas_rendering_context_2d.html   |   6 +-
+ .../tests/canvas/canvas_serialization.html    |  15 +-
+ .../tests/canvas/offscreen_canvas.html        |   8 +-
+ .../canvas/CanvasRenderingContext2D.zig       |  50 ++--
+ src/browser/webapi/canvas/OffscreenCanvas.zig |  40 +--
+ .../OffscreenCanvasRenderingContext2D.zig     |  50 ++--
+ src/browser/webapi/canvas/Recording.zig       | 233 ++++++++++++++++++
+ src/browser/webapi/canvas/context2d.zig       | 129 ++++++++++
+ src/browser/webapi/element/html/Canvas.zig    |  91 ++++---
+ 9 files changed, 491 insertions(+), 131 deletions(-)
+ create mode 100644 src/browser/webapi/canvas/Recording.zig
+
+diff --git a/src/browser/tests/canvas/canvas_rendering_context_2d.html b/src/browser/tests/canvas/canvas_rendering_context_2d.html
+index 00d5ba9..5119045 100644
+--- a/src/browser/tests/canvas/canvas_rendering_context_2d.html
++++ b/src/browser/tests/canvas/canvas_rendering_context_2d.html
+@@ -117,11 +117,11 @@
+   const element = document.createElement("canvas");
+   const ctx = element.getContext("2d");
+ 
+-  // Zero or negative width/height should throw IndexSizeError.
++  // Zero dimensions throw; negative dimensions read in the opposite direction.
+   testing.expectError('Index or size', () => ctx.getImageData(0, 0, 0, 10));
+   testing.expectError('Index or size', () => ctx.getImageData(0, 0, 10, 0));
+-  testing.expectError('Index or size', () => ctx.getImageData(0, 0, -5, 10));
+-  testing.expectError('Index or size', () => ctx.getImageData(0, 0, 10, -5));
++  testing.expectEqual(5, ctx.getImageData(0, 0, -5, 10).width);
++  testing.expectEqual(5, ctx.getImageData(0, 0, 10, -5).height);
+ }
+ </script>
+ 
+diff --git a/src/browser/tests/canvas/canvas_serialization.html b/src/browser/tests/canvas/canvas_serialization.html
+index 37972f3..82249fb 100644
+--- a/src/browser/tests/canvas/canvas_serialization.html
++++ b/src/browser/tests/canvas/canvas_serialization.html
+@@ -1,4 +1,5 @@
+ <!DOCTYPE html>
++<!-- Brenno Flávio <contato@brennoflavio.com.br> -->
+ <head>
+   <script src="../testing.js"></script>
+ </head>
+@@ -8,10 +9,7 @@
+ </body>
+ 
+ <!--
+-  There is no rasterizer: every 2D draw call is a no-op, so a canvas is always
+-  blank and serializes to a fixed 1x1 transparent PNG. A real browser would
+-  size the image to the canvas, but nothing here can observe image dimensions
+-  (Image.naturalWidth is always 0).
++  The lightweight display list synthesizes a dimension-correct PNG on demand.
+ -->
+ 
+ <script id=toDataURL_basic>
+@@ -32,15 +30,14 @@
+ }
+ </script>
+ 
+-<script id=toDataURL_is_size_independent>
++<script id=toDataURL_depends_on_size>
+ {
+-  // Deliberate: with no rasterizer every canvas is blank, so they all
+-  // serialize to the same 1x1 transparent PNG regardless of dimensions.
++  // PNG dimensions follow the canvas even when it has not been drawn on.
+   const a = document.createElement('canvas');
+   a.width = 10; a.height = 10;
+   const b = document.createElement('canvas');
+   b.width = 20; b.height = 20;
+-  testing.expectEqual(a.toDataURL(), b.toDataURL());
++  testing.expectEqual(false, a.toDataURL() === b.toDataURL());
+ }
+ </script>
+ 
+@@ -84,7 +81,7 @@
+     // A thrown TypeError in here is only logged, so guard before dereferencing.
+     testing.expectEqual(true, blob instanceof Blob);
+     testing.expectEqual('image/png', blob.type);
+-    testing.expectEqual(67, blob.size);
++    testing.expectEqual(atob(canvas.toDataURL().split(',')[1]).length, blob.size);
+   });
+ }
+ </script>
+diff --git a/src/browser/tests/canvas/offscreen_canvas.html b/src/browser/tests/canvas/offscreen_canvas.html
+index c0264e5..49bdc51 100644
+--- a/src/browser/tests/canvas/offscreen_canvas.html
++++ b/src/browser/tests/canvas/offscreen_canvas.html
+@@ -49,11 +49,11 @@
+   const canvas = new OffscreenCanvas(64, 64);
+   const promise = canvas.convertToBlob();
+   testing.expectEqual(true, promise instanceof Promise);
+-  // The same blank PNG as HTMLCanvasElement.toBlob.
++  // A dimension-correct synthetic PNG, as with HTMLCanvasElement.toBlob.
+   promise.then(blob => {
+     testing.expectEqual(true, blob instanceof Blob);
+     testing.expectEqual('image/png', blob.type);
+-    testing.expectEqual(67, blob.size);
++    testing.expectEqual(true, blob.size > 67);
+   });
+ }
+ </script>
+@@ -97,9 +97,9 @@
+   testing.expectEqual(imageData.data[2], 0);
+   testing.expectEqual(imageData.data[3], 0);
+ 
+-  // Zero or negative dimensions should throw.
++  // Zero dimensions throw; negative dimensions read in the opposite direction.
+   testing.expectError('Index or size', () => ctx.getImageData(0, 0, 0, 10));
+-  testing.expectError('Index or size', () => ctx.getImageData(0, 0, 10, -5));
++  testing.expectEqual(5, ctx.getImageData(0, 0, 10, -5).height);
+ }
+ </script>
+ 
+diff --git a/src/browser/webapi/canvas/CanvasRenderingContext2D.zig b/src/browser/webapi/canvas/CanvasRenderingContext2D.zig
+index 3cb58d5..e3f5967 100644
+--- a/src/browser/webapi/canvas/CanvasRenderingContext2D.zig
++++ b/src/browser/webapi/canvas/CanvasRenderingContext2D.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -37,6 +38,11 @@ const CanvasRenderingContext2D = @This();
+ /// https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/canvas
+ _canvas: *Canvas,
+ _state: context2d.State = .{},
++_recording: context2d.Recording = .{},
++_saved: std.ArrayList(context2d.State) = .empty,
++
++const painting = context2d.Painting(CanvasRenderingContext2D);
++pub const reset = painting.reset;
+ 
+ fn getCanvas(self: *const CanvasRenderingContext2D) *Canvas {
+     return self._canvas;
+@@ -83,25 +89,13 @@ fn createImageData(
+     }
+ }
+ 
+-fn putImageData(_: *const CanvasRenderingContext2D, _: *ImageData, _: f64, _: f64, _: ?f64, _: ?f64, _: ?f64, _: ?f64) void {}
++const putImageData = painting.putImageData;
+ 
+ // CanvasImageSource (HTMLImageElement, HTMLCanvasElement, ImageBitmap, ...) is
+ // just taken as a js.Value for now since we don't use it, and that's much easier.
+ fn drawImage(_: *const CanvasRenderingContext2D, _: js.Value, _: f64, _: f64, _: ?f64, _: ?f64, _: ?f64, _: ?f64, _: ?f64, _: ?f64) void {}
+ 
+-fn getImageData(
+-    _: *const CanvasRenderingContext2D,
+-    _: i32, // sx
+-    _: i32, // sy
+-    sw: i32,
+-    sh: i32,
+-    exec: *Execution,
+-) !*ImageData {
+-    if (sw <= 0 or sh <= 0) {
+-        return error.IndexSizeError;
+-    }
+-    return ImageData.init(@intCast(sw), @intCast(sh), null, exec);
+-}
++const getImageData = painting.getImageData;
+ 
+ fn getFont(self: *const CanvasRenderingContext2D) []const u8 {
+     return self._state.font();
+@@ -153,16 +147,16 @@ fn createPattern(_: *const CanvasRenderingContext2D, _: js.Value, repetition_: ?
+     return error.SyntaxError;
+ }
+ 
+-pub fn save(_: *CanvasRenderingContext2D) void {}
+-pub fn restore(_: *CanvasRenderingContext2D) void {}
++pub const save = painting.save;
++pub const restore = painting.restore;
+ pub fn scale(_: *CanvasRenderingContext2D, _: f64, _: f64) void {}
+ pub fn rotate(_: *CanvasRenderingContext2D, _: f64) void {}
+ pub fn translate(_: *CanvasRenderingContext2D, _: f64, _: f64) void {}
+ pub fn transform(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+ fn setTransform(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+ fn resetTransform(_: *CanvasRenderingContext2D) void {}
+-fn clearRect(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
+-fn fillRect(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
++const clearRect = painting.clearRect;
++const fillRect = painting.fillRect;
+ fn strokeRect(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
+ fn beginPath(_: *CanvasRenderingContext2D) void {}
+ fn closePath(_: *CanvasRenderingContext2D) void {}
+@@ -176,7 +170,7 @@ pub fn rect(_: *CanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {
+ pub fn fill(_: *CanvasRenderingContext2D) void {}
+ pub fn stroke(_: *CanvasRenderingContext2D) void {}
+ pub fn clip(_: *CanvasRenderingContext2D) void {}
+-fn fillText(_: *CanvasRenderingContext2D, _: []const u8, _: f64, _: f64, _: ?f64) void {}
++const fillText = painting.fillText;
+ fn strokeText(_: *CanvasRenderingContext2D, _: []const u8, _: f64, _: f64, _: ?f64) void {}
+ 
+ pub const JsApi = struct {
+@@ -214,32 +208,32 @@ pub const JsApi = struct {
+     pub const letterSpacing = bridge.property("0px", .{ .template = false, .readonly = false });
+     pub const wordSpacing = bridge.property("0px", .{ .template = false, .readonly = false });
+     pub const fontKerning = bridge.property("auto", .{ .template = false, .readonly = false });
+-    pub const globalAlpha = bridge.property(1.0, .{ .template = false, .readonly = false });
++    pub const globalAlpha = bridge.accessor(painting.getGlobalAlpha, painting.setGlobalAlpha, .{});
+     pub const globalCompositeOperation = bridge.property("source-over", .{ .template = false, .readonly = false });
+     pub const strokeStyle = bridge.accessor(CanvasRenderingContext2D.getStrokeStyle, CanvasRenderingContext2D.setStrokeStyle, .{});
+     pub const lineWidth = bridge.property(1.0, .{ .template = false, .readonly = false });
+     pub const lineCap = bridge.property("butt", .{ .template = false, .readonly = false });
+     pub const lineJoin = bridge.property("miter", .{ .template = false, .readonly = false });
+     pub const miterLimit = bridge.property(10.0, .{ .template = false, .readonly = false });
+-    pub const textAlign = bridge.property("start", .{ .template = false, .readonly = false });
+-    pub const textBaseline = bridge.property("alphabetic", .{ .template = false, .readonly = false });
++    pub const textAlign = bridge.accessor(painting.getTextAlign, painting.setTextAlign, .{});
++    pub const textBaseline = bridge.accessor(painting.getTextBaseline, painting.setTextBaseline, .{});
+ 
+     pub const fillStyle = bridge.accessor(CanvasRenderingContext2D.getFillStyle, CanvasRenderingContext2D.setFillStyle, .{});
+     pub const createImageData = bridge.function(CanvasRenderingContext2D.createImageData, .{});
+ 
+-    pub const putImageData = bridge.function(CanvasRenderingContext2D.putImageData, .{ .noop = true });
++    pub const putImageData = bridge.function(CanvasRenderingContext2D.putImageData, .{});
+     pub const drawImage = bridge.function(CanvasRenderingContext2D.drawImage, .{ .noop = true });
+     pub const getImageData = bridge.function(CanvasRenderingContext2D.getImageData, .{});
+-    pub const save = bridge.function(CanvasRenderingContext2D.save, .{ .noop = true });
+-    pub const restore = bridge.function(CanvasRenderingContext2D.restore, .{ .noop = true });
++    pub const save = bridge.function(CanvasRenderingContext2D.save, .{});
++    pub const restore = bridge.function(CanvasRenderingContext2D.restore, .{});
+     pub const scale = bridge.function(CanvasRenderingContext2D.scale, .{ .noop = true });
+     pub const rotate = bridge.function(CanvasRenderingContext2D.rotate, .{ .noop = true });
+     pub const translate = bridge.function(CanvasRenderingContext2D.translate, .{ .noop = true });
+     pub const transform = bridge.function(CanvasRenderingContext2D.transform, .{ .noop = true });
+     pub const setTransform = bridge.function(CanvasRenderingContext2D.setTransform, .{ .noop = true });
+     pub const resetTransform = bridge.function(CanvasRenderingContext2D.resetTransform, .{ .noop = true });
+-    pub const clearRect = bridge.function(CanvasRenderingContext2D.clearRect, .{ .noop = true });
+-    pub const fillRect = bridge.function(CanvasRenderingContext2D.fillRect, .{ .noop = true });
++    pub const clearRect = bridge.function(CanvasRenderingContext2D.clearRect, .{});
++    pub const fillRect = bridge.function(CanvasRenderingContext2D.fillRect, .{});
+     pub const strokeRect = bridge.function(CanvasRenderingContext2D.strokeRect, .{ .noop = true });
+     pub const beginPath = bridge.function(CanvasRenderingContext2D.beginPath, .{ .noop = true });
+     pub const closePath = bridge.function(CanvasRenderingContext2D.closePath, .{ .noop = true });
+@@ -253,7 +247,7 @@ pub const JsApi = struct {
+     pub const fill = bridge.function(CanvasRenderingContext2D.fill, .{ .noop = true });
+     pub const stroke = bridge.function(CanvasRenderingContext2D.stroke, .{ .noop = true });
+     pub const clip = bridge.function(CanvasRenderingContext2D.clip, .{ .noop = true });
+-    pub const fillText = bridge.function(CanvasRenderingContext2D.fillText, .{ .noop = true });
++    pub const fillText = bridge.function(CanvasRenderingContext2D.fillText, .{});
+     pub const strokeText = bridge.function(CanvasRenderingContext2D.strokeText, .{ .noop = true });
+ };
+ 
+diff --git a/src/browser/webapi/canvas/OffscreenCanvas.zig b/src/browser/webapi/canvas/OffscreenCanvas.zig
+index df1666f..19c44dd 100644
+--- a/src/browser/webapi/canvas/OffscreenCanvas.zig
++++ b/src/browser/webapi/canvas/OffscreenCanvas.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -20,6 +21,8 @@ const std = @import("std");
+ const js = @import("../../js/js.zig");
+ 
+ const Blob = @import("../Blob.zig");
++const Recording = @import("Recording.zig");
++const empty_recording: Recording = .{};
+ const OffscreenCanvasRenderingContext2D = @import("OffscreenCanvasRenderingContext2D.zig");
+ 
+ const Execution = js.Execution;
+@@ -52,6 +55,7 @@ pub fn getWidth(self: *const OffscreenCanvas) u32 {
+ 
+ fn setWidth(self: *OffscreenCanvas, value: u32) void {
+     self._width = value;
++    if (self._cached) |cached| cached.@"2d".reset();
+ }
+ 
+ pub fn getHeight(self: *const OffscreenCanvas) u32 {
+@@ -60,6 +64,7 @@ pub fn getHeight(self: *const OffscreenCanvas) u32 {
+ 
+ fn setHeight(self: *OffscreenCanvas, value: u32) void {
+     self._height = value;
++    if (self._cached) |cached| cached.@"2d".reset();
+ }
+ 
+ fn getContext(self: *OffscreenCanvas, context_type: []const u8, exec: *Execution) !?DrawingContext {
+@@ -78,13 +83,14 @@ fn getContext(self: *OffscreenCanvas, context_type: []const u8, exec: *Execution
+     return null;
+ }
+ 
+-/// Resolves to the same blank PNG as `HTMLCanvasElement.toBlob`. A canvas
++/// Resolves to the same synthetic PNG as `HTMLCanvasElement.toBlob`. A canvas
+ /// with no pixels rejects with IndexSizeError, per spec.
+ fn convertToBlob(self: *const OffscreenCanvas, exec: *Execution) !js.Promise {
+-    if (!BlankPNG.hasBitmap(self._width, self._height)) {
++    if (!Recording.hasBitmap(self._width, self._height)) {
+         return error.IndexSizeError;
+     }
+-    const blob = try BlankPNG.blob(exec);
++    const recording = if (self._cached) |cached| &cached.@"2d"._recording else &empty_recording;
++    const blob = try Blob.initFromBytes(try recording.png(self._width, self._height, exec), "image/png", exec);
+     return exec.js.local.?.resolvePromise(blob);
+ }
+ 
+@@ -94,34 +100,6 @@ fn transferToImageBitmap(_: *OffscreenCanvas) ?void {
+     return null;
+ }
+ 
+-pub const BlankPNG = struct {
+-    const mime = "image/png";
+-
+-    const base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==";
+-
+-    pub const data_url = "data:" ++ mime ++ ";base64," ++ base64;
+-
+-    pub const bytes = blk: {
+-        const decoder = std.base64.standard.Decoder;
+-        var buf: [decoder.calcSizeForSlice(base64) catch unreachable]u8 = undefined;
+-        decoder.decode(&buf, base64) catch unreachable;
+-        break :blk buf;
+-    };
+-
+-    /// Largest canvas Chrome backs with a bitmap (16384 x 16384). Past that, and
+-    /// at zero size, there are no pixels to serialize and the serializers answer
+-    /// with the spec's "no data" values.
+-    const max_area = 16384 * 16384;
+-
+-    pub fn hasBitmap(width: u32, height: u32) bool {
+-        return width > 0 and height > 0 and @as(u64, width) * height <= max_area;
+-    }
+-
+-    pub fn blob(exec: *js.Execution) !*Blob {
+-        return Blob.initFromBytes(&BlankPNG.bytes, BlankPNG.mime, exec);
+-    }
+-};
+-
+ pub const JsApi = struct {
+     pub const bridge = js.Bridge(OffscreenCanvas);
+ 
+diff --git a/src/browser/webapi/canvas/OffscreenCanvasRenderingContext2D.zig b/src/browser/webapi/canvas/OffscreenCanvasRenderingContext2D.zig
+index 08f559b..c95cea4 100644
+--- a/src/browser/webapi/canvas/OffscreenCanvasRenderingContext2D.zig
++++ b/src/browser/webapi/canvas/OffscreenCanvasRenderingContext2D.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -36,6 +37,11 @@ const OffscreenCanvasRenderingContext2D = @This();
+ /// https://html.spec.whatwg.org/multipage/canvas.html#dom-offscreencanvasrenderingcontext2d-canvas
+ _canvas: *OffscreenCanvas,
+ _state: context2d.State = .{},
++_recording: context2d.Recording = .{},
++_saved: std.ArrayList(context2d.State) = .empty,
++
++const painting = context2d.Painting(OffscreenCanvasRenderingContext2D);
++pub const reset = painting.reset;
+ 
+ fn getCanvas(self: *const OffscreenCanvasRenderingContext2D) *OffscreenCanvas {
+     return self._canvas;
+@@ -82,21 +88,9 @@ fn createImageData(
+     }
+ }
+ 
+-fn putImageData(_: *const OffscreenCanvasRenderingContext2D, _: *ImageData, _: f64, _: f64, _: ?f64, _: ?f64, _: ?f64, _: ?f64) void {}
++const putImageData = painting.putImageData;
+ 
+-fn getImageData(
+-    _: *const OffscreenCanvasRenderingContext2D,
+-    _: i32, // sx
+-    _: i32, // sy
+-    sw: i32,
+-    sh: i32,
+-    exec: *Execution,
+-) !*ImageData {
+-    if (sw <= 0 or sh <= 0) {
+-        return error.IndexSizeError;
+-    }
+-    return ImageData.init(@intCast(sw), @intCast(sh), null, exec);
+-}
++const getImageData = painting.getImageData;
+ 
+ fn getFont(self: *const OffscreenCanvasRenderingContext2D) []const u8 {
+     return self._state.font();
+@@ -148,16 +142,16 @@ fn createPattern(_: *const OffscreenCanvasRenderingContext2D, _: js.Value, repet
+     return error.SyntaxError;
+ }
+ 
+-pub fn save(_: *OffscreenCanvasRenderingContext2D) void {}
+-pub fn restore(_: *OffscreenCanvasRenderingContext2D) void {}
++pub const save = painting.save;
++pub const restore = painting.restore;
+ pub fn scale(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64) void {}
+ pub fn rotate(_: *OffscreenCanvasRenderingContext2D, _: f64) void {}
+ pub fn translate(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64) void {}
+ pub fn transform(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+ fn setTransform(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64) void {}
+ fn resetTransform(_: *OffscreenCanvasRenderingContext2D) void {}
+-fn clearRect(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
+-fn fillRect(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
++const clearRect = painting.clearRect;
++const fillRect = painting.fillRect;
+ fn strokeRect(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f64) void {}
+ fn beginPath(_: *OffscreenCanvasRenderingContext2D) void {}
+ fn closePath(_: *OffscreenCanvasRenderingContext2D) void {}
+@@ -171,7 +165,7 @@ pub fn rect(_: *OffscreenCanvasRenderingContext2D, _: f64, _: f64, _: f64, _: f6
+ pub fn fill(_: *OffscreenCanvasRenderingContext2D) void {}
+ pub fn stroke(_: *OffscreenCanvasRenderingContext2D) void {}
+ pub fn clip(_: *OffscreenCanvasRenderingContext2D) void {}
+-fn fillText(_: *OffscreenCanvasRenderingContext2D, _: []const u8, _: f64, _: f64, _: ?f64) void {}
++const fillText = painting.fillText;
+ fn strokeText(_: *OffscreenCanvasRenderingContext2D, _: []const u8, _: f64, _: f64, _: ?f64) void {}
+ 
+ pub const JsApi = struct {
+@@ -209,31 +203,31 @@ pub const JsApi = struct {
+     pub const letterSpacing = bridge.property("0px", .{ .template = false, .readonly = false });
+     pub const wordSpacing = bridge.property("0px", .{ .template = false, .readonly = false });
+     pub const fontKerning = bridge.property("auto", .{ .template = false, .readonly = false });
+-    pub const globalAlpha = bridge.property(1.0, .{ .template = false, .readonly = false });
++    pub const globalAlpha = bridge.accessor(painting.getGlobalAlpha, painting.setGlobalAlpha, .{});
+     pub const globalCompositeOperation = bridge.property("source-over", .{ .template = false, .readonly = false });
+     pub const strokeStyle = bridge.accessor(OffscreenCanvasRenderingContext2D.getStrokeStyle, OffscreenCanvasRenderingContext2D.setStrokeStyle, .{});
+     pub const lineWidth = bridge.property(1.0, .{ .template = false, .readonly = false });
+     pub const lineCap = bridge.property("butt", .{ .template = false, .readonly = false });
+     pub const lineJoin = bridge.property("miter", .{ .template = false, .readonly = false });
+     pub const miterLimit = bridge.property(10.0, .{ .template = false, .readonly = false });
+-    pub const textAlign = bridge.property("start", .{ .template = false, .readonly = false });
+-    pub const textBaseline = bridge.property("alphabetic", .{ .template = false, .readonly = false });
++    pub const textAlign = bridge.accessor(painting.getTextAlign, painting.setTextAlign, .{});
++    pub const textBaseline = bridge.accessor(painting.getTextBaseline, painting.setTextBaseline, .{});
+ 
+     pub const fillStyle = bridge.accessor(OffscreenCanvasRenderingContext2D.getFillStyle, OffscreenCanvasRenderingContext2D.setFillStyle, .{});
+     pub const createImageData = bridge.function(OffscreenCanvasRenderingContext2D.createImageData, .{});
+ 
+-    pub const putImageData = bridge.function(OffscreenCanvasRenderingContext2D.putImageData, .{ .noop = true });
++    pub const putImageData = bridge.function(OffscreenCanvasRenderingContext2D.putImageData, .{});
+     pub const getImageData = bridge.function(OffscreenCanvasRenderingContext2D.getImageData, .{});
+-    pub const save = bridge.function(OffscreenCanvasRenderingContext2D.save, .{ .noop = true });
+-    pub const restore = bridge.function(OffscreenCanvasRenderingContext2D.restore, .{ .noop = true });
++    pub const save = bridge.function(OffscreenCanvasRenderingContext2D.save, .{});
++    pub const restore = bridge.function(OffscreenCanvasRenderingContext2D.restore, .{});
+     pub const scale = bridge.function(OffscreenCanvasRenderingContext2D.scale, .{ .noop = true });
+     pub const rotate = bridge.function(OffscreenCanvasRenderingContext2D.rotate, .{ .noop = true });
+     pub const translate = bridge.function(OffscreenCanvasRenderingContext2D.translate, .{ .noop = true });
+     pub const transform = bridge.function(OffscreenCanvasRenderingContext2D.transform, .{ .noop = true });
+     pub const setTransform = bridge.function(OffscreenCanvasRenderingContext2D.setTransform, .{ .noop = true });
+     pub const resetTransform = bridge.function(OffscreenCanvasRenderingContext2D.resetTransform, .{ .noop = true });
+-    pub const clearRect = bridge.function(OffscreenCanvasRenderingContext2D.clearRect, .{ .noop = true });
+-    pub const fillRect = bridge.function(OffscreenCanvasRenderingContext2D.fillRect, .{ .noop = true });
++    pub const clearRect = bridge.function(OffscreenCanvasRenderingContext2D.clearRect, .{});
++    pub const fillRect = bridge.function(OffscreenCanvasRenderingContext2D.fillRect, .{});
+     pub const strokeRect = bridge.function(OffscreenCanvasRenderingContext2D.strokeRect, .{ .noop = true });
+     pub const beginPath = bridge.function(OffscreenCanvasRenderingContext2D.beginPath, .{ .noop = true });
+     pub const closePath = bridge.function(OffscreenCanvasRenderingContext2D.closePath, .{ .noop = true });
+@@ -247,6 +241,6 @@ pub const JsApi = struct {
+     pub const fill = bridge.function(OffscreenCanvasRenderingContext2D.fill, .{ .noop = true });
+     pub const stroke = bridge.function(OffscreenCanvasRenderingContext2D.stroke, .{ .noop = true });
+     pub const clip = bridge.function(OffscreenCanvasRenderingContext2D.clip, .{ .noop = true });
+-    pub const fillText = bridge.function(OffscreenCanvasRenderingContext2D.fillText, .{ .noop = true });
++    pub const fillText = bridge.function(OffscreenCanvasRenderingContext2D.fillText, .{});
+     pub const strokeText = bridge.function(OffscreenCanvasRenderingContext2D.strokeText, .{ .noop = true });
+ };
+diff --git a/src/browser/webapi/canvas/Recording.zig b/src/browser/webapi/canvas/Recording.zig
+new file mode 100644
+index 0000000..d58403d
+--- /dev/null
++++ b/src/browser/webapi/canvas/Recording.zig
+@@ -0,0 +1,233 @@
++// Copyright (C) 2026 Brenno Flávio
++//
++// Brenno Flávio <contato@brennoflavio.com.br>
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as
++// published by the Free Software Foundation, either version 3 of the
++// License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++//! A display list, not a rasterizer. Only output requests synthesize pixels.
++//! Synthetic 5x7 glyph masks deliberately do not claim CoreText fidelity.
++const std = @import("std");
++const RGBA = @import("../../color.zig").RGBA;
++const Execution = @import("../../js/js.zig").Execution;
++const ImageData = @import("../ImageData.zig");
++const Allocator = std.mem.Allocator;
++const Recording = @This();
++
++allocator: ?Allocator = null,
++commands: std.ArrayList(Command) = .empty,
++
++pub const Bounds = struct { left: u32, top: u32, right: u32, bottom: u32 };
++pub const Glyph = struct { x: f64, y: f64, width: f64, height: f64, codepoint: u21, color: RGBA };
++const Command = struct {
++    bounds: Bounds,
++    paint: union(enum) { fill: RGBA, clear, glyph: Glyph, pixels: []const u8 },
++};
++
++pub fn hasBitmap(width: u32, height: u32) bool {
++    return width > 0 and height > 0 and @as(u64, width) * height <= 16384 * 16384;
++}
++
++pub fn reset(self: *Recording) void {
++    const allocator = self.allocator orelse return;
++    for (self.commands.items) |command| {
++        if (command.paint == .pixels) allocator.free(command.paint.pixels);
++    }
++    // Reuse display-list storage across animation frames, without retaining pixels.
++    self.commands.clearRetainingCapacity();
++}
++
++/// Replacement operations make fully covered history irrelevant. In particular,
++/// repeated partial putImageData calls must recycle old pixel snapshots.
++fn discardCovered(self: *Recording, area: Bounds) void {
++    const allocator = self.allocator orelse return;
++    var kept: usize = 0;
++    for (self.commands.items) |command| {
++        const b = command.bounds;
++        if (area.left <= b.left and area.top <= b.top and area.right >= b.right and area.bottom >= b.bottom) {
++            if (command.paint == .pixels) allocator.free(command.paint.pixels);
++        } else {
++            self.commands.items[kept] = command;
++            kept += 1;
++        }
++    }
++    self.commands.items.len = kept;
++}
++
++fn append(self: *Recording, command: Command, exec: *Execution) !void {
++    const allocator = self.allocator orelse exec._factory.storageAllocator();
++    self.allocator = allocator;
++    try self.commands.append(allocator, command);
++}
++
++pub fn bounds(x: f64, y: f64, w: f64, h: f64, width: u32, height: u32) ?Bounds {
++    if (!hasBitmap(width, height)) return null;
++    inline for (.{ x, y, w, h }) |v| if (!std.math.isFinite(v)) return null;
++    // Sample pixel centres; normalize negative rectangles before clipping.
++    const left: u32 = @intFromFloat(@ceil(std.math.clamp(@min(x, x + w) - 0.5, 0, @as(f64, @floatFromInt(width)))));
++    const right: u32 = @intFromFloat(@ceil(std.math.clamp(@max(x, x + w) - 0.5, 0, @as(f64, @floatFromInt(width)))));
++    const top: u32 = @intFromFloat(@ceil(std.math.clamp(@min(y, y + h) - 0.5, 0, @as(f64, @floatFromInt(height)))));
++    const bottom: u32 = @intFromFloat(@ceil(std.math.clamp(@max(y, y + h) - 0.5, 0, @as(f64, @floatFromInt(height)))));
++    if (left >= right or top >= bottom) return null;
++    return .{ .left = left, .right = right, .top = top, .bottom = bottom };
++}
++
++pub fn rectangle(self: *Recording, area: Bounds, color: ?RGBA, width: u32, height: u32, exec: *Execution) !void {
++    if (color) |c| if (c.a == 0) return;
++    const full = area.left == 0 and area.top == 0 and area.right == width and area.bottom == height;
++    if (color == null or color.?.a == 255) self.discardCovered(area);
++    if (full and color == null) return;
++    try self.append(.{ .bounds = area, .paint = if (color) |c| .{ .fill = c } else .clear }, exec);
++}
++
++pub fn glyph(self: *Recording, shape: Glyph, width: u32, height: u32, exec: *Execution) !void {
++    if (shape.color.a == 0 or shape.width <= 0 or shape.height <= 0) return;
++    const area = bounds(shape.x, shape.y, shape.width, shape.height, width, height) orelse return;
++    try self.append(.{ .bounds = area, .paint = .{ .glyph = shape } }, exec);
++}
++
++/// Copy only the visible dirty rectangle now; subsequent ImageData writes
++/// must not change a recorded putImageData operation.
++pub fn put(self: *Recording, image: *ImageData, dx: f64, dy: f64, dirty_x: ?f64, dirty_y: ?f64, dirty_w: ?f64, dirty_h: ?f64, width: u32, height: u32, exec: *Execution) !void {
++    const values = .{ dx, dy, dirty_x orelse 0, dirty_y orelse 0, dirty_w orelse @as(f64, @floatFromInt(image._width)), dirty_h orelse @as(f64, @floatFromInt(image._height)) };
++    inline for (values) |v| if (!std.math.isFinite(v)) return error.NotSupported;
++    const source = image._data.local(exec.js.local.?).slice();
++    if (source.len == 0) return error.InvalidState;
++    const dirty = bounds(@trunc(values[2]), @trunc(values[3]), @trunc(values[4]), @trunc(values[5]), image._width, image._height) orelse return;
++    const x = @trunc(dx);
++    const y = @trunc(dy);
++    const area = bounds(x + @as(f64, @floatFromInt(dirty.left)), y + @as(f64, @floatFromInt(dirty.top)), @floatFromInt(dirty.right - dirty.left), @floatFromInt(dirty.bottom - dirty.top), width, height) orelse return;
++    const allocator = self.allocator orelse exec._factory.storageAllocator();
++    const stride = @as(usize, area.right - area.left) * 4;
++    const pixels = try allocator.alloc(u8, stride * (area.bottom - area.top));
++    errdefer allocator.free(pixels);
++    const sx: usize = @intFromFloat(@as(f64, @floatFromInt(area.left)) - x);
++    const sy: usize = @intFromFloat(@as(f64, @floatFromInt(area.top)) - y);
++    for (0..area.bottom - area.top) |row| {
++        const start = ((sy + row) * image._width + sx) * 4;
++        @memcpy(pixels[row * stride ..][0..stride], source[start..][0..stride]);
++    }
++    self.discardCovered(area);
++    try self.append(.{ .bounds = area, .paint = .{ .pixels = pixels } }, exec);
++}
++
++fn blend(pixel: *[4]u8, color: RGBA) void {
++    if (color.a == 255) {
++        pixel.* = .{ color.r, color.g, color.b, 255 };
++        return;
++    }
++    if (color.a == 0) return;
++    const sa: u32 = color.a;
++    const da: u32 = pixel[3];
++    const alpha = sa * 255 + da * (255 - sa);
++    inline for (.{ color.r, color.g, color.b }, 0..) |c, channel| {
++        pixel[channel] = @intCast((@as(u32, c) * sa * 255 + @as(u32, pixel[channel]) * da * (255 - sa) + alpha / 2) / alpha);
++    }
++    pixel[3] = @intCast((alpha + 127) / 255);
++}
++
++/// Replays only operations intersecting this requested span, in paint order.
++/// No canvas-sized pixel allocation, even during PNG serialization.
++pub fn readSpan(self: *const Recording, sx: i64, sy: i64, destination: []u8, width: u32, height: u32) void {
++    @memset(destination, 0);
++    if (!hasBitmap(width, height) or sy < 0 or sy >= height) return;
++    for (self.commands.items) |command| {
++        const b = command.bounds;
++        if (sy < b.top or sy >= b.bottom) continue;
++        const left = @max(sx, b.left);
++        const right = @min(sx + @as(i64, @intCast(destination.len / 4)), b.right);
++        if (left >= right) continue;
++        const offset: usize = @intCast((left - sx) * 4);
++        const length: usize = @intCast((right - left) * 4);
++        const span = destination[offset..][0..length];
++        switch (command.paint) {
++            .clear => @memset(span, 0),
++            .pixels => |pixels| {
++                const start: usize = @intCast(((sy - b.top) * (b.right - b.left) + left - b.left) * 4);
++                @memcpy(span, pixels[start..][0..length]);
++            },
++            .fill => |c| {
++                var i: usize = 0;
++                while (i < span.len) : (i += 4) blend(span[i..][0..4], c);
++            },
++            .glyph => |g| {
++                const row: u32 = @intFromFloat(@floor((@as(f64, @floatFromInt(sy)) + 0.5 - g.y) * 7 / g.height));
++                if (row >= 7) continue;
++                const mask = (@as(u32, g.codepoint) *% @as(u32, 0x45d9f3b)) ^ (row *% @as(u32, 0x9e3779b9));
++                var x = left;
++                while (x < right) : (x += 1) {
++                    const column: u32 = @intFromFloat(@floor((@as(f64, @floatFromInt(x)) + 0.5 - g.x) * 5 / g.width));
++                    if (column < 5 and (mask >> @as(u5, @intCast(column))) & 1 != 0) {
++                        const i: usize = @intCast((x - left) * 4);
++                        blend(span[i..][0..4], g.color);
++                    }
++                }
++            },
++        }
++    }
++}
++
++pub fn imageData(self: *const Recording, sx: i32, sy: i32, sw: i32, sh: i32, width: u32, height: u32, exec: *Execution) !*ImageData {
++    if (sw == 0 or sh == 0) return error.IndexSizeError;
++    const result = try ImageData.init(@intCast(@abs(@as(i64, sw))), @intCast(@abs(@as(i64, sh))), null, exec);
++    const pixels = result._data.local(exec.js.local.?).slice();
++    const x = @as(i64, sx) + @min(@as(i64, sw), 0);
++    const y = @as(i64, sy) + @min(@as(i64, sh), 0);
++    const stride = @as(usize, result._width) * 4;
++    for (0..result._height) |row| self.readSpan(x, y + @as(i64, @intCast(row)), pixels[row * stride ..][0..stride], width, height);
++    return result;
++}
++
++fn chunk(writer: *std.Io.Writer, kind: *const [4]u8, bytes: []const u8) !void {
++    try writer.writeInt(u32, @intCast(bytes.len), .big);
++    try writer.writeAll(kind);
++    try writer.writeAll(bytes);
++    var crc = std.hash.Crc32.init();
++    crc.update(kind);
++    crc.update(bytes);
++    try writer.writeInt(u32, crc.final(), .big);
++}
++
++pub fn png(self: *const Recording, width: u32, height: u32, exec: *Execution) ![]const u8 {
++    const arena = try exec.getArena(.medium, "canvas.png");
++    defer arena.release();
++    const allocator = arena.allocator();
++    var compressed: std.Io.Writer.Allocating = .init(allocator);
++    try compressed.ensureUnusedCapacity(256);
++    const flate = std.compress.flate;
++    const compressor = try allocator.create(flate.Compress);
++    compressor.* = try flate.Compress.init(&compressed.writer, try allocator.alloc(u8, flate.max_window_len), .zlib, .fastest);
++    var tile: [4096]u8 = undefined;
++    for (0..height) |row| {
++        try compressor.writer.writeByte(0); // PNG filter: None.
++        var x: u32 = 0;
++        while (x < width) {
++            const n: u32 = @min(width - x, tile.len / 4);
++            self.readSpan(x, @intCast(row), tile[0 .. n * 4], width, height);
++            try compressor.writer.writeAll(tile[0 .. n * 4]);
++            x += n;
++        }
++    }
++    try compressor.finish();
++    var result: std.Io.Writer.Allocating = .init(exec.local_arena);
++    try result.writer.writeAll("\x89PNG\r\n\x1a\n");
++    var header: [13]u8 = .{0} ** 13;
++    std.mem.writeInt(u32, header[0..4], width, .big);
++    std.mem.writeInt(u32, header[4..8], height, .big);
++    header[8] = 8;
++    header[9] = 6; // 8-bit RGBA, no interlace.
++    try chunk(&result.writer, "IHDR", &header);
++    try chunk(&result.writer, "IDAT", compressed.written());
++    try chunk(&result.writer, "IEND", "");
++    return result.written();
++}
+diff --git a/src/browser/webapi/canvas/context2d.zig b/src/browser/webapi/canvas/context2d.zig
+index 32e0c1e..a5a0e4e 100644
+--- a/src/browser/webapi/canvas/context2d.zig
++++ b/src/browser/webapi/canvas/context2d.zig
+@@ -29,6 +29,7 @@ const CanvasGradient = @import("CanvasGradient.zig");
+ const CanvasPattern = @import("CanvasPattern.zig");
+ 
+ const Execution = js.Execution;
++pub const Recording = @import("Recording.zig");
+ 
+ const default_font = "10px sans-serif";
+ 
+@@ -244,7 +245,13 @@ pub const StyleOutput = union(enum) {
+     pattern: *CanvasPattern,
+ };
+ 
++const TextAlign = enum { start, end, left, right, center };
++const TextBaseline = enum { top, hanging, middle, alphabetic, ideographic, bottom };
++
+ pub const State = struct {
++    global_alpha: f64 = 1,
++    text_align: TextAlign = .start,
++    text_baseline: TextBaseline = .alphabetic,
+     fill_style: Style = .{ .color = color.RGBA.Named.black },
+     stroke_style: Style = .{ .color = color.RGBA.Named.black },
+ 
+@@ -336,6 +343,128 @@ pub const State = struct {
+     }
+ };
+ 
++/// The regular and offscreen contexts share one deliberately bounded painter.
++/// Transforms, paths, gradients and actual font rasterization remain unsupported.
++pub fn Painting(comptime Context: type) type {
++    return struct {
++        pub fn reset(self: *Context) void {
++            self._recording.reset();
++            self._state = .{};
++            self._saved.clearRetainingCapacity();
++        }
++
++        pub fn save(self: *Context, exec: *Execution) !void {
++            try self._saved.append(exec._factory.storageAllocator(), self._state);
++        }
++
++        pub fn restore(self: *Context) void {
++            self._state = self._saved.pop() orelse return;
++        }
++
++        pub fn getGlobalAlpha(self: *const Context) f64 {
++            return self._state.global_alpha;
++        }
++
++        pub fn setGlobalAlpha(self: *Context, value: f64) void {
++            if (value >= 0 and value <= 1) self._state.global_alpha = value;
++        }
++
++        pub fn getTextAlign(self: *const Context) []const u8 {
++            return @tagName(self._state.text_align);
++        }
++
++        pub fn setTextAlign(self: *Context, value: []const u8) void {
++            self._state.text_align = std.meta.stringToEnum(TextAlign, value) orelse return;
++        }
++
++        pub fn getTextBaseline(self: *const Context) []const u8 {
++            return @tagName(self._state.text_baseline);
++        }
++
++        pub fn setTextBaseline(self: *Context, value: []const u8) void {
++            self._state.text_baseline = std.meta.stringToEnum(TextBaseline, value) orelse return;
++        }
++
++        fn fillColor(self: *const Context) ?@import("../../color.zig").RGBA {
++            var c = switch (self._state.fill_style) {
++                .color => |c| c,
++                else => return null,
++            };
++            c.a = @intFromFloat(@round(@as(f64, @floatFromInt(c.a)) * self._state.global_alpha));
++            return c;
++        }
++
++        pub fn clearRect(self: *Context, x: f64, y: f64, w: f64, h: f64, exec: *Execution) !void {
++            const width = self._canvas.getWidth();
++            const height = self._canvas.getHeight();
++            const area = Recording.bounds(x, y, w, h, width, height) orelse return;
++            try self._recording.rectangle(area, null, width, height, exec);
++        }
++
++        pub fn fillRect(self: *Context, x: f64, y: f64, w: f64, h: f64, exec: *Execution) !void {
++            const c = fillColor(self) orelse return;
++            const width = self._canvas.getWidth();
++            const height = self._canvas.getHeight();
++            const area = Recording.bounds(x, y, w, h, width, height) orelse return;
++            try self._recording.rectangle(area, c, width, height, exec);
++        }
++
++        pub fn fillText(self: *Context, text: []const u8, x: f64, y: f64, max_width: ?js.Value, exec: *Execution) !void {
++            const limit = if (max_width) |v| try v.toF64() else null;
++            if (!std.math.isFinite(x) or !std.math.isFinite(y)) return;
++            const c = fillColor(self) orelse return;
++            if (c.a == 0) return;
++            const state = &self._state;
++            const size = state.font_size;
++            const natural_width = measureWidth(text, size, state.font_face);
++            if (!(natural_width > 0) or !std.math.isFinite(natural_width)) return;
++            var scale: f64 = 1;
++            if (limit) |value| {
++                if (!(value > 0) or !std.math.isFinite(value)) return;
++                scale = @min(1, value / natural_width);
++            }
++            const width = self._canvas.getWidth();
++            const height = self._canvas.getHeight();
++            if (!Recording.hasBitmap(width, height)) return;
++            var pen = x - natural_width * scale * switch (state.text_align) {
++                .center => @as(f64, 0.5),
++                .end, .right => @as(f64, 1),
++                else => @as(f64, 0),
++            };
++            const top = y - size * switch (state.text_baseline) {
++                .top => @as(f64, 0),
++                .hanging => @as(f64, 0.2),
++                .middle => @as(f64, 0.5),
++                .alphabetic => @as(f64, 0.8),
++                .ideographic, .bottom => @as(f64, 1),
++            };
++            var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
++            while (it.i < text.len) {
++                const start = it.i;
++                const cp = it.nextCodepoint() orelse break;
++                const advance = measureWidth(text[start..it.i], size, state.font_face) * scale;
++                if (cp > ' ' and advance > 0) {
++                    try self._recording.glyph(.{ .x = pen, .y = top, .width = advance * 0.85, .height = size, .codepoint = cp, .color = c }, width, height, exec);
++                }
++                pen += advance;
++            }
++        }
++
++        pub fn putImageData(self: *Context, image: *@import("../ImageData.zig"), dx: f64, dy: f64, dirty_x: ?js.Value, dirty_y: ?js.Value, dirty_w: ?js.Value, dirty_h: ?js.Value, exec: *Execution) !void {
++            if (dirty_x != null and (dirty_y == null or dirty_w == null or dirty_h == null)) return error.TypeError;
++            const x = if (dirty_x) |v| try v.toF64() else null;
++            const y = if (dirty_y) |v| try v.toF64() else null;
++            const w = if (dirty_w) |v| try v.toF64() else null;
++            const h = if (dirty_h) |v| try v.toF64() else null;
++            try self._recording.put(image, dx, dy, x, y, w, h, self._canvas.getWidth(), self._canvas.getHeight(), exec);
++        }
++
++        pub fn getImageData(self: *const Context, sx: i32, sy: i32, sw: i32, sh: i32, exec: *Execution) !*@import("../ImageData.zig") {
++            return self._recording.imageData(sx, sy, sw, sh, self._canvas.getWidth(), self._canvas.getHeight(), exec);
++        }
++    };
++}
++
+ const ParsedFont = struct { size: f64, face: FontFace };
+ 
+ fn parseSize(token: []const u8) ?f64 {
+diff --git a/src/browser/webapi/element/html/Canvas.zig b/src/browser/webapi/element/html/Canvas.zig
+index 4518e96..b396928 100644
+--- a/src/browser/webapi/element/html/Canvas.zig
++++ b/src/browser/webapi/element/html/Canvas.zig
+@@ -2,6 +2,7 @@
+ //
+ // Francis Bouvier <francis@lightpanda.io>
+ // Pierre Tachoire <pierre@lightpanda.io>
++// Brenno Flávio <contato@brennoflavio.com.br>
+ //
+ // This program is free software: you can redistribute it and/or modify
+ // it under the terms of the GNU Affero General Public License as
+@@ -35,7 +36,8 @@ const HtmlElement = @import("../Html.zig");
+ const js = lp.js;
+ const log = lp.log;
+ const Execution = js.Execution;
+-const BlankPNG = OffscreenCanvas.BlankPNG;
++const Recording = @import("../../canvas/Recording.zig");
++const empty_recording: Recording = .{};
+ 
+ const Canvas = @This();
+ 
+@@ -54,13 +56,19 @@ pub fn asNode(self: *Canvas) *Node {
+ }
+ 
+ pub fn getWidth(self: *const Canvas) u32 {
+-    const attr = self.asConstElement().getAttributeInterned("width") orelse return 300;
+-    return std.fmt.parseUnsigned(u32, attr, 10) catch 300;
++    return self.dimension("width", 300);
+ }
+ 
+ pub fn getHeight(self: *const Canvas) u32 {
+-    const attr = self.asConstElement().getAttributeInterned("height") orelse return 150;
+-    return std.fmt.parseUnsigned(u32, attr, 10) catch 150;
++    return self.dimension("height", 150);
++}
++
++fn dimension(self: *const Canvas, name: []const u8, default: u32) u32 {
++    const attr = self.asConstElement().getAttributeSafe(.wrap(name)) orelse return default;
++    const parsed = @import("../reflection.zig").parseInteger(attr) orelse return default;
++    // Match Reflect.unsignedLong, including HTML whitespace/sign/trailing text.
++    if (parsed < 0 or parsed > std.math.maxInt(i32)) return default;
++    return @intCast(parsed);
+ }
+ 
+ /// Since there's no base class rendering contexts inherit from,
+@@ -104,24 +112,43 @@ fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?DrawingC
+ }
+ 
+ fn hasBitmap(self: *const Canvas) bool {
+-    return BlankPNG.hasBitmap(self.getWidth(), self.getHeight());
++    return Recording.hasBitmap(self.getWidth(), self.getHeight());
++}
++
++fn recording(self: *const Canvas) *const Recording {
++    if (self._cached) |cached| switch (cached) {
++        .@"2d" => |ctx| return &ctx._recording,
++        else => {},
++    };
++    return &empty_recording;
+ }
+ 
+-/// Serializes the canvas, always as the blank PNG. Per spec an unsupported
+-/// `type` falls back to image/png, and with nothing drawn there is no lossy
+-/// encoding for `quality` to control, so both arguments are ignored.
+-fn toDataURL(self: *const Canvas, _: ?[]const u8, _: ?f64) []const u8 {
+-    // Per spec, a canvas with no pixels serializes to this exact string.
+-    return if (self.hasBitmap()) BlankPNG.data_url else "data:,";
++/// Only PNG encoding is supported; unsupported formats retain the PNG fallback.
++fn toDataURL(self: *const Canvas, _: ?[]const u8, _: ?f64, exec: *Execution) ![]const u8 {
++    if (!self.hasBitmap()) return "data:,";
++    const png = try self.recording().png(self.getWidth(), self.getHeight(), exec);
++    const prefix = "data:image/png;base64,";
++    const encoder = std.base64.standard.Encoder;
++    const result = try exec.local_arena.alloc(u8, prefix.len + encoder.calcSize(png.len));
++    @memcpy(result[0..prefix.len], prefix);
++    _ = encoder.encode(result[prefix.len..], png);
++    return result;
+ }
+ 
+ /// Same image as `toDataURL`, handed to `callback` as a Blob from a task.
+ /// A canvas with no pixels calls back with null, per spec.
+ pub fn toBlob(self: *const Canvas, callback: js.Function.Global, _: ?[]const u8, _: ?f64, exec: *Execution) !void {
++    errdefer callback.release();
++    // Snapshot bytes at invocation, before any later draw or resize.
++    const blob = if (self.hasBitmap())
++        try Blob.initFromBytes(try self.recording().png(self.getWidth(), self.getHeight(), exec), "image/png", exec)
++    else
++        null;
++    if (blob) |b| b.acquireRef();
++    errdefer if (blob) |b| b.releaseRef(exec.page);
+     const task = try exec._factory.create(ToBlobCallback{
+         .exec = exec,
+-        // The spec checks the bitmap now, not when the task runs.
+-        .has_bitmap = self.hasBitmap(),
++        .blob = blob,
+         .callback = callback,
+     });
+     errdefer exec._factory.destroy(task);
+@@ -134,7 +161,7 @@ pub fn toBlob(self: *const Canvas, callback: js.Function.Global, _: ?[]const u8,
+ 
+ const ToBlobCallback = struct {
+     exec: *Execution,
+-    has_bitmap: bool,
++    blob: ?*Blob,
+     callback: js.Function.Global,
+ 
+     fn cancelled(ctx: *anyopaque) void {
+@@ -144,6 +171,7 @@ const ToBlobCallback = struct {
+ 
+     fn deinit(self: *ToBlobCallback) void {
+         self.callback.release();
++        if (self.blob) |b| b.releaseRef(self.exec.page);
+         self.exec._factory.destroy(self);
+     }
+ 
+@@ -152,23 +180,11 @@ const ToBlobCallback = struct {
+         defer self.deinit();
+         const exec = self.exec;
+ 
+-        var blob: ?*Blob = null;
+-        if (self.has_bitmap) {
+-            const b = try BlankPNG.blob(exec);
+-            // The page can hold on to the Blob, in which case the JS wrapper
+-            // takes its own ref; ours only has to cover the call.
+-            b.acquireRef();
+-            blob = b;
+-        }
+-        defer if (blob) |b| {
+-            b.releaseRef(exec.page);
+-        };
+-
+         var ls: js.Local.Scope = undefined;
+         exec.js.localScope(&ls);
+         defer ls.deinit();
+ 
+-        ls.toLocal(self.callback).call(void, .{blob}) catch |err| {
++        ls.toLocal(self.callback).call(void, .{self.blob}) catch |err| {
+             exec.page.recordJsError(err);
+             log.debug(.js, "canvas.toBlob", .{ .err = err });
+         };
+@@ -185,6 +201,25 @@ fn transferControlToOffscreen(self: *Canvas, exec: *Execution) !*OffscreenCanvas
+     return OffscreenCanvas.constructor(width, height, exec);
+ }
+ 
++pub const Build = struct {
++    pub fn attributeChange(element: *Element, name: lp.String, _: lp.String, _: *Frame) !void {
++        resetBitmap(element, name);
++    }
++
++    pub fn attributeRemove(element: *Element, name: lp.String, _: *Frame) !void {
++        resetBitmap(element, name);
++    }
++
++    fn resetBitmap(element: *Element, name: lp.String) void {
++        if (!name.eql(comptime .wrap("width")) and !name.eql(comptime .wrap("height"))) return;
++        const self = element.as(Canvas);
++        if (self._cached) |cached| switch (cached) {
++            .@"2d" => |ctx| ctx.reset(),
++            else => {},
++        };
++    }
++};
++
+ pub const JsApi = struct {
+     pub const bridge = js.Bridge(Canvas);
+ 

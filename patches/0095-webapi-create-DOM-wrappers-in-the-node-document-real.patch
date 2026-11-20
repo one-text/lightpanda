@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Wed, 18 Nov 2026 00:48:09 -0300
+Subject: [PATCH] webapi: create DOM wrappers in the node document realm
+
+Fresh iframe.contentDocument wrappers used the realm of the first accessor.
+Reading contentDocument before contentWindow.document therefore gave child
+HTMLDocument/Element objects parent prototypes and parent native methods.
+Borrowed parent Document.createElement calls also wrapped new child nodes in
+the parent realm. Chrome uses the node document's realm in these cases.
+
+Select the active node-document frame's creation context through the resolved
+prototype chain, including Node objects returned as EventTarget/base types.
+Keep custom Meta.creation_context evaluation before identity insertion (some
+anchors inspect that map), existing cached identities and constructor-provided
+objects unchanged. Keep same-frame initialization and unframed/non-node cases
+in their existing context. Do not cross identity/world boundaries into a page's
+main world when accessed from a CDP isolated world.
+
+Correct the existing iframe link fixture to use after_link.html rather than
+support/after_link.html. It previously depended on resolving a child link using
+the parent native method's realm/base URL. No new upstream tests.
+
+All 1658 upstream tests pass. Owned Chrome/native controls agree on document-
+first/window-first access, prototype/method identity, borrowed creation,
+constructor-provided wrappers, adoption/import and retained detached identities.
+An isolated-world control keeps a page-modified child querySelector out of the
+isolated wrapper/method path.
+
+The live SDK exercises the document-first pristine-iframe pattern. Normal builds
+with this fix emit binary POSTs (22450 and 22442 bytes, HTTP200) followed by auth
+201; a bounded interleaved revert records no binary and two auth429 responses.
+This is an A/B/A association with uncontrolled exit/source/session variation,
+not proof of every vendor decision or basket/checkout readiness.
+
+A separate, explicitly approved Chrome negative control first rejected one
+receive-audio/video offer result with NotSupportedError and still posted binary.
+No vendor completion, request replay, synthetic live input or RTC success shim
+was added. All temporary native instrumentation is removed.
+---
+ src/browser/js/Local.zig                      | 22 ++++++++++++++++++-
+ .../tests/frames/support/with_link.html       |  2 +-
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/src/browser/js/Local.zig b/src/browser/js/Local.zig
+index aadbb61..a4d34a6 100644
+--- a/src/browser/js/Local.zig
++++ b/src/browser/js/Local.zig
+@@ -23,6 +23,7 @@ const lp = @import("lightpanda");
+ const string = @import("../../string.zig");
+ 
+ const Page = @import("../Page.zig");
++const Node = @import("../webapi/Node.zig");
+ 
+ const js = @import("js.zig");
+ const bridge = @import("bridge.zig");
+@@ -274,7 +275,7 @@ pub fn mapZigInstanceToJs(self: *const Local, js_obj_handle: ?*const v8.Object,
+             const creation_context = if (comptime @hasDecl(JsApi.Meta, "creation_context"))
+                 JsApi.Meta.creation_context(value, self)
+             else
+-                self.handle;
++                resolved.creationContext(self);
+             const resolved_ptr_id = @intFromPtr(resolved.ptr);
+             const gop = try ctx.addIdentity(resolved_ptr_id);
+             if (gop.found_existing) {
+@@ -1321,6 +1322,25 @@ const Resolved = struct {
+     prototype_chain: []const @import("TaggedOpaque.zig").PrototypeChainEntry,
+     finalizer: ?Finalizer,
+ 
++    fn creationContext(self: Resolved, local: *const Local) *const v8.Context {
++        const frame = switch (local.ctx.global) {
++            .frame => |frame| frame,
++            .worker => return local.handle,
++        };
++        const tagged = TaggedOpaque{
++            .value = self.ptr,
++            .prototype_chain = self.prototype_chain.ptr,
++            .prototype_len = @intCast(self.prototype_chain.len),
++            .subtype = null,
++        };
++        // First access from a parent must not give a child node parent prototypes.
++        const node = tagged.as(Node) orelse return local.handle;
++        const owner = node.ownerFrame(frame) orelse return local.handle;
++        // A page's main-world context must not supply isolated-world prototypes.
++        if (owner == frame or owner.js.identity != local.ctx.identity) return local.handle;
++        return @ptrCast(v8.v8__Global__Get(&owner.js.handle, local.isolate.handle).?);
++    }
++
+     const Finalizer = struct {
+         // Resolved.ptr is the most specific value in a chain (e.g. IFrame, not EventTarget, Node,  ...)
+         // Finalizer.ptr_id is the most specific value in a chain that defines an acquireRef
+diff --git a/src/browser/tests/frames/support/with_link.html b/src/browser/tests/frames/support/with_link.html
+index bc31b19..2fd9ca7 100644
+--- a/src/browser/tests/frames/support/with_link.html
++++ b/src/browser/tests/frames/support/with_link.html
+@@ -1,2 +1,2 @@
+ <!DOCTYPE html>
+-<a href="support/after_link.html" id=link>a link</a>
++<a href="after_link.html" id=link>a link</a>

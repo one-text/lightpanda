@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: brennoflavio <contato@brennoflavio.com.br>
+Date: Thu, 19 Nov 2026 00:55:15 -0300
+Subject: [PATCH] webapi: parse cookie expiry dates with RFC6265 tokens
+
+Use the cookie-date algorithm from RFC6265 section 5.1.1 instead of the
+strict RFC822 parser and fixed-position dashed-date retry. Extract time,
+day, month and year tokens in specification order, accept case-insensitive
+month prefixes, apply the 69/70 year pivot, and validate the UTC calendar
+and clock through DateTime.initUTC. Ignore weekday/timezone tokens as the
+cookie grammar requires. Keep Max-Age precedence and invalid Expires as a
+session cookie; leave the general-purpose datetime parser unchanged.
+
+An exercised deletion using Thu, 01 Jan 1970 00:00:00 UTC previously left
+an empty session cookie because RFC822 parsing rejected UTC. This affects
+both document.cookie and response Set-Cookie, not one site's special case.
+
+All 1658 existing upstream tests pass; no upstream tests were added or
+modified. A temporary owned HTTP fixture covers 27 date/precedence cases
+through each setter: the old binary passes34/54 and this build passes54/54.
+The exact UTC/GMT deletion controls agree with Camoufox158 and Chrome154.
+Those engines have additional malformed-date quirks not adopted here.
+
+A bounded fresh Sephora search-click check no longer retains the empty
+parent-domain bm_lso cookie, but the exact catalog request remains403.
+This is a cookie-contract fix, not a claimed protection-acceptance fix.
+No cookie transplant, SDK rewrite, protected request replay or diagnostic
+instrumentation is included.
+
+Reference: https://www.rfc-editor.org/rfc/rfc6265#section-5.1.1
+---
+ src/browser/webapi/storage/Cookie.zig | 94 +++++++++++++++++++++------
+ 1 file changed, 73 insertions(+), 21 deletions(-)
+
+diff --git a/src/browser/webapi/storage/Cookie.zig b/src/browser/webapi/storage/Cookie.zig
+index 789f58b..eeec8b0 100644
+--- a/src/browser/webapi/storage/Cookie.zig
++++ b/src/browser/webapi/storage/Cookie.zig
+@@ -214,27 +214,10 @@ pub fn parse(allocator: Allocator, url: [:0]const u8, str: []const u8) !Cookie {
+     var normalized_expires: ?f64 = null;
+     if (max_age) |ma| {
+         normalized_expires = @as(f64, @floatFromInt(lp.datetime.timestamp(.real))) + @as(f64, @floatFromInt(ma));
+-    } else {
+-        // max age takes priority over expires
+-        if (expires) |expires_| {
+-            var exp_dt = DateTime.parse(expires_, .rfc822) catch null;
+-            if (exp_dt == null) {
+-                if ((expires_.len > 11 and expires_[7] == '-' and expires_[11] == '-')) {
+-                    // Replace dashes and try again
+-                    const output = try aa.dupe(u8, expires_);
+-                    output[7] = ' ';
+-                    output[11] = ' ';
+-                    exp_dt = DateTime.parse(output, .rfc822) catch null;
+-                }
+-            }
+-            if (exp_dt) |dt| {
+-                normalized_expires = @floatFromInt(dt.unix(.seconds));
+-            } else {
+-                // Algolia, for example, will call document.setCookie with
+-                // an expired value which is literally 'Invalid Date'
+-                // (it's trying to do something like: `new Date() + undefined`).
+-                log.debug(.frame, "cookie expires date", .{ .date = expires_ });
+-            }
++    } else if (expires) |expires_| {
++        normalized_expires = parseExpires(expires_);
++        if (normalized_expires == null) {
++            log.debug(.frame, "cookie expires date", .{ .date = expires_ });
+         }
+     }
+ 
+@@ -252,6 +235,75 @@ pub fn parse(allocator: Allocator, url: [:0]const u8, str: []const u8) !Cookie {
+     };
+ }
+ 
++// RFC 6265 section 5.1.1: extract date tokens, ignoring weekday/timezone text.
++fn parseExpires(input: []const u8) ?f64 {
++    var time: ?[3]u8 = null;
++    var day: ?u8 = null;
++    var month: ?u8 = null;
++    var year: ?u16 = null;
++    var tokens = std.mem.tokenizeAny(u8, input, "\t !\"#$%&'()*+,-./;<=>?@[\\]^_`{|}~");
++    while (tokens.next()) |token| {
++        if (time == null) {
++            time = parseDateTime(token);
++            if (time != null) continue;
++        }
++        if (day == null) {
++            if (parseDateNumber(token, 1, 2)) |number| {
++                day = @intCast(number.value);
++                continue;
++            }
++        }
++        if (month == null and token.len >= 3) {
++            const months = [_][]const u8{ "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec" };
++            for (months, 1..) |name, value| {
++                if (std.ascii.eqlIgnoreCase(token[0..3], name)) {
++                    month = @intCast(value);
++                    break;
++                }
++            }
++            if (month != null) continue;
++        }
++        if (year == null) {
++            if (parseDateNumber(token, 2, 4)) |number| {
++                year = number.value;
++            }
++        }
++    }
++
++    var normalized_year = year orelse return null;
++    if (normalized_year >= 70 and normalized_year <= 99) {
++        normalized_year += 1900;
++    } else if (normalized_year <= 69) {
++        normalized_year += 2000;
++    }
++    if (normalized_year < 1601) return null;
++    const tm = time orelse return null;
++    const dt = DateTime.initUTC(@intCast(normalized_year), month orelse return null, day orelse return null, tm[0], tm[1], tm[2], 0) catch return null;
++    return @floatFromInt(dt.unix(.seconds));
++}
++
++fn parseDateNumber(token: []const u8, min_digits: usize, max_digits: usize) ?struct { value: u16, rest: []const u8 } {
++    var end: usize = 0;
++    while (end < token.len and std.ascii.isDigit(token[end])) : (end += 1) {}
++    if (end < min_digits or end > max_digits) return null;
++    return .{ .value = std.fmt.parseInt(u16, token[0..end], 10) catch return null, .rest = token[end..] };
++}
++
++fn parseDateTime(token: []const u8) ?[3]u8 {
++    var rest = token;
++    var fields: [3]u8 = undefined;
++    for (0..3) |i| {
++        const number = parseDateNumber(rest, 1, 2) orelse return null;
++        fields[i] = @intCast(number.value);
++        rest = number.rest;
++        if (i < 2) {
++            if (rest.len == 0 or rest[0] != ':') return null;
++            rest = rest[1..];
++        }
++    }
++    return fields;
++}
++
+ const ValidateCookieError = error{ Empty, InvalidByteSequence };
+ 
+ /// Returns an error if cookie str length is 0
